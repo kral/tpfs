@@ -19,7 +19,7 @@ struct Env {
 impl Env {
 	fn new() -> Self {
 		let tmp = tempfile::TempDir::new().unwrap();
-		let base = fs::canonicalize(tmp.path()).unwrap();
+		let base = tpfs_core::canonicalize(tmp.path()).unwrap();
 		let (left, right) = (base.join("left"), base.join("right"));
 		fs::create_dir_all(&left).unwrap();
 		fs::create_dir_all(&right).unwrap();

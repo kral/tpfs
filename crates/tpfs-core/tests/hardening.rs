@@ -30,7 +30,7 @@ impl Sandbox {
 			Some(d) => TempDir::new_in(d).unwrap(),
 			None => TempDir::new().unwrap(),
 		};
-		let base = fs::canonicalize(tmp.path()).unwrap();
+		let base = tpfs_core::canonicalize(tmp.path()).unwrap();
 		let root = base.join("root");
 		let state = base.join("state");
 		fs::create_dir(&root).unwrap();

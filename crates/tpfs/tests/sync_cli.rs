@@ -17,7 +17,7 @@ fn stdout(o: &Output) -> String {
 #[test]
 fn dry_run_approve_digest_and_undo() {
 	let tmp = tempfile::TempDir::new().unwrap();
-	let base = fs::canonicalize(tmp.path()).unwrap();
+	let base = tpfs_core::canonicalize(tmp.path()).unwrap();
 	let (src, dst, home) = (base.join("src"), base.join("dst"), base.join("state"));
 	fs::create_dir_all(src.join("album")).unwrap();
 	fs::create_dir_all(&dst).unwrap();
@@ -58,7 +58,7 @@ fn dry_run_approve_digest_and_undo() {
 #[test]
 fn json_output_is_a_plan_for_apply() {
 	let tmp = tempfile::TempDir::new().unwrap();
-	let base = fs::canonicalize(tmp.path()).unwrap();
+	let base = tpfs_core::canonicalize(tmp.path()).unwrap();
 	let (src, dst) = (base.join("src"), base.join("dst"));
 	fs::create_dir_all(&src).unwrap();
 	fs::create_dir_all(&dst).unwrap();

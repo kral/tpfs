@@ -18,8 +18,8 @@ struct Sandbox {
 impl Sandbox {
 	fn new() -> Self {
 		let tmp = TempDir::new().unwrap();
-		let root = fs::canonicalize(tmp.path()).unwrap().join("root");
-		let state = fs::canonicalize(tmp.path()).unwrap().join("state");
+		let root = tpfs_core::canonicalize(tmp.path()).unwrap().join("root");
+		let state = tpfs_core::canonicalize(tmp.path()).unwrap().join("state");
 		fs::create_dir(&root).unwrap();
 		Self { _tmp: tmp, root, state }
 	}

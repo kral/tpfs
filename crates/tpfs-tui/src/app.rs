@@ -630,7 +630,7 @@ mod tests {
 	#[test]
 	fn copy_trash_and_undo_through_plans() {
 		let tmp = tempfile::TempDir::new().unwrap();
-		let base = fs::canonicalize(tmp.path()).unwrap();
+		let base = tpfs_core::canonicalize(tmp.path()).unwrap();
 		let (left, right, state) = (base.join("left"), base.join("right"), base.join("state"));
 		fs::create_dir_all(left.join("folder")).unwrap();
 		fs::create_dir(&right).unwrap();
@@ -664,7 +664,7 @@ mod tests {
 	#[test]
 	fn copy_onto_an_existing_file_is_refused_in_the_dialog() {
 		let tmp = tempfile::TempDir::new().unwrap();
-		let base = fs::canonicalize(tmp.path()).unwrap();
+		let base = tpfs_core::canonicalize(tmp.path()).unwrap();
 		fs::create_dir_all(base.join("l")).unwrap();
 		fs::create_dir_all(base.join("r")).unwrap();
 		fs::write(base.join("l/x.txt"), "new").unwrap();
@@ -684,7 +684,7 @@ mod tests {
 	#[test]
 	fn mkdir_and_rename_by_typing() {
 		let tmp = tempfile::TempDir::new().unwrap();
-		let base = fs::canonicalize(tmp.path()).unwrap();
+		let base = tpfs_core::canonicalize(tmp.path()).unwrap();
 		fs::create_dir_all(base.join("l")).unwrap();
 		let mut app = App::new(base.join("l"), base.join("l"), base.join("state"), false).unwrap();
 
@@ -710,7 +710,7 @@ mod tests {
 	#[test]
 	fn viewer_and_command_line() {
 		let tmp = tempfile::TempDir::new().unwrap();
-		let base = fs::canonicalize(tmp.path()).unwrap();
+		let base = tpfs_core::canonicalize(tmp.path()).unwrap();
 		fs::create_dir_all(base.join("l")).unwrap();
 		let text: String = (1..=50).map(|i| format!("line {i}\n")).collect();
 		fs::write(base.join("l/notes.txt"), text).unwrap();
@@ -749,7 +749,7 @@ mod tests {
 	#[test]
 	fn drive_picker_switches_a_panel() {
 		let tmp = tempfile::TempDir::new().unwrap();
-		let base = fs::canonicalize(tmp.path()).unwrap();
+		let base = tpfs_core::canonicalize(tmp.path()).unwrap();
 		fs::create_dir_all(base.join("l")).unwrap();
 		let mut app = App::new(base.join("l"), base.join("l"), base.join("state"), false).unwrap();
 
@@ -781,7 +781,7 @@ mod tests {
 	#[test]
 	fn quick_search_jumps_ignoring_case_and_diacritics() {
 		let tmp = tempfile::TempDir::new().unwrap();
-		let base = fs::canonicalize(tmp.path()).unwrap();
+		let base = tpfs_core::canonicalize(tmp.path()).unwrap();
 		for name in ["alfa.txt", "Zálohy", "zebra.txt"] {
 			fs::write(base.join(name), "x").unwrap();
 		}
@@ -807,7 +807,7 @@ mod tests {
 	#[test]
 	fn shift_f2_syncs_active_panel_to_the_other() {
 		let tmp = tempfile::TempDir::new().unwrap();
-		let base = fs::canonicalize(tmp.path()).unwrap();
+		let base = tpfs_core::canonicalize(tmp.path()).unwrap();
 		fs::create_dir_all(base.join("l/album")).unwrap();
 		fs::create_dir_all(base.join("r")).unwrap();
 		fs::write(base.join("l/album/a.jpg"), "a").unwrap();
