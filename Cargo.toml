@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members  = ["crates/planfs-core", "crates/planfs-mcp", "crates/planfs-tui", "crates/planfs"]
+
+[workspace.package]
+version      = "0.2.0"
+edition      = "2024"
+rust-version = "1.89"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/kral/tpfs"
+
+[workspace.dependencies]
+planfs-core = { path = "crates/planfs-core" }
+planfs-mcp  = { path = "crates/planfs-mcp" }
+planfs-tui  = { path = "crates/planfs-tui" }
+
+crc32fast  = "1"
+lexopt     = "0.3"
+libc       = "0.2"
+ratatui    = { version = "0.30", default-features = false, features = ["crossterm"] }
+rustix     = { version = "1", features = ["fs", "process"] }
+schemars   = "1"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2       = "0.10"
+tempfile   = "3"
+
+[profile.release]
+opt-level     = "s"
+lto           = true
+codegen-units = 1
+panic         = "abort"
+strip         = true

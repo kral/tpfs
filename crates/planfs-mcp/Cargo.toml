@@ -1,0 +1,16 @@
+[package]
+name         = "planfs-mcp"
+description  = "MCP server for planfs: agents propose file operations, humans approve them"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[dependencies]
+planfs-core = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

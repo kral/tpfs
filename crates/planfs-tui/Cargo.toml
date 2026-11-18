@@ -1,0 +1,18 @@
+[package]
+name         = "planfs-tui"
+description  = "Minimal Norton Commander-style file manager on top of planfs"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[dependencies]
+planfs-core = { workspace = true }
+ratatui     = { workspace = true }
+
+[target.'cfg(any(unix, windows))'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
