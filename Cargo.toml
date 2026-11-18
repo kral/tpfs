@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members  = ["crates/planfs-core", "crates/planfs-mcp", "crates/planfs-tui", "crates/planfs"]
+members  = ["crates/tpfs-core", "crates/tpfs-mcp", "crates/tpfs-tui", "crates/tpfs"]
 
 [workspace.package]
 version      = "0.2.0"
@@ -10,9 +10,9 @@ license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/kral/tpfs"
 
 [workspace.dependencies]
-planfs-core = { path = "crates/planfs-core" }
-planfs-mcp  = { path = "crates/planfs-mcp" }
-planfs-tui  = { path = "crates/planfs-tui" }
+tpfs-core = { path = "crates/tpfs-core" }
+tpfs-mcp  = { path = "crates/tpfs-mcp" }
+tpfs-tui  = { path = "crates/tpfs-tui" }
 
 crc32fast  = "1"
 lexopt     = "0.3"

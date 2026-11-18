@@ -1,0 +1,18 @@
+[package]
+name         = "tpfs"
+description  = "Plan, preview, apply and undo file operations safely"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[dependencies]
+lexopt      = { workspace = true }
+tpfs-core = { workspace = true }
+tpfs-mcp  = { workspace = true }
+tpfs-tui  = { workspace = true }
+serde_json  = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
