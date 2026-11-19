@@ -1475,3 +1475,42 @@ fn case_only_renames_in_a_big_folder_validate_quickly() {
 	assert!(issues.is_empty(), "{:?}", issues.first());
 	assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
 }
+
+/// Recovery records each step it rolled back: interrupted after the newest step's inverse, it
+/// resumes with the next one instead of judging the disk again (two steps here share a path).
+#[test]
+fn interrupted_recovery_resumes_after_the_steps_it_finished() {
+	let s = Sandbox::new();
+	let a = s.root.join("a.txt");
+	let b = s.root.join("b.txt");
+	fs::write(&b, "ORIGINAL").unwrap(); // after step 0 (move a -> b)
+	fs::write(&a, "ORIGINAL").unwrap(); // after step 1 (copy b -> a); then recovery trashed a…
+	let mut j = s.journal();
+	let batch = "1-reuse".to_owned();
+	j.append(&Entry::Begin {
+		batch: batch.clone(),
+		at: 0,
+		source: "human".into(),
+		reason: String::new(),
+		digest: String::new(),
+		v: 1,
+	})
+	.unwrap();
+	for (i, forward, inverse) in [
+		(0, Op::Move { from: a.clone(), to: b.clone() }, Op::Move { from: b.clone(), to: a.clone() }),
+		(1, Op::Copy { from: b.clone(), to: a.clone() }, Op::Trash { path: a.clone() }),
+	] {
+		j.append(&Entry::Intent { batch: batch.clone(), index: i, forward, inverse }).unwrap();
+		j.append(&Entry::Done { batch: batch.clone(), index: i, check: None, mode: None }).unwrap();
+	}
+	// …the first recovery trashed the copy at a, recorded it, and was cut off before step 0.
+	fs::remove_file(&a).unwrap();
+	j.append(&Entry::UndoStep { batch: batch.clone(), index: 1 }).unwrap();
+
+	let v = s.validator();
+	let report = Executor::new(&v, &mut j, s.trash()).recover().unwrap();
+	assert!(report.errors.is_empty(), "{:?}", report.errors);
+	assert_eq!(fs::read_to_string(&a).unwrap(), "ORIGINAL", "the original is back at its place");
+	assert!(!b.exists());
+	assert_eq!(j.batches().unwrap()[0].status, BatchStatus::Aborted);
+}

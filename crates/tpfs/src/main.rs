@@ -30,7 +30,7 @@ USAGE:
                 [--mirror]                        one-way: move target-only items to the trash
                 [--apply]                         confirm and execute (or --approve <digest>)
                 [--json]                          print the plan as JSON (for `tpfs apply -`)
-  tpfs undo                                     revert the most recent batch
+  tpfs undo [--approve <batch>]                 revert the most recent batch
   tpfs log                                      list recorded batches
   tpfs recover                                  roll back batches interrupted by a crash
                 [--abandon <batch>]               give up on one recovery cannot handle (damaged, or
@@ -112,7 +112,8 @@ fn allowed(command: &str) -> Option<(&'static [&'static str], usize)> {
 		"check" => (&["root", "source", "max-ops", "home"], 1),
 		"apply" => (&["root", "approve", "source", "max-ops", "home"], 1),
 		"sync" => (&["both", "mirror", "apply", "approve", "json", "home"], 2),
-		"undo" | "log" | "pending" => (&["home"], 0),
+		"undo" => (&["approve", "home"], 0),
+		"log" | "pending" => (&["home"], 0),
 		"recover" => (&["home", "abandon"], 0),
 		"mcp" => (&["root", "approval", "home"], 0),
 		"approve" | "reject" => (&["home"], 1),
@@ -312,22 +313,39 @@ fn run(args: Args) -> Res {
 				});
 			}
 			let last = batches.into_iter().rev().find(|b| b.status == BatchStatus::Committed);
-			if let Some(b) = &last
-				&& io::stdin().is_terminal()
-				&& io::stderr().is_terminal()
-			{
-				eprintln!(
-					"Undo batch {} by {} — {} step(s): {}",
-					tpfs_core::sanitize(b.id.as_ref()),
-					tpfs_core::sanitize(b.source.as_ref()),
-					b.steps.len(),
-					tpfs_core::sanitize(b.reason.as_ref())
-				);
-				for s in b.steps.iter().filter(|s| s.done && !s.undone).take(20) {
-					eprintln!("  {}", s.forward);
-				}
-				if !ask("Undo it? [y/N] ")?.eq_ignore_ascii_case("y") {
-					return Err(cancelled("cancelled; nothing was changed"));
+			if let Some(b) = &last {
+				let steps: Vec<_> = b.steps.iter().filter(|s| s.done && !s.undone).collect();
+				if let Some(approved) = &args.approve {
+					// Non-interactive: name the batch, as `apply` names the plan by its digest.
+					if *approved != b.id {
+						return Err(cancelled(format!(
+							"--approve {} does not name the newest batch ({}); nothing was changed",
+							tpfs_core::sanitize(approved.as_ref()),
+							tpfs_core::sanitize(b.id.as_ref())
+						)));
+					}
+				} else if io::stdin().is_terminal() && io::stderr().is_terminal() {
+					eprintln!(
+						"Undo batch {} by {} — {} step(s): {}",
+						tpfs_core::sanitize(b.id.as_ref()),
+						tpfs_core::sanitize(b.source.as_ref()),
+						steps.len(),
+						tpfs_core::sanitize(b.reason.as_ref())
+					);
+					for s in steps.iter().take(20) {
+						eprintln!("  {}", s.forward.normalized());
+					}
+					if steps.len() > 20 {
+						eprintln!("  … and {} more (see `tpfs log`)", steps.len() - 20);
+					}
+					if !ask("Undo it? [y/N] ")?.eq_ignore_ascii_case("y") {
+						return Err(cancelled("cancelled; nothing was changed"));
+					}
+				} else {
+					return Err(cancelled(format!(
+						"not interactive: pass --approve {} to undo exactly that batch (see `tpfs log`)",
+						tpfs_core::sanitize(b.id.as_ref())
+					)));
 				}
 			}
 			match Executor::new(&validator, &mut journal, trash).undo_last() {

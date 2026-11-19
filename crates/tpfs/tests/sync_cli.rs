@@ -51,7 +51,12 @@ fn dry_run_approve_digest_and_undo() {
 	assert!(stdout(&tpfs(&home, &["sync", s, d])).contains("Nothing to sync"));
 
 	// Undo through the shared journal.
-	assert!(tpfs(&home, &["undo"]).status.success());
+	let id = {
+		let mut j = tpfs_core::Journal::open(home.join("journal.jsonl")).unwrap();
+		j.batches().unwrap().pop().unwrap().id
+	};
+	let out = tpfs(&home, &["undo", "--approve", &id]);
+	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 	assert!(!dst.join("album").exists());
 }
 

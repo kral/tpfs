@@ -219,21 +219,19 @@ impl Server {
 
 		// Keep at most a bounded number of entries in memory, however big the folder is.
 		const SCAN: usize = 100_000;
-		let mut total = 0usize;
 		let mut entries: Vec<(bool, String, u64)> = Vec::new();
 		// Listed relative to the folder's own confined handle: a folder swapped for a link after the
 		// check above is refused instead of followed out of the allowed folders.
-		let listing =
-			tpfs_core::list_confined(self.validator.roots(), &dir).map_err(|e| format!("{}: {e}", show(&dir)))?;
+		let (listing, all) = tpfs_core::list_confined(self.validator.roots(), &dir, SCAN)
+			.map_err(|e| format!("{}: {}", show(&dir), sanitize(e.to_string().as_ref())))?;
+		let mut total = all;
 		for e in listing {
 			// tpfs's own working entries (local trash, partial copies) are not the agent's business.
 			if tpfs_core::is_own_name(&e.name) {
+				total -= 1;
 				continue;
 			}
-			total += 1;
-			if entries.len() < SCAN {
-				entries.push((e.dir, sanitize(&e.name), e.size));
-			}
+			entries.push((e.dir, sanitize(&e.name), e.size));
 		}
 		entries.sort_by_cached_key(|e| (!e.0, e.1.to_lowercase()));
 

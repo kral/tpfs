@@ -10,6 +10,13 @@ fn tpfs(home: &Path, args: &[&str]) -> Output {
 	Command::new(env!("CARGO_BIN_EXE_tpfs")).args(args).env("TPFS_HOME", home).stdin(Stdio::null()).output().unwrap()
 }
 
+/// The newest committed batch (the journal is opened only while no child runs).
+fn newest_batch(home: &Path) -> Option<String> {
+	let mut j = tpfs_core::Journal::open(home.join("journal.jsonl")).unwrap();
+	let b = j.batches().unwrap().into_iter().rev().find(|b| b.status == tpfs_core::BatchStatus::Committed);
+	b.map(|b| b.id)
+}
+
 fn code(o: &Output) -> i32 {
 	o.status.code().unwrap()
 }
@@ -169,8 +176,11 @@ fn two_way_sync_by_digest_is_idempotent_and_undoable() {
 		let again = String::from_utf8(tpfs(&home, &args).stdout).unwrap();
 		assert!(again.contains("Nothing to sync"), "{mode:?} is not idempotent:\n{again}");
 	}
-	assert_eq!(code(&tpfs(&home, &["undo"])), 0);
-	assert_eq!(code(&tpfs(&home, &["undo"])), 0);
+	assert_eq!(code(&tpfs(&home, &["undo"])), 4, "not interactive and no batch named: nothing undone");
+	assert_eq!(code(&tpfs(&home, &["undo", "--approve", "nope"])), 4);
+	while let Some(id) = newest_batch(&home) {
+		assert_eq!(code(&tpfs(&home, &["undo", "--approve", &id])), 0);
+	}
 	assert!(l.join("only-l.txt").exists() && !l.join("only-r.txt").exists());
 	assert!(r.join("only-r.txt").exists() && !r.join("only-l.txt").exists());
 }

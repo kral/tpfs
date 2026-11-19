@@ -425,13 +425,14 @@ impl App {
 				};
 				self.dialog = Some(Dialog::Drives { panel, items, cursor });
 			}
-			// Only Low risk proceeds on Enter. Medium needs a deliberate `y`; High needs `y` after
+			// Only a Low-risk plan that removes nothing (a routine F5/F6/F7) proceeds on Enter, so a
+			// stray Enter never trashes anything. Otherwise a deliberate `y`; High needs `y` after
 			// every operation has been on screen. Nothing proceeds if the dialog does not fit.
 			(Some(Dialog::Confirm { plan, risk, issues, mut offset, fits, seen_all, summary }), code) => {
 				let ok = issues.is_empty() && fits;
 				let level = risk.level;
 				match code {
-					KeyCode::Enter if ok && level == risk::Level::Low => return self.execute(&plan),
+					KeyCode::Enter if ok && level == risk::Level::Low && !removes(&plan) => return self.execute(&plan),
 					KeyCode::Char('y' | 'Y') if ok && (level != risk::Level::High || seen_all) => {
 						return self.execute(&plan);
 					}
@@ -704,6 +705,11 @@ fn one_line(e: &ExecError) -> String {
 	e.to_string().lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ")
 }
 
+/// Whether a plan takes anything away from where it is: trash or folder removal.
+pub(crate) fn removes(plan: &Plan) -> bool {
+	plan.ops.iter().any(|op| matches!(op, tpfs_core::Op::Trash { .. } | tpfs_core::Op::Rmdir { .. }))
+}
+
 #[cfg(test)]
 mod tests {
 	use std::fs;
@@ -774,6 +780,24 @@ mod tests {
 		key(&mut app, KeyCode::F(9));
 		key(&mut app, KeyCode::Char('y'));
 		assert!(!right.join("a.txt").exists());
+	}
+
+	#[test]
+	fn a_stray_enter_never_trashes_anything() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+		let (left, right, state) = (base.join("left"), base.join("right"), base.join("state"));
+		fs::create_dir_all(&left).unwrap();
+		fs::create_dir(&right).unwrap();
+		fs::write(left.join("a.txt"), "A").unwrap();
+		let mut app = App::new(left.clone(), right, state, false).unwrap();
+		select(&mut app, "a.txt");
+		key(&mut app, KeyCode::F(8)); // one file to the trash: low risk, but it removes something
+		key(&mut app, KeyCode::Enter);
+		key(&mut app, KeyCode::Enter);
+		assert!(left.join("a.txt").exists() && app.dialog.is_some(), "Enter trashed the file");
+		key(&mut app, KeyCode::Char('y'));
+		assert!(!left.join("a.txt").exists());
 	}
 
 	#[test]

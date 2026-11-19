@@ -27,8 +27,16 @@ pub struct Listed {
 
 /// List `dir`, which must be below one of `roots`, without following any link on the way: the
 /// listing and each entry's kind and size are read relative to the directory's own confined handle.
-pub fn list_confined(roots: &[PathBuf], dir: &Path) -> io::Result<Vec<Listed>> {
-	Fs::confined(roots).list_entries(dir, true)
+/// At most `max` entries are returned (memory stays bounded); the second value counts them all.
+/// A `dir` outside every root is refused.
+pub fn list_confined(roots: &[PathBuf], dir: &Path, max: usize) -> io::Result<(Vec<Listed>, usize)> {
+	if !roots.iter().any(|r| dir.starts_with(r)) {
+		return Err(io::Error::new(
+			io::ErrorKind::PermissionDenied,
+			format!("refused: {} is outside the allowed folders", crate::sanitize(dir.as_os_str())),
+		));
+	}
+	Fs::confined(roots).list_entries(dir, true, max)
 }
 
 pub(crate) struct Fs {
@@ -165,27 +173,33 @@ impl Fs {
 	/// Names in a directory, read through a confined descriptor where possible, so a directory
 	/// swapped for a symlink is not followed out of the root.
 	fn list(&self, dir: &Path) -> io::Result<Vec<std::ffi::OsString>> {
-		Ok(self.list_entries(dir, false)?.into_iter().map(|l| l.name).collect())
+		Ok(self.list_entries(dir, false, usize::MAX)?.0.into_iter().map(|l| l.name).collect())
 	}
 
 	/// Entries of a directory with (when `meta`) their kind and size, all read relative to the
 	/// directory's own confined handle, so nothing outside the roots is listed or measured.
-	pub(crate) fn list_entries(&self, dir: &Path, meta: bool) -> io::Result<Vec<Listed>> {
+	/// At most `max` entries are kept; the second value counts them all.
+	pub(crate) fn list_entries(&self, dir: &Path, meta: bool, max: usize) -> io::Result<(Vec<Listed>, usize)> {
 		self.guard(dir)?;
 		#[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
-		if let Some(result) = confined::list(&self.anchors, dir, meta) {
+		if let Some(result) = confined::list(&self.anchors, dir, meta, max) {
 			return result;
 		}
 		let mut out = Vec::new();
+		let mut total = 0usize;
 		for e in fs::read_dir(dir)? {
 			let e = e?;
+			total += 1;
+			if out.len() >= max {
+				continue;
+			}
 			let mut l = Listed { name: e.file_name(), ..Default::default() };
 			if meta && let Ok(m) = fs::symlink_metadata(e.path()) {
 				(l.dir, l.link, l.size) = (m.is_dir(), m.file_type().is_symlink(), m.len());
 			}
 			out.push(l);
 		}
-		Ok(out)
+		Ok((out, total))
 	}
 
 	/// Permissions of a directory just created by a copy, set through a confined descriptor.
@@ -307,6 +321,10 @@ impl Fs {
 		let ft = meta.file_type();
 
 		if ft.is_file() {
+			// Both sides first: one side under an anchored root must not let the other side, under a
+			// root without an anchor, go through plain path calls unchecked.
+			self.guard(from)?;
+			self.guard(to)?;
 			#[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
 			if let Some((src, dst)) = confined::open_copy_pair(&self.anchors, from, to, &meta)? {
 				check_regular(&src, from)?;
@@ -314,8 +332,6 @@ impl Fs {
 				copied.push(Copied::of(rel, &meta));
 				return Ok(());
 			}
-			self.guard(from)?;
-			self.guard(to)?;
 			let src = open_regular(from)?;
 			let dst = OpenOptions::new().write(true).create_new(true).open(to)?;
 			copy_stream(src, dst, from, &meta)?;
@@ -684,8 +700,28 @@ mod confined {
 			&self.root
 		}
 
+		/// The root is canonical, so it has no symlink in it: open it so that none is followed either,
+		/// or a root swapped for a link after validation would bind every operation to the link's
+		/// target (`openat2(RESOLVE_NO_SYMLINKS)` on Linux, `O_NOFOLLOW_ANY` on macOS).
 		pub(super) fn open(root: &Path) -> Option<Self> {
-			let fd = rustix::fs::open(root, DIR | OFlags::CLOEXEC, Mode::empty()).ok()?;
+			#[cfg(target_os = "linux")]
+			let fd = match openat2(
+				rustix::fs::CWD,
+				root,
+				DIR | OFlags::CLOEXEC,
+				Mode::empty(),
+				ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+			) {
+				Ok(fd) => fd,
+				// No openat2: operations are refused anyway unless the user opted out of confinement.
+				Err(Errno::NOSYS) => rustix::fs::open(root, DIR | OFlags::CLOEXEC, Mode::empty()).ok()?,
+				Err(_) => return None,
+			};
+			#[cfg(target_vendor = "apple")]
+			let fd = {
+				let follow = if nofollow_any_works() { NOFOLLOW_ANY } else { OFlags::empty() };
+				rustix::fs::open(root, DIR | OFlags::CLOEXEC | follow, Mode::empty()).ok()?
+			};
 			Some(Self { root: root.to_path_buf(), fd })
 		}
 	}
@@ -826,7 +862,12 @@ mod confined {
 	}
 
 	/// List a directory opened beneath its root without following symlinks.
-	pub(super) fn list(anchors: &[Anchor], dir: &Path, meta: bool) -> Option<io::Result<Vec<super::Listed>>> {
+	pub(super) fn list(
+		anchors: &[Anchor],
+		dir: &Path,
+		meta: bool,
+		max: usize,
+	) -> Option<io::Result<(Vec<super::Listed>, usize)>> {
 		use std::os::unix::ffi::OsStrExt;
 		let anchor = anchors.iter().filter(|a| dir.starts_with(&a.root)).max_by_key(|a| a.root.as_os_str().len())?;
 		let rel = dir.strip_prefix(&anchor.root).ok()?;
@@ -846,10 +887,15 @@ mod confined {
 		};
 		Some((|| {
 			let mut names = Vec::new();
+			let mut total = 0usize;
 			for entry in rustix::fs::Dir::read_from(&fd)? {
 				let entry = entry?;
 				let name = entry.file_name().to_bytes();
 				if name != b"." && name != b".." {
+					total += 1;
+					if names.len() >= max {
+						continue;
+					}
 					let mut l = super::Listed { name: OsStr::from_bytes(name).to_os_string(), ..Default::default() };
 					if meta && let Ok(st) = rustix::fs::statat(&fd, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW) {
 						let ft = rustix::fs::FileType::from_raw_mode(st.st_mode as _);
@@ -860,7 +906,7 @@ mod confined {
 					names.push(l);
 				}
 			}
-			Ok(names)
+			Ok((names, total))
 		})())
 	}
 
@@ -937,10 +983,10 @@ mod confined {
 				CreateFileW, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
 				FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_DISPOSITION_INFO,
 				FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FULL_DIR_INFO, FILE_GENERIC_READ,
-				FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-				FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FileAttributeTagInfo, FileBasicInfo,
-				FileDispositionInfo, FileFullDirectoryInfo, FileFullDirectoryRestartInfo, GetFileInformationByHandleEx,
-				OPEN_EXISTING, SYNCHRONIZE, SetFileInformationByHandle,
+				FILE_GENERIC_WRITE, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+				FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FileAttributeTagInfo,
+				FileBasicInfo, FileDispositionInfo, FileFullDirectoryInfo, FileFullDirectoryRestartInfo, FileIdInfo,
+				GetFileInformationByHandleEx, OPEN_EXISTING, SYNCHRONIZE, SetFileInformationByHandle,
 			},
 			System::IO::IO_STATUS_BLOCK,
 		},
@@ -956,7 +1002,39 @@ mod confined {
 			&self.root
 		}
 
+		/// Opened component by component from the drive or share root, refusing any link on the way
+		/// (not only at the end): a root swapped for a junction after validation is not followed.
 		pub(super) fn open(root: &Path) -> Option<Self> {
+			use std::path::Component;
+			let mut comps = root.components();
+			let mut base = PathBuf::new();
+			for c in comps.by_ref() {
+				base.push(c.as_os_str());
+				if matches!(c, Component::RootDir) {
+					break;
+				}
+			}
+			let mut handle = Self::open_base(&base)?;
+			for c in comps {
+				let Component::Normal(name) = c else { return None };
+				let h = nt_open(
+					raw(&handle),
+					name,
+					FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
+					FILE_SHARE_READ | FILE_SHARE_WRITE,
+					FILE_OPEN,
+					FILE_DIRECTORY_FILE,
+				)
+				.ok()?;
+				if is_reparse(&h).ok()? {
+					return None;
+				}
+				handle = h;
+			}
+			Some(Self { root: root.to_path_buf(), handle })
+		}
+
+		fn open_base(root: &Path) -> Option<OwnedHandle> {
 			let w: Vec<u16> = crate::path::win_api_path(root).encode_wide().chain(Some(0)).collect();
 			// SAFETY: `w` is NUL-terminated and outlives the call; no security attributes or template.
 			let h = unsafe {
@@ -975,7 +1053,7 @@ mod confined {
 			}
 			// SAFETY: `h` is a fresh, valid handle that nothing else owns.
 			let handle = unsafe { OwnedHandle::from_raw_handle(h as RawHandle) };
-			(!is_reparse(&handle).ok()?).then(|| Self { root: root.to_path_buf(), handle })
+			(!is_reparse(&handle).ok()?).then_some(handle)
 		}
 	}
 
@@ -988,6 +1066,36 @@ mod confined {
 			io::ErrorKind::PermissionDenied,
 			format!("refused: {} goes through a link (symlink, junction or mount point)", path.display()),
 		)
+	}
+
+	/// Whether `h` is a reparse point of any kind (a link, or a file whose data a filter driver
+	/// supplies: compressed by WOF, deduplicated, a cloud placeholder).
+	fn any_reparse(h: &OwnedHandle) -> io::Result<bool> {
+		let mut info = FILE_ATTRIBUTE_TAG_INFO { FileAttributes: 0, ReparseTag: 0 };
+		// SAFETY: `info` is a valid buffer of the size passed for this information class.
+		let ok = unsafe {
+			GetFileInformationByHandleEx(
+				raw(h),
+				FileAttributeTagInfo,
+				(&raw mut info).cast(),
+				size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+			)
+		};
+		if ok == 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+	}
+
+	/// The volume and 128-bit file id behind a handle.
+	fn id_of(h: &OwnedHandle) -> io::Result<(u64, [u8; 16])> {
+		// SAFETY: an all-zero FILE_ID_INFO is a valid value; the buffer has the size passed.
+		let mut id: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+		// SAFETY: `h` is open and `id` is a valid out-buffer of the size passed.
+		let ok = unsafe {
+			GetFileInformationByHandleEx(raw(h), FileIdInfo, (&raw mut id).cast(), size_of::<FILE_ID_INFO>() as u32)
+		};
+		if ok == 0 { Err(io::Error::last_os_error()) } else { Ok((id.VolumeSerialNumber, id.FileId.Identifier)) }
 	}
 
 	/// Whether `h` is a link: a reparse point whose tag is a name surrogate.
@@ -1020,6 +1128,19 @@ mod confined {
 		disposition: u32,
 		options: u32,
 	) -> io::Result<OwnedHandle> {
+		nt_open_with(root, name, access, share, disposition, options | FILE_OPEN_REPARSE_POINT)
+	}
+
+	/// `NtCreateFile` relative to `root` with exactly these options (callers add
+	/// `FILE_OPEN_REPARSE_POINT` unless they deliberately let a filter driver supply the data).
+	fn nt_open_with(
+		root: HANDLE,
+		name: &OsStr,
+		access: u32,
+		share: u32,
+		disposition: u32,
+		options: u32,
+	) -> io::Result<OwnedHandle> {
 		let mut wide: Vec<u16> = name.encode_wide().collect();
 		let bytes = u16::try_from(wide.len() * 2).map_err(|_| io::Error::other("name too long"))?;
 		let us = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: wide.as_mut_ptr() };
@@ -1045,7 +1166,7 @@ mod confined {
 				FILE_ATTRIBUTE_NORMAL,
 				share,
 				disposition,
-				options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+				options | FILE_SYNCHRONOUS_IO_NONALERT,
 				std::ptr::null(),
 				0,
 			)
@@ -1305,7 +1426,12 @@ mod confined {
 		)))
 	}
 
-	pub(super) fn list(anchors: &[Anchor], dir: &Path, _meta: bool) -> Option<io::Result<Vec<super::Listed>>> {
+	pub(super) fn list(
+		anchors: &[Anchor],
+		dir: &Path,
+		_meta: bool,
+		max: usize,
+	) -> Option<io::Result<(Vec<super::Listed>, usize)>> {
 		let a = anchor_of(anchors, dir)?;
 		Some((|| {
 			let h = if dir == a.root {
@@ -1327,6 +1453,7 @@ mod confined {
 			};
 			let dh = h.as_ref().map_or(raw(&a.handle), raw);
 			let mut names = Vec::new();
+			let mut total = 0usize;
 			let mut buf = vec![0u64; 8192];
 			let mut class = FileFullDirectoryRestartInfo;
 			loop {
@@ -1360,7 +1487,10 @@ mod confined {
 						)
 					};
 					let name = OsString::from_wide(&name);
-					if name != "." && name != ".." {
+					if name != "." && name != ".." && {
+						total += 1;
+						names.len() < max
+					} {
 						let link = attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 && tag & 0x2000_0000 != 0;
 						names.push(super::Listed {
 							name,
@@ -1375,7 +1505,7 @@ mod confined {
 					offset += next;
 				}
 			}
-			Ok(names)
+			Ok((names, total))
 		})())
 	}
 
@@ -1405,7 +1535,25 @@ mod confined {
 				if is_reparse(&h)? {
 					return Err(refused(from));
 				}
-				File::from(h)
+				if any_reparse(&h)? {
+					// Not a link, but its data comes from a filter driver (WOF compression, dedup, a
+					// cloud placeholder): read through the driver, or the copy gets the raw on-disk
+					// stream (zeros). Reopened relative to the same held folder; it must be the same file.
+					let data = nt_open_with(
+						l.parent(a),
+						l.name,
+						FILE_GENERIC_READ,
+						FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+						FILE_OPEN,
+						FILE_NON_DIRECTORY_FILE,
+					)?;
+					if id_of(&data)? != id_of(&h)? {
+						return Err(refused(from));
+					}
+					File::from(data)
+				} else {
+					File::from(h)
+				}
 			}
 			None => File::open(from)?,
 		};

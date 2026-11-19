@@ -339,7 +339,8 @@ fn draw_confirm(
 		"Terminal too small to review this plan — enlarge it.   [ Esc: Cancel ]".to_owned()
 	} else {
 		match risk.level {
-			Level::Low => "[ Enter: Proceed ]   [ Esc: Cancel ]".to_owned(),
+			Level::Low if !crate::app::removes(plan) => "[ Enter: Proceed ]   [ Esc: Cancel ]".to_owned(),
+			Level::Low => "[ Y: Proceed ]   [ Esc: Cancel ]".to_owned(),
 			Level::Medium => "[ Y: Proceed ]   [ Esc: Cancel ]".to_owned(),
 			_ if at_end => "[ Y: Proceed ]   [ Esc: Cancel ]".to_owned(),
 			_ => "↓ PgDn: read the whole list to proceed   [ Esc: Cancel ]".to_owned(),

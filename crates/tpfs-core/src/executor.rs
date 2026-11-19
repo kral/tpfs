@@ -369,8 +369,12 @@ impl<'a> Executor<'a> {
 			Op::Move { from, to } => {
 				let part = part_path(&n(to), &t);
 				if step.undo_published && !exists(&part) && exists(&n(from)) && exists(&n(to)) {
-					// An earlier attempt published its copy (the part is gone, renamed into place):
-					// what is left at the old place duplicates it.
+					// An earlier attempt may have published its copy (the part is gone, renamed into
+					// place) and stopped while removing the rest: only if everything left at the old
+					// place is in the copy is it a duplicate. Otherwise the new place is someone else's.
+					if !duplicated_in(&n(from), &n(to)) {
+						return Err(both_exist(&n(from), &n(to)));
+					}
 					return apply(&Op::Trash { path: n(from) }, fs, &self.trash, &label, step.index, None, &mut || {
 						Ok(())
 					});
@@ -383,6 +387,9 @@ impl<'a> Executor<'a> {
 				if step.undo_published && !exists(&part) && exists(&slot) && exists(&n(path)) {
 					// An earlier attempt got the item into its trash slot and stopped while removing
 					// the original: what is left duplicates it; it goes to a trash slot of its own.
+					if !duplicated_in(&n(path), &slot) {
+						return Err(both_exist(&n(path), &slot));
+					}
 					let rest = format!("{label}-rest");
 					return apply(&Op::Trash { path: n(path) }, fs, &self.trash, &rest, step.index, None, &mut || {
 						Ok(())
@@ -492,21 +499,27 @@ impl<'a> Executor<'a> {
 				continue;
 			}
 			let mut errors = Vec::new();
-			for step in batch.steps.iter().rev() {
+			// Each step rolled back is recorded (as undo does), so an interrupted recovery resumes
+			// after it instead of guessing from the disk, where two steps may share a path.
+			for step in batch.steps.iter().rev().filter(|s| !s.undone) {
 				if step.done {
 					let result = self
 						.check_journaled(&step.inverse)
 						.and_then(|()| self.copy_unchanged(step))
 						.map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))
 						.and_then(|()| self.replay(&fs, &batch.id, "recover", step));
-					if let Err(e) = result {
-						errors.push(clean(format!("{}: {e}", step.inverse)));
+					match result {
+						Ok(()) => {
+							self.journal.write(&Entry::UndoStep { batch: batch.id.clone(), index: step.index })?
+						}
+						Err(e) => errors.push(clean(format!("{}: {e}", step.inverse))),
 					}
 					continue;
 				}
 				if step.failed {
 					continue; // its own call failed and its marks were cleaned up
 				}
+				let mut clean_step = true;
 				for fix in cleanup(&step.forward, &step.inverse, &tag(&batch.id, step.index), step.published) {
 					let result = match &fix {
 						Fix::Op(op) => {
@@ -517,7 +530,11 @@ impl<'a> Executor<'a> {
 					.and_then(|()| apply_fix(&fix, &fs, &self.trash, &format!("{}-recover", batch.id), step.index));
 					if let Err(e) = result {
 						errors.push(clean(format!("{fix}: {e}")));
+						clean_step = false;
 					}
+				}
+				if clean_step {
+					self.journal.write(&Entry::UndoStep { batch: batch.id.clone(), index: step.index })?;
 				}
 			}
 			if errors.is_empty() {
@@ -652,6 +669,55 @@ fn fingerprint(path: &Path) -> Option<String> {
 	let mut budget = 100_000;
 	walk(path, Path::new(""), &mut h, &mut budget)?;
 	Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Whether everything in `rest` (a file, or a folder tree) is also in `copy` at the same relative
+/// place, with the same kind, size and modification time (copies keep the time; 2 s tolerance for
+/// FAT): then `rest` is what is left of an original after its copy was published.
+fn duplicated_in(rest: &Path, copy: &Path) -> bool {
+	fn same(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+		let t = |m: &fs::Metadata| m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok());
+		let close = match (t(a), t(b)) {
+			(Some(x), Some(y)) => x.abs_diff(y) <= std::time::Duration::from_secs(2),
+			_ => false,
+		};
+		a.file_type() == b.file_type() && (a.is_dir() || (a.len() == b.len() && close))
+	}
+	let mut budget = 1_000_000usize;
+	let mut stack = vec![(rest.to_path_buf(), copy.to_path_buf())];
+	while let Some((r, c)) = stack.pop() {
+		let (Ok(rm), Ok(cm)) = (fs::symlink_metadata(&r), fs::symlink_metadata(&c)) else { return false };
+		if !same(&rm, &cm) {
+			return false;
+		}
+		if rm.file_type().is_symlink() && fs::read_link(&r).ok() != fs::read_link(&c).ok() {
+			return false;
+		}
+		if rm.is_dir() {
+			let Ok(rd) = fs::read_dir(&r) else { return false };
+			for e in rd {
+				let Ok(e) = e else { return false };
+				budget = match budget.checked_sub(1) {
+					Some(b) => b,
+					None => return false,
+				};
+				stack.push((e.path(), c.join(e.file_name())));
+			}
+		}
+	}
+	true
+}
+
+fn both_exist(old: &Path, new: &Path) -> io::Error {
+	io::Error::new(
+		io::ErrorKind::AlreadyExists,
+		format!(
+			"{} and {} both exist and differ; an earlier attempt did not finish here, or someone else put a file there. \
+			 Nothing was changed: check both, keep what you need, and run it again",
+			crate::sanitize(old.as_os_str()),
+			crate::sanitize(new.as_os_str())
+		),
+	)
 }
 
 /// Private tag of one step, used for its in-progress names.

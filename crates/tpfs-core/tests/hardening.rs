@@ -489,3 +489,19 @@ fn a_link_swapped_in_redirects_no_kind_of_operation() {
 		assert_eq!(fs::read_to_string(s.root.join("g.txt")).unwrap(), "G", "{what}");
 	}
 }
+
+/// An allowed root swapped for a link after validation does not bind the listing (or any
+/// operation) to the link's target.
+#[test]
+fn a_root_swapped_for_a_link_is_not_followed() {
+	let s = Sandbox::new();
+	let roots = vec![s.root.clone()];
+	let outside = s.base.join("outside");
+	fs::create_dir(&outside).unwrap();
+	fs::write(outside.join("secret.txt"), "secret").unwrap();
+	fs::rename(&s.root, s.base.join("root-real")).unwrap();
+	link_dir(&outside, &s.root);
+	let listed = tpfs_core::list_confined(&roots, &s.root, 100);
+	assert!(listed.is_err(), "listed the link's target: {listed:?}");
+	assert!(tpfs_core::list_confined(&roots, &outside, 100).is_err(), "a folder outside the roots was listed");
+}
