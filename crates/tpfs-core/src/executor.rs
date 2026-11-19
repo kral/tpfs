@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-	fsops::{Fs, same_file, sync_parent},
+	fsops::{Fs, merge_back, part_path, remove_part, same_file, sync_parent},
 	journal::{BatchStatus, Entry, Journal},
 	op::{Op, Plan},
 	path::{exists, normalize},
@@ -169,7 +169,17 @@ impl<'a> Executor<'a> {
 				hook(i, Phase::BeforeApply);
 			}
 
-			match apply(op, &fs, &self.trash, &batch, i, Some(&inverse)) {
+			let published = std::cell::Cell::new(false);
+			let result = {
+				let journal = &mut self.journal;
+				let mut publish = || {
+					journal.append(&Entry::Published { batch: batch.clone(), index: i })?;
+					published.set(true);
+					Ok(())
+				};
+				apply(op, &fs, &self.trash, &batch, i, Some(&inverse), &mut publish)
+			};
+			match result {
 				Ok(()) => {
 					if let Some(hook) = &mut self.hook {
 						hook(i, Phase::AfterApply);
@@ -178,14 +188,13 @@ impl<'a> Executor<'a> {
 					applied.push(inverse);
 				}
 				Err(error) => {
+					// Clean up what this step may have left, judged from the disk and from whether its
+					// copy was published. A target that is not provably ours is left alone.
 					let mut rollback_errors = Vec::new();
-					// A target that "already exists" belongs to someone else (it appeared after the
-					// re-check): leave it alone. Otherwise the step may have left a partial result.
-					if error.kind() != io::ErrorKind::AlreadyExists
-						&& let Some(fix) = cleanup(op, &inverse)
-						&& let Err(e) = apply(&fix, &fs, &self.trash, &format!("{batch}-rollback"), i, None)
-					{
-						rollback_errors.push(format!("{fix}: {e}"));
+					for fix in cleanup(op, &inverse, &tag(&batch, i), published.get()) {
+						if let Err(e) = apply_fix(&fix, &fs, &self.trash, &format!("{batch}-rollback"), i) {
+							rollback_errors.push(format!("{fix}: {e}"));
+						}
 					}
 					rollback_errors.extend(self.revert(&fs, &applied, &batch));
 					self.journal.append(&Entry::Abort { batch })?;
@@ -207,8 +216,15 @@ impl<'a> Executor<'a> {
 
 		let mut errors = Vec::new();
 		for step in batch.steps.iter().rev().filter(|s| s.done && !s.undone) {
-			match apply(&step.inverse, &Fs::unconfined(), &self.trash, &format!("{}-undo", batch.id), step.index, None)
-			{
+			match apply(
+				&step.inverse,
+				&Fs::unconfined(),
+				&self.trash,
+				&format!("{}-undo", batch.id),
+				step.index,
+				None,
+				&mut || Ok(()),
+			) {
 				Ok(()) => self.journal.append(&Entry::UndoStep { batch: batch.id.clone(), index: step.index })?,
 				Err(e) => {
 					errors.push(format!("{}: {e}", step.inverse));
@@ -243,12 +259,17 @@ impl<'a> Executor<'a> {
 		let mut report = RecoveryReport::default();
 		for batch in batches {
 			for step in batch.steps.iter().rev() {
-				let fix = if step.done { Some(step.inverse.clone()) } else { cleanup(&step.forward, &step.inverse) };
-				if let Some(fix) = fix
-					&& let Err(e) =
-						apply(&fix, &Fs::unconfined(), &self.trash, &format!("{}-recover", batch.id), step.index, None)
-				{
-					report.errors.push(format!("{fix}: {e}"));
+				let fixes = if step.done {
+					vec![Fix::Op(step.inverse.clone())]
+				} else {
+					cleanup(&step.forward, &step.inverse, &tag(&batch.id, step.index), step.published)
+				};
+				for fix in fixes {
+					if let Err(e) =
+						apply_fix(&fix, &Fs::unconfined(), &self.trash, &format!("{}-recover", batch.id), step.index)
+					{
+						report.errors.push(format!("{fix}: {e}"));
+					}
 				}
 			}
 			self.journal.append(&Entry::Abort { batch: batch.id.clone() })?;
@@ -263,7 +284,9 @@ impl<'a> Executor<'a> {
 			.enumerate()
 			.rev()
 			.filter_map(|(i, inv)| {
-				apply(inv, fs, &self.trash, &format!("{batch}-rollback"), i, None).err().map(|e| format!("{inv}: {e}"))
+				apply(inv, fs, &self.trash, &format!("{batch}-rollback"), i, None, &mut || Ok(()))
+					.err()
+					.map(|e| format!("{inv}: {e}"))
 			})
 			.collect()
 	}
@@ -286,28 +309,49 @@ impl<'a> Executor<'a> {
 	}
 }
 
+/// Private tag of one step, used for its in-progress names.
+fn tag(batch: &str, index: usize) -> String {
+	format!("{batch}-{index}")
+}
+
 /// Perform one operation. Inverse operations of `trash` are plain moves out of the trash.
 /// `planned` is the journaled inverse: a `trash` goes exactly to the slot recorded there.
-fn apply(op: &Op, fs: &Fs, trash: &Path, batch: &str, index: usize, planned: Option<&Op>) -> io::Result<()> {
+/// `publish` is called when a copy has been published at its target (see [`Entry::Published`]).
+fn apply(
+	op: &Op,
+	fs: &Fs,
+	trash: &Path,
+	batch: &str,
+	index: usize,
+	planned: Option<&Op>,
+	publish: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<()> {
 	let n = |p: &Path| normalize(p).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "relative path"));
+	let tag = tag(batch, index);
 	match op {
-		Op::Move { from, to } => fs.move_any(&n(from)?, &n(to)?),
+		Op::Move { from, to } => {
+			let to = n(to)?;
+			fs.move_any(&n(from)?, &to, &part_path(&to, &tag), publish)
+		}
 		Op::Copy { from, to } => {
 			let to = n(to)?;
-			fs.copy_any(&n(from)?, &to)?;
-			sync_parent(&to);
-			Ok(())
+			fs.copy_to(&n(from)?, &to, &part_path(&to, &tag), publish)
 		}
 		Op::Rename { path, new_name } => {
 			let path = n(path)?;
 			let to = path.with_file_name(new_name);
 			if path != to && same_file(&path, &to) {
 				// Only the letter case changes on a case-insensitive file system: go through a temporary name.
-				let tmp = path.with_file_name(format!(".tpfs-case-{batch}-{index}"));
+				let tmp = case_tmp(&path, &tag);
 				fs.rename_noreplace(&path, &tmp)?;
 				if let Err(e) = fs.rename_noreplace(&tmp, &to) {
-					let _ = fs.rename_noreplace(&tmp, &path);
-					return Err(e);
+					return match fs.rename_noreplace(&tmp, &path) {
+						Ok(()) => Err(e),
+						Err(back) => Err(io::Error::new(
+							e.kind(),
+							format!("{e}; the file is left at {} ({back})", tmp.display()),
+						)),
+					};
 				}
 			} else {
 				fs.rename_noreplace(&path, &to)?;
@@ -321,8 +365,10 @@ fn apply(op: &Op, fs: &Fs, trash: &Path, batch: &str, index: usize, planned: Opt
 				Some(Op::Move { from, .. }) => from.clone(),
 				_ => trash_slot(trash, batch, index, &path),
 			};
-			fs::create_dir_all(slot.parent().expect("slot has a parent"))?;
-			fs.move_any(&path, &slot)
+			let parent = slot.parent().ok_or_else(|| io::Error::other("trash slot without a parent"))?;
+			fs::create_dir_all(parent)?;
+			sync_parent(parent);
+			fs.move_any(&path, &slot, &part_path(&slot, &tag), publish)
 		}
 		Op::Mkdir { path } => {
 			let path = n(path)?;
@@ -339,34 +385,115 @@ fn apply(op: &Op, fs: &Fs, trash: &Path, batch: &str, index: usize, planned: Opt
 	}
 }
 
-/// What to do to clean up after `forward` when the journal has an `intent` but no `done`
-/// (a crash or a failed step), judged from the disk. Targets never exist before a step runs
-/// (validation guarantees it), so anything found there is ours.
-fn cleanup(forward: &Op, inverse: &Op) -> Option<Op> {
-	let n = |p: &Path| normalize(p).unwrap_or_else(|| p.to_path_buf());
-	match (forward, inverse) {
-		(Op::Copy { to, .. }, _) => exists(&n(to)).then(|| Op::Trash { path: n(to) }),
-		(Op::Mkdir { path }, _) => exists(&n(path)).then(|| inverse.clone()),
-		(Op::Rmdir { path }, _) => (!exists(&n(path))).then(|| inverse.clone()),
-		// Move and trash: the inverse moves the target back to the source.
-		(_, Op::Move { from: target, to: source }) => moved_back(&n(target), &n(source), inverse),
-		// Rename: the inverse renames the new name back.
-		(Op::Rename { path: source, .. }, Op::Rename { path: target, .. }) => {
-			moved_back(&n(target), &n(source), inverse)
+fn case_tmp(path: &Path, tag: &str) -> PathBuf {
+	path.with_file_name(format!(".tpfs-case-{tag}"))
+}
+
+/// One clean-up action after a step that did not finish.
+#[derive(Debug)]
+enum Fix {
+	Op(Op),
+	/// Delete a partial copy under its private name.
+	RemovePart(PathBuf),
+	/// A cross-device move stopped while removing the source: put back what was removed.
+	MergeBack {
+		target: PathBuf,
+		source: PathBuf,
+	},
+	/// A letter-case rename stopped between its two renames.
+	RestoreCase {
+		tmp: PathBuf,
+		path: PathBuf,
+	},
+}
+
+impl fmt::Display for Fix {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Fix::Op(op) => write!(f, "{op}"),
+			Fix::RemovePart(p) => write!(f, "REMOVE PARTIAL COPY {}", crate::sanitize(p.as_os_str())),
+			Fix::MergeBack { target, source } => write!(
+				f,
+				"RESTORE {} FROM {}",
+				crate::sanitize(source.as_os_str()),
+				crate::sanitize(target.as_os_str())
+			),
+			Fix::RestoreCase { tmp, path } => {
+				write!(f, "RENAME {} BACK TO {}", crate::sanitize(tmp.as_os_str()), crate::sanitize(path.as_os_str()))
+			}
 		}
-		_ => None,
 	}
 }
 
-fn moved_back(target: &Path, source: &Path, inverse: &Op) -> Option<Op> {
-	if !exists(target) {
-		None
-	} else if exists(source) && !same_file(target, source) {
-		// Both sides exist: a cross-device move stopped half way — drop the partial copy.
-		Some(Op::Trash { path: target.to_path_buf() })
-	} else {
-		Some(inverse.clone())
+fn apply_fix(fix: &Fix, fs: &Fs, trash: &Path, batch: &str, index: usize) -> io::Result<()> {
+	match fix {
+		Fix::Op(op) => apply(op, fs, trash, batch, index, None, &mut || Ok(())),
+		Fix::RemovePart(part) => {
+			remove_part(part);
+			Ok(())
+		}
+		Fix::MergeBack { target, source } => merge_back(target, source, &mut |rest| {
+			apply(&Op::Trash { path: rest.to_path_buf() }, fs, trash, batch, index, None, &mut || Ok(()))
+		}),
+		Fix::RestoreCase { tmp, path } => fs.rename_noreplace(tmp, path),
 	}
+}
+
+/// How to clean up after `forward` when the journal has an `intent` but no `done` (a crash or a
+/// failed step), judged from the disk. Something found at a target is only touched when it is
+/// provably ours: the source is gone (a rename moved it), or the step's copy was `published`.
+fn cleanup(forward: &Op, inverse: &Op, tag: &str, published: bool) -> Vec<Fix> {
+	let n = |p: &Path| normalize(p).unwrap_or_else(|| p.to_path_buf());
+	let mut fixes = Vec::new();
+	match (forward, inverse) {
+		(Op::Copy { to, .. }, _) => {
+			let to = n(to);
+			let part = part_path(&to, tag);
+			if exists(&part) {
+				fixes.push(Fix::RemovePart(part));
+			}
+			if published && exists(&to) {
+				fixes.push(Fix::Op(Op::Trash { path: to }));
+			}
+		}
+		(Op::Mkdir { path }, _) => {
+			if exists(&n(path)) {
+				fixes.push(Fix::Op(inverse.clone()));
+			}
+		}
+		(Op::Rmdir { path }, _) => {
+			if !exists(&n(path)) {
+				fixes.push(Fix::Op(inverse.clone()));
+			}
+		}
+		// Move and trash: the inverse moves the target back to the source.
+		(_, Op::Move { from: target, to: source }) => {
+			let (target, source) = (n(target), n(source));
+			let part = part_path(&target, tag);
+			if exists(&part) {
+				// Still copying: the source is untouched.
+				fixes.push(Fix::RemovePart(part));
+			} else if exists(&target) {
+				if !exists(&source) || same_file(&target, &source) {
+					fixes.push(Fix::Op(inverse.clone()));
+				} else if published {
+					fixes.push(Fix::MergeBack { target, source });
+				}
+			}
+		}
+		// Rename: the inverse renames the new name back.
+		(Op::Rename { path: source, .. }, Op::Rename { path: target, .. }) => {
+			let (target, source) = (n(target), n(source));
+			let tmp = case_tmp(&source, tag);
+			if exists(&tmp) {
+				fixes.push(Fix::RestoreCase { tmp, path: source });
+			} else if exists(&target) && (!exists(&source) || same_file(&target, &source)) {
+				fixes.push(Fix::Op(inverse.clone()));
+			}
+		}
+		_ => {}
+	}
+	fixes
 }
 
 /// Where `path` goes when trashed. Prefer a trash directory on the same file system, so trashing is a

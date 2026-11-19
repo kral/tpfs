@@ -16,13 +16,42 @@ use crate::op::Op;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Entry {
-	Begin { batch: String, at: u64, source: String, reason: String, digest: String },
-	Intent { batch: String, index: usize, forward: Op, inverse: Op },
-	Done { batch: String, index: usize },
-	Commit { batch: String },
-	Abort { batch: String },
-	UndoStep { batch: String, index: usize },
-	Undo { batch: String },
+	Begin {
+		batch: String,
+		at: u64,
+		source: String,
+		reason: String,
+		digest: String,
+	},
+	Intent {
+		batch: String,
+		index: usize,
+		forward: Op,
+		inverse: Op,
+	},
+	Done {
+		batch: String,
+		index: usize,
+	},
+	/// A copy built under a private name was published at its target: from here on the target is
+	/// ours (written between `intent` and `done` by steps that copy).
+	Published {
+		batch: String,
+		index: usize,
+	},
+	Commit {
+		batch: String,
+	},
+	Abort {
+		batch: String,
+	},
+	UndoStep {
+		batch: String,
+		index: usize,
+	},
+	Undo {
+		batch: String,
+	},
 }
 
 impl Entry {
@@ -31,6 +60,7 @@ impl Entry {
 			Entry::Begin { batch, .. }
 			| Entry::Intent { batch, .. }
 			| Entry::Done { batch, .. }
+			| Entry::Published { batch, .. }
 			| Entry::Commit { batch }
 			| Entry::Abort { batch }
 			| Entry::UndoStep { batch, .. }
@@ -56,7 +86,6 @@ pub struct BatchView {
 	pub source: String,
 	pub reason: String,
 	pub status: BatchStatus,
-	/// (index, forward, inverse, done, undone)
 	pub steps: Vec<Step>,
 }
 
@@ -66,6 +95,8 @@ pub struct Step {
 	pub forward: Op,
 	pub inverse: Op,
 	pub done: bool,
+	/// The step's copy reached its target (see [`Entry::Published`]).
+	pub published: bool,
 	pub undone: bool,
 }
 
@@ -207,11 +238,16 @@ impl Journal {
 			let Some(b) = batches.iter_mut().rev().find(|b| b.id == e.batch()) else { continue };
 			match e {
 				Entry::Intent { index, forward, inverse, .. } => {
-					b.steps.push(Step { index, forward, inverse, done: false, undone: false });
+					b.steps.push(Step { index, forward, inverse, done: false, published: false, undone: false });
 				}
 				Entry::Done { index, .. } => {
 					if let Some(s) = step_mut(&mut b.steps, index) {
 						s.done = true;
+					}
+				}
+				Entry::Published { index, .. } => {
+					if let Some(s) = step_mut(&mut b.steps, index) {
+						s.published = true;
 					}
 				}
 				Entry::UndoStep { index, .. } => {

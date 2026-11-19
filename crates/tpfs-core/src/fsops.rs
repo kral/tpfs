@@ -65,18 +65,35 @@ impl Fs {
 		fs::rename(from, to)
 	}
 
-	/// Move a file, directory or symlink; across file systems falls back to copy + verify + remove.
-	pub(crate) fn move_any(&self, from: &Path, to: &Path) -> io::Result<()> {
+	/// Move a file, directory or symlink. Within a file system this is one no-replace rename.
+	///
+	/// Across file systems the source is copied to `part` (a private name next to `to`), the copy is
+	/// published at `to` with a no-replace rename, `publish` records that in the journal, and only then
+	/// is the source removed — and only the entries that were copied and are unchanged since. Anything
+	/// that appeared or changed in the source meanwhile is left where it is and reported as an error, so
+	/// the step is rolled back with nothing lost.
+	pub(crate) fn move_any(
+		&self,
+		from: &Path,
+		to: &Path,
+		part: &Path,
+		publish: &mut dyn FnMut() -> io::Result<()>,
+	) -> io::Result<()> {
 		match self.rename_noreplace(from, to) {
 			Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
-				self.copy_any(from, to)?;
-				if fs::symlink_metadata(from)?.is_dir() {
-					fs::remove_dir_all(from)?;
-				} else {
-					fs::remove_file(from)?;
-				}
+				let copied = self.copy_published(from, to, part, publish)?;
+				let left = remove_copied(from, &copied)?;
 				sync_parent(from);
-				Ok(())
+				if left.is_empty() {
+					Ok(())
+				} else {
+					Err(io::Error::other(format!(
+						"{} item(s) changed or appeared in {} during the move and were left there, e.g. {}",
+						left.len(),
+						from.display(),
+						left[0].display()
+					)))
+				}
 			}
 			Ok(()) => {
 				sync_parent(to);
@@ -87,33 +104,73 @@ impl Fs {
 		}
 	}
 
-	/// Copy a file, directory (recursively) or symlink (as a symlink). Never overwrites.
-	/// A top-level file inside a root is read and created through confined descriptors; the inside of
-	/// a copied directory is walked by path.
-	pub(crate) fn copy_any(&self, from: &Path, to: &Path) -> io::Result<()> {
+	/// Copy `from` to `to` through `part`: the copy only ever appears at `to` complete.
+	pub(crate) fn copy_to(
+		&self,
+		from: &Path,
+		to: &Path,
+		part: &Path,
+		publish: &mut dyn FnMut() -> io::Result<()>,
+	) -> io::Result<()> {
+		self.copy_published(from, to, part, publish).map(|_| ())
+	}
+
+	fn copy_published(
+		&self,
+		from: &Path,
+		to: &Path,
+		part: &Path,
+		publish: &mut dyn FnMut() -> io::Result<()>,
+	) -> io::Result<Vec<Copied>> {
+		let mut copied = Vec::new();
+		let result = self.copy_tree(from, part, Path::new(""), &mut copied);
+		let result = result.and_then(|()| {
+			sync_tree_dirs(part, &copied);
+			self.rename_noreplace(part, to)
+		});
+		if let Err(e) = result {
+			// The partial copy is ours and the source is untouched: drop it.
+			remove_part(part);
+			return Err(e);
+		}
+		sync_parent(to);
+		publish()?;
+		Ok(copied)
+	}
+
+	/// Copy a file, directory (recursively) or symlink (as a symlink), recording what was copied.
+	/// Never overwrites. A top-level file inside a root is read and created through confined
+	/// descriptors; the inside of a copied directory is walked by path.
+	fn copy_tree(&self, from: &Path, to: &Path, rel: &Path, copied: &mut Vec<Copied>) -> io::Result<()> {
 		let meta = fs::symlink_metadata(from)?;
 		let ft = meta.file_type();
 
 		if ft.is_file() {
 			#[cfg(target_os = "linux")]
 			if let Some((src, dst)) = linux::open_copy_pair(&self.anchors, from, to, &meta)? {
-				return copy_stream(src, dst, from, &meta);
+				copy_stream(src, dst, from, &meta)?;
+				copied.push(Copied::of(rel, &meta));
+				return Ok(());
 			}
 			let src = File::open(from)?;
 			let dst = OpenOptions::new().write(true).create_new(true).open(to)?;
-			copy_stream(src, dst, from, &meta)
+			copy_stream(src, dst, from, &meta)?;
 		} else if ft.is_dir() {
 			self.mkdir(to)?;
+			copied.push(Copied::of(rel, &meta));
 			for entry in fs::read_dir(from)? {
 				let entry = entry?;
-				Fs::unconfined().copy_any(&entry.path(), &to.join(entry.file_name()))?;
+				let name = entry.file_name();
+				Fs::unconfined().copy_tree(&entry.path(), &to.join(&name), &rel.join(&name), copied)?;
 			}
-			fs::set_permissions(to, meta.permissions())
+			return fs::set_permissions(to, meta.permissions());
 		} else if ft.is_symlink() {
-			copy_symlink(from, to)
+			copy_symlink(from, to)?;
 		} else {
-			Err(io::Error::new(io::ErrorKind::Unsupported, format!("special file: {}", from.display())))
+			return Err(io::Error::new(io::ErrorKind::Unsupported, format!("special file: {}", from.display())));
 		}
+		copied.push(Copied::of(rel, &meta));
+		Ok(())
 	}
 
 	pub(crate) fn mkdir(&self, path: &Path) -> io::Result<()> {
@@ -158,16 +215,133 @@ fn copy_symlink(from: &Path, _: &Path) -> io::Result<()> {
 	Err(io::Error::new(io::ErrorKind::Unsupported, format!("symlink: {}", from.display())))
 }
 
+/// One entry copied by `copy_tree`, as the source looked when it was read.
+pub(crate) struct Copied {
+	rel: PathBuf,
+	dir: bool,
+	len: u64,
+	modified: Option<std::time::SystemTime>,
+}
+
+impl Copied {
+	fn of(rel: &Path, meta: &fs::Metadata) -> Self {
+		Self { rel: rel.to_path_buf(), dir: meta.is_dir(), len: meta.len(), modified: meta.modified().ok() }
+	}
+
+	fn unchanged(&self, meta: &fs::Metadata) -> bool {
+		meta.is_dir() == self.dir && (self.dir || (meta.len() == self.len && meta.modified().ok() == self.modified))
+	}
+}
+
+/// Remove from `from` exactly the entries that were copied and have not changed since, children
+/// before parents. Returns what was left in place (changed, new, or a folder that is not empty).
+fn remove_copied(from: &Path, copied: &[Copied]) -> io::Result<Vec<PathBuf>> {
+	let mut left = Vec::new();
+	for c in copied.iter().rev() {
+		let path = if c.rel.as_os_str().is_empty() { from.to_path_buf() } else { from.join(&c.rel) };
+		let meta = match fs::symlink_metadata(&path) {
+			Ok(m) => m,
+			Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+			Err(e) => return Err(e),
+		};
+		if !c.unchanged(&meta) {
+			left.push(path);
+			continue;
+		}
+		let removed = if c.dir { fs::remove_dir(&path) } else { fs::remove_file(&path) };
+		if removed.is_err() {
+			left.push(path);
+		}
+	}
+	Ok(left)
+}
+
+/// Make the directory entries of a freshly copied tree durable before it is published.
+fn sync_tree_dirs(root: &Path, copied: &[Copied]) {
+	for c in copied.iter().filter(|c| c.dir) {
+		let dir = if c.rel.as_os_str().is_empty() { root.to_path_buf() } else { root.join(&c.rel) };
+		sync_dir(&dir);
+	}
+}
+
+/// Delete a partial copy that only tpfs ever saw (its private `part` name).
+pub(crate) fn remove_part(part: &Path) {
+	match fs::symlink_metadata(part) {
+		Ok(m) if m.is_dir() => {
+			let _ = fs::remove_dir_all(part);
+		}
+		Ok(_) => {
+			let _ = fs::remove_file(part);
+		}
+		Err(_) => {}
+	}
+}
+
+/// The private name a step's result is built under, next to its target.
+pub(crate) fn part_path(to: &Path, tag: &str) -> PathBuf {
+	to.with_file_name(format!(".tpfs-part-{tag}"))
+}
+
+/// Put back into `source` what a cross-device move had already removed from it, taking it from the
+/// published copy at `target`; then move the rest of `target` (duplicates of what is still in
+/// `source`) to `trash_rest`. Used when such a move stopped half way.
+pub(crate) fn merge_back(
+	target: &Path,
+	source: &Path,
+	trash_rest: &mut dyn FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+	let fs = Fs::unconfined();
+	let mut entries = Vec::new();
+	collect(target, Path::new(""), &mut entries)?;
+	for (rel, is_dir) in &entries {
+		let src = if rel.as_os_str().is_empty() { source.to_path_buf() } else { source.join(rel) };
+		if *is_dir {
+			if !crate::path::exists(&src) {
+				fs.mkdir(&src)?;
+			}
+			continue;
+		}
+		if crate::path::exists(&src) {
+			continue;
+		}
+		let tgt = target.join(rel);
+		let part = part_path(&src, "restore");
+		fs.move_any(&tgt, &src, &part, &mut || Ok(()))?;
+	}
+	// Folders now empty were fully restored; whatever is left duplicates the source.
+	for (rel, _) in entries.iter().rev().filter(|(_, d)| *d) {
+		let _ = fs::remove_dir(target.join(rel));
+	}
+	if crate::path::exists(target) { trash_rest(target) } else { Ok(()) }
+}
+
+fn collect(path: &Path, rel: &Path, out: &mut Vec<(PathBuf, bool)>) -> io::Result<()> {
+	let is_dir = fs::symlink_metadata(path)?.is_dir();
+	out.push((rel.to_path_buf(), is_dir));
+	if is_dir {
+		for entry in fs::read_dir(path)? {
+			let name = entry?.file_name();
+			collect(&path.join(&name), &rel.join(&name), out)?;
+		}
+	}
+	Ok(())
+}
+
 /// Make a directory entry change durable (best effort).
 pub(crate) fn sync_parent(path: &Path) {
+	if let Some(parent) = path.parent() {
+		sync_dir(parent);
+	}
+}
+
+/// fsync a directory so entries created in it survive a power loss (Unix; NTFS journals metadata).
+fn sync_dir(dir: &Path) {
 	#[cfg(unix)]
-	if let Some(parent) = path.parent()
-		&& let Ok(dir) = File::open(parent)
-	{
-		let _ = dir.sync_all();
+	if let Ok(d) = File::open(dir) {
+		let _ = d.sync_all();
 	}
 	#[cfg(not(unix))]
-	let _ = path;
+	let _ = dir;
 }
 
 /// Whether two paths name the same file (same device and inode), e.g. `a.txt` and `A.txt`
@@ -308,5 +482,96 @@ mod linux {
 		let dst = openat(dfd, dname, create, Mode::from_raw_mode(meta.permissions().mode() & 0o7777))?;
 
 		Ok(Some((File::from(src), File::from(dst))))
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+	use std::os::unix::fs::MetadataExt;
+
+	use super::*;
+
+	/// Two directories on different file systems, or `None` when the machine has only one.
+	fn two_devices() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
+		let a = tempfile::TempDir::new_in("/dev/shm").ok()?;
+		let b = tempfile::TempDir::new().ok()?;
+		let dev = |p: &Path| fs::metadata(p).map(|m| m.dev()).ok();
+		(dev(a.path()) != dev(b.path())).then_some((a, b))
+	}
+
+	#[test]
+	fn cross_device_move_keeps_what_appeared_in_the_source() {
+		let Some((a, b)) = two_devices() else {
+			assert!(std::env::var_os("CI").is_none(), "CI must provide /dev/shm on its own file system");
+			return;
+		};
+		let from = a.path().join("inbox");
+		fs::create_dir(&from).unwrap();
+		fs::write(from.join("photo.jpg"), "photo").unwrap();
+		let to = b.path().join("inbox");
+
+		let late = from.join("late.txt");
+		let err = Fs::unconfined()
+			.move_any(&from, &to, &part_path(&to, "t"), &mut || fs::write(&late, "written meanwhile"))
+			.unwrap_err();
+		assert!(err.to_string().contains("left there"), "{err}");
+		assert_eq!(fs::read_to_string(&late).unwrap(), "written meanwhile");
+		assert_eq!(fs::read_to_string(to.join("photo.jpg")).unwrap(), "photo");
+		assert!(!from.join("photo.jpg").exists());
+
+		// Rolling back puts the moved file home and keeps the late one.
+		let mut rest = Vec::new();
+		merge_back(&to, &from, &mut |p| {
+			rest.push(p.to_path_buf());
+			Ok(())
+		})
+		.unwrap();
+		assert_eq!(fs::read_to_string(from.join("photo.jpg")).unwrap(), "photo");
+		assert_eq!(fs::read_to_string(&late).unwrap(), "written meanwhile");
+		assert!(rest.is_empty() && !to.exists(), "{rest:?}");
+	}
+
+	#[test]
+	fn cross_device_copy_never_shows_a_partial_target() {
+		let Some((a, b)) = two_devices() else { return };
+		let from = a.path().join("dir");
+		fs::create_dir(&from).unwrap();
+		fs::write(from.join("x"), "x").unwrap();
+		fs::create_dir(from.join("sub")).unwrap();
+		let to = b.path().join("dir");
+		let part = part_path(&to, "t");
+
+		// Publishing fails (as if the journal could not be written): no target, no part.
+		let err = Fs::unconfined().copy_to(&from, &to, &part, &mut || {
+			assert!(to.join("sub").is_dir() && !part.exists());
+			Err(io::Error::other("journal full"))
+		});
+		assert!(err.is_err());
+		assert!(!part.exists());
+		assert!(from.join("x").exists());
+	}
+
+	#[test]
+	fn merge_back_restores_a_half_removed_tree() {
+		let t = tempfile::TempDir::new().unwrap();
+		let (target, source) = (t.path().join("target"), t.path().join("source"));
+		for d in [&target, &source] {
+			fs::create_dir_all(d.join("sub")).unwrap();
+		}
+		fs::write(target.join("a"), "A").unwrap();
+		fs::write(target.join("sub/b"), "B").unwrap();
+		fs::write(source.join("a"), "A edited").unwrap(); // still in the source, newer
+		// sub/b was already removed from the source when the move stopped.
+
+		let mut rest = Vec::new();
+		merge_back(&target, &source, &mut |p| {
+			rest.push(p.to_path_buf());
+			Ok(())
+		})
+		.unwrap();
+		assert_eq!(fs::read_to_string(source.join("a")).unwrap(), "A edited");
+		assert_eq!(fs::read_to_string(source.join("sub/b")).unwrap(), "B");
+		assert_eq!(rest, std::slice::from_ref(&target), "the stale duplicate goes to the trash, not away");
+		assert!(target.join("a").exists());
 	}
 }

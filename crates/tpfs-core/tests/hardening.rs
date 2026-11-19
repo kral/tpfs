@@ -238,3 +238,35 @@ fn trashing_a_hard_linked_file_is_flagged() {
 	assert_eq!(r.level, Level::Medium);
 	assert!(r.reasons.iter().any(|x| x.contains("hard link")), "{:?}", r.reasons);
 }
+
+/// A crash before a copy runs, then someone else creates the target: `recover` must not touch it.
+#[test]
+fn recover_leaves_a_target_that_is_not_ours() {
+	let s = Sandbox::new();
+	fs::write(s.root.join("a.txt"), "A").unwrap();
+	let plan = Plan::new(vec![Op::Copy { from: s.root.join("a.txt"), to: s.root.join("b.txt") }], "");
+	let foreign = s.root.join("b.txt");
+
+	let default_hook = panic::take_hook();
+	panic::set_hook(Box::new(|_| {}));
+	let crashed = panic::catch_unwind(AssertUnwindSafe(|| {
+		let v = s.validator();
+		let mut j = s.journal();
+		let _ = Executor::new(&v, &mut j, s.state.join("trash"))
+			.hook(move |_, p| {
+				if p == Phase::BeforeApply {
+					panic!("simulated crash");
+				}
+			})
+			.execute(&plan, Source::Human);
+	}));
+	panic::set_hook(default_hook);
+	assert!(crashed.is_err());
+
+	fs::write(&foreign, "someone else's").unwrap();
+	let v = Validator::new(["/"]).unwrap();
+	let mut j = s.journal();
+	let report = Executor::new(&v, &mut j, s.state.join("trash")).recover().unwrap();
+	assert!(report.errors.is_empty(), "{:?}", report.errors);
+	assert_eq!(fs::read_to_string(&foreign).unwrap(), "someone else's");
+}
