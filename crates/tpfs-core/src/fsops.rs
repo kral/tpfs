@@ -853,7 +853,8 @@ mod confined {
 			Foundation::OBJECT_ATTRIBUTES,
 			Storage::FileSystem::{
 				FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
-				FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+				FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtCreateFile,
+				NtSetInformationFile,
 			},
 		},
 		Win32::{
@@ -862,10 +863,10 @@ mod confined {
 				CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
 				FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
 				FILE_FLAG_OPEN_REPARSE_POINT, FILE_FULL_DIR_INFO, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-				FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-				FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FileAttributeTagInfo, FileBasicInfo,
-				FileDispositionInfo, FileFullDirectoryInfo, FileFullDirectoryRestartInfo, FileRenameInfo,
-				GetFileInformationByHandleEx, OPEN_EXISTING, SYNCHRONIZE, SetFileInformationByHandle,
+				FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+				FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FileAttributeTagInfo, FileBasicInfo, FileDispositionInfo,
+				FileFullDirectoryInfo, FileFullDirectoryRestartInfo, GetFileInformationByHandleEx, OPEN_EXISTING,
+				SYNCHRONIZE, SetFileInformationByHandle,
 			},
 			System::IO::IO_STATUS_BLOCK,
 		},
@@ -1034,22 +1035,32 @@ mod confined {
 		OsStr::new(&nt).encode_wide().collect()
 	}
 
+	/// Rename the object behind `h` to `name` under the directory `root` (or to the full NT path
+	/// `name` when `root` is null), never replacing anything. Calls `NtSetInformationFile` directly:
+	/// the Win32 wrapper does not take a relative name with a root handle.
 	fn rename_by_handle(h: &OwnedHandle, root: HANDLE, name: &[u16]) -> io::Result<()> {
-		let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-		let size = header + name.len() * 2 + 2;
+		let header = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
+		let size = (header + name.len() * 2).max(std::mem::size_of::<FILE_RENAME_INFORMATION>());
 		let mut buf = vec![0u64; size.div_ceil(8)];
-		let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-		// SAFETY: `buf` is large enough and suitably aligned for the header plus the name; the fields
-		// are written through raw pointers into that buffer only.
+		let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+		// SAFETY: `buf` is zeroed, large enough and suitably aligned for the header plus the name;
+		// the fields are written through raw pointers into that buffer only.
 		unsafe {
-			(*info).Anonymous.ReplaceIfExists = false;
 			(*info).RootDirectory = root;
 			(*info).FileNameLength = (name.len() * 2) as u32;
 			std::ptr::copy_nonoverlapping(name.as_ptr(), (&raw mut (*info).FileName).cast::<u16>(), name.len());
 		}
-		// SAFETY: `info` points at a complete FILE_RENAME_INFO of `size` bytes.
-		let ok = unsafe { SetFileInformationByHandle(raw(h), FileRenameInfo, info.cast(), size as u32) };
-		if ok == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+		// SAFETY: IO_STATUS_BLOCK is plain data; all zeroes is a valid value.
+		let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+		// SAFETY: `info` points at a complete FILE_RENAME_INFORMATION of `size` bytes; `iosb` is ours.
+		let status =
+			unsafe { NtSetInformationFile(raw(h), &mut iosb, info.cast(), size as u32, FileRenameInformation) };
+		if status < 0 {
+			// SAFETY: plain conversion of a status code.
+			let code = unsafe { RtlNtStatusToDosError(status) };
+			return Err(io::Error::from_raw_os_error(code as i32));
+		}
+		Ok(())
 	}
 
 	pub(super) fn rename(anchors: &[Anchor], from: &Path, to: &Path) -> Option<io::Result<()>> {
