@@ -1,6 +1,6 @@
 use std::{
 	fs::{self, File, OpenOptions, TryLockError},
-	io::{self, BufRead, BufReader, Seek, SeekFrom, Write},
+	io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
 	path::{Path, PathBuf},
 };
 
@@ -101,7 +101,28 @@ impl Journal {
 			Err(TryLockError::Error(e)) => return Err(e),
 		}
 
-		Ok(Self { path, file, corrupt: 0 })
+		let mut journal = Self { path, file, corrupt: 0 };
+		journal.seal_torn_tail()?;
+		Ok(journal)
+	}
+
+	/// A crash in the middle of an append leaves a last line without its newline. Terminate it, so
+	/// the next record starts on a line of its own instead of being glued to the fragment (which
+	/// would make both fail the CRC and silently drop the new record).
+	fn seal_torn_tail(&mut self) -> io::Result<()> {
+		let len = self.file.metadata()?.len();
+		if len == 0 {
+			return Ok(());
+		}
+		let mut last = [0u8; 1];
+		let mut file = &self.file;
+		file.seek(SeekFrom::Start(len - 1))?;
+		file.read_exact(&mut last)?;
+		if last[0] != b'\n' {
+			self.file.write_all(b"\n")?;
+			self.file.sync_data()?;
+		}
+		Ok(())
 	}
 
 	pub fn path(&self) -> &Path {
@@ -125,16 +146,41 @@ impl Journal {
 		// handle could not read the file. Appends still go to the end regardless of the position.
 		let mut file = &self.file;
 		file.seek(SeekFrom::Start(0))?;
-		let reader = BufReader::new(file);
+		let mut reader = BufReader::new(file);
 		let mut out = Vec::new();
+		let mut buf = Vec::new();
 		self.corrupt = 0;
 
-		for line in reader.lines() {
-			let line = line?;
+		loop {
+			buf.clear();
+			// Bounded read: a line can never make us hold more than MAX_LINE bytes.
+			let n = (&mut reader).take(MAX_LINE as u64 + 1).read_until(b'\n', &mut buf)?;
+			if n == 0 {
+				break;
+			}
+			if buf.last() != Some(&b'\n') && buf.len() > MAX_LINE {
+				// Oversized line: skip the rest of it without buffering it.
+				loop {
+					buf.clear();
+					let m = (&mut reader).take(MAX_LINE as u64).read_until(b'\n', &mut buf)?;
+					if m == 0 || buf.last() == Some(&b'\n') {
+						break;
+					}
+				}
+				self.corrupt += 1;
+				continue;
+			}
+			// Invalid UTF-8 (e.g. a torn write cutting a multi-byte character) is a corrupt line,
+			// not a reason to make the whole journal unreadable.
+			let Ok(line) = std::str::from_utf8(&buf) else {
+				self.corrupt += 1;
+				continue;
+			};
+			let line = line.trim_end_matches(['\n', '\r']);
 			if line.trim().is_empty() {
 				continue;
 			}
-			match parse_line(&line) {
+			match parse_line(line) {
 				Some(e) => out.push(e),
 				None => self.corrupt += 1,
 			}
@@ -191,6 +237,10 @@ fn step_mut(steps: &mut [Step], index: usize) -> Option<&mut Step> {
 	}
 	steps.iter_mut().find(|s| s.index == index)
 }
+
+/// Longest journal line accepted. A record holds at most two operations and a reason, so anything
+/// this long is damage, not data.
+const MAX_LINE: usize = 1 << 20;
 
 fn parse_line(line: &str) -> Option<Entry> {
 	let (crc, json) = line.split_once(' ')?;

@@ -330,6 +330,61 @@ fn journal_survives_a_torn_last_line_and_checks_crc() {
 }
 
 #[test]
+fn a_batch_after_a_torn_tail_is_not_lost() {
+	let s = Sandbox::new();
+	let v = s.validator();
+	let mut j = s.journal();
+	let first = Executor::new(&v, &mut j, s.trash())
+		.execute(&Plan::new(vec![Op::Mkdir { path: s.root.join("a") }], ""), Source::Human)
+		.unwrap();
+	drop(j);
+
+	// Crash mid-append: a fragment without newline, cutting a multi-byte character in half.
+	let path = s.state.join("journal.jsonl");
+	let mut bytes = fs::read(&path).unwrap();
+	bytes.extend_from_slice(b"0badc0de {\"kind\":\"begin\",\"reason\":\"lo\xC5");
+	fs::write(&path, bytes).unwrap();
+
+	let mut j = s.journal();
+	let second = Executor::new(&v, &mut j, s.trash())
+		.execute(&Plan::new(vec![Op::Mkdir { path: s.root.join("b") }], ""), Source::Human)
+		.unwrap();
+	let batches = j.batches().unwrap();
+	assert_eq!(batches.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(), [first.id.as_str(), second.id.as_str()]);
+	assert_eq!(batches[1].status, BatchStatus::Committed);
+	assert_eq!(j.corrupt_lines(), 1);
+
+	// Undo reverts the newest batch, not the one before the damage.
+	Executor::new(&v, &mut j, s.trash()).undo_last().unwrap().unwrap();
+	assert!(s.root.join("a").is_dir());
+	assert!(!s.root.join("b").exists());
+}
+
+#[test]
+fn journal_skips_oversized_and_non_utf8_lines() {
+	let s = Sandbox::new();
+	let v = s.validator();
+	let mut j = s.journal();
+	let batch = Executor::new(&v, &mut j, s.trash())
+		.execute(&Plan::new(vec![Op::Mkdir { path: s.root.join("d") }], ""), Source::Human)
+		.unwrap();
+	drop(j);
+
+	let path = s.state.join("journal.jsonl");
+	let mut bytes = fs::read(&path).unwrap();
+	bytes.extend(std::iter::repeat_n(b'x', 3 << 20));
+	bytes.push(b'\n');
+	bytes.extend_from_slice(b"00000000 \xFF\xFE\n");
+	fs::write(&path, bytes).unwrap();
+
+	let mut j = s.journal();
+	let batches = j.batches().unwrap();
+	assert_eq!(batches.len(), 1);
+	assert_eq!(batches[0].id, batch.id);
+	assert_eq!(j.corrupt_lines(), 2);
+}
+
+#[test]
 fn journal_is_exclusive() {
 	let s = Sandbox::new();
 	let _first = s.journal();
