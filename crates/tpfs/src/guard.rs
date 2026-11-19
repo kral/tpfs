@@ -67,18 +67,30 @@ fn judge(words: &[String], depth: usize) -> Option<String> {
 	}
 	let mut i = 0;
 	// Leading variable assignments and wrappers (with their own options) run what follows.
+	let mut after_wrapper = false;
 	while let Some(w) = words.get(i) {
-		let name = base(w);
-		if (w.contains('=') && !w.starts_with('-'))
-			|| WRAPPERS.contains(&name.as_str())
-			|| (i > 0 && w.starts_with('-') && WRAPPERS.contains(&base(&words[i - 1]).as_str()))
-		{
+		if after_wrapper && w.starts_with('-') {
+			// A wrapper's option; some take a value (`sudo -u bob`, `env -u NAME`, `xargs -n 1`).
+			let with_value = matches!(
+				w.as_str(),
+				"-u" | "-g"
+					| "-U" | "-C" | "-D"
+					| "-h" | "-p" | "-r"
+					| "-t" | "-n" | "-I"
+					| "-L" | "-P" | "-s"
+					| "-d" | "-E" | "-a"
+			);
+			i += if with_value { 2 } else { 1 };
+		} else if WRAPPERS.contains(&base(w).as_str()) {
+			after_wrapper = true;
+			i += 1;
+		} else if w.contains('=') && !w.starts_with('-') {
 			i += 1;
 		} else {
 			break;
 		}
 	}
-	let words = &words[i..];
+	let words = words.get(i..).unwrap_or_default();
 	let first = base(words.first()?);
 	let refuse = |what: &str| {
 		Some(format!(
@@ -231,6 +243,9 @@ mod tests {
 			"rm -rf tests/ patches/ plan/ ~/",
 			"cd old-repo && rm -rf build",
 			"sudo rm -r /var/www/old",
+			"sudo -u deploy rm -rf /srv/x",
+			"env -u HOME rm x",
+			"xargs -n 1 rm < list.txt",
 			"/bin/rm file",
 			"mv a.py \"new folder\"",
 			"ls | xargs rm",

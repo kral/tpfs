@@ -65,8 +65,9 @@ backticks, `find -delete` and `find -exec rm`, `git clean`, `rsync --delete`, an
 `python -c`/`node -e`/`perl -e`/`ruby -e` scripts that remove or rename files. Everything else
 (builds, tests, `git status`, reading files) passes.
 
-It is a guard rail, not a sandbox: a program the agent writes and then runs can still change files
-in ways no command line shows. For that, run the agent in a sandbox where only tpfs can write to
+It is a guard rail, not a sandbox: a program the agent writes and then runs (`python3 cleanup.py`)
+can still change files in ways no command line shows, and redirections that overwrite a file
+(`> file`) or copies over existing files (`cp`) are not checked. For that, run the agent in a sandbox where only tpfs can write to
 the folders that matter.
 
 ### 3. No blanket shell allow
