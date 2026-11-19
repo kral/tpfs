@@ -150,6 +150,19 @@ Only one tpfs process writes to a journal at a time; a second one gets
 MCP server keep working. If another batch was committed meanwhile, `tpfs undo` stops with
 `the history changed meanwhile` instead of undoing a batch you did not see.
 
+### Archived history
+
+Every undo, recovery and plan reads the whole journal, so finished history does not stay in it
+forever. When the journal is 4 MiB or more as tpfs opens it, the batches nothing can act on any more
+move to `journal-archive.jsonl` next to it: undone, rolled back and abandoned batches, and committed
+ones older than the newest 1000. Those older committed batches can then no longer be undone. Nothing
+that started at or after an interrupted or damaged batch is archived, and nothing at all while the
+journal has unreadable lines. `tpfs log` says when there is an archive; `tpfs log --all` lists it
+too, and `tpfs log <batch>` finds an archived batch.
+
+The move is crash-safe: the shorter journal is written in full under a private name first, the
+archived records are added to the archive, and only then does a rename put the new journal in place.
+
 If a step fails while a batch runs, tpfs rolls back the steps before it right away and reports
 `step #N failed (…); previous steps were rolled back`. The batch shows as `rolled back` in `tpfs log`.
 
@@ -271,6 +284,8 @@ tpfs keeps its own data in one private folder:
 | Path | Content |
 |---|---|
 | `journal.jsonl` | the [journal](#the-journal) |
+| `journal.lock` | held by the tpfs process using the journal |
+| `journal-archive.jsonl` | [archived history](#archived-history) |
 | `trash/` | the [trash](#the-trash) |
 | `pending/` | plans proposed by agents (`<id>.json`) and approvals (`<id>.approved`) |
 

@@ -123,6 +123,12 @@ If the terminal is too small to show the dialog, nothing can be approved:
 `Terminal too small to review this plan — enlarge it.` Esc always cancels:
 `Cancelled; nothing was changed.`
 
+While the plan runs, a **Working** dialog shows the step, a progress bar and the time taken; the
+screen stays live. Esc (or Ctrl+C) stops it before the next step: the batch is rolled back, as a
+batch is all or nothing (`Stopped: stopped on request before step #N; nothing was changed …`). A
+step already running, such as one big file being copied, is finished first. Other keys and the
+mouse do nothing until it is done.
+
 After the plan runs, the status line reports it, for example
 `Move to /home/you/backup: done, 2 step(s). Ctrl+Z to undo.` Marks are cleared and both panels
 reload.
@@ -131,7 +137,9 @@ reload.
 
 F9 or Ctrl+Z opens the Undo dialog for the newest batch in the journal. That batch may come from an
 AI agent or from another terminal, so the dialog says who made it (`a person` or `an AI agent`), the
-reason, and up to 12 of its steps. Press `y` to undo, Esc to cancel.
+reason, and up to 12 of its steps. Press `y` to undo, Esc to cancel. The undo runs with the same
+Working dialog; Esc stops it after the current step, the steps undone so far stay undone, and Undo
+again finishes the batch.
 
 If the history changed while the dialog was open, nothing happens:
 `the history changed meanwhile; press Undo again to see what it would revert`.

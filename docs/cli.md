@@ -11,7 +11,7 @@ tpfs check  <plan.json|-> --root <dir>... [--source human|agent] [--max-ops <n>]
 tpfs apply  <plan.json|-> --root <dir>... [--approve <digest>] [--source human|agent] [--max-ops <n>]
 tpfs sync <source> <target> [--both] [--mirror] [--apply] [--approve <digest>] [--json]
 tpfs undo [--approve <batch>]
-tpfs log [<batch>]
+tpfs log [--all] [<batch>]
 tpfs recover [--abandon <batch>]
 tpfs mcp --root <dir>... [--approval terminal|client]
 tpfs pending
@@ -245,10 +245,12 @@ Undone batch 18e97ddd620dcbd3-6c1a (6 step(s)):
 ## tpfs log
 
 ```text
-tpfs log [<batch>]
+tpfs log [--all] [<batch>]
 ```
 
-Without an argument, lists all batches, oldest first: id, source, state, number of steps and reason.
+Without an argument, lists the batches in the journal, oldest first: id, source, state, number of
+steps and reason. `--all` adds the [archived history](concepts.md#archived-history) before them; when
+there is an archive and `--all` is not given, a note on stderr says so.
 The first line, on stderr, names the state folder.
 
 ```console
@@ -261,7 +263,8 @@ The states are explained in [The journal](concepts.md#the-journal). If the journ
 lines, a warning follows: `warning: 1 unreadable journal line(s) skipped`.
 
 With a batch id, lists every step of that batch, its state (`done`, `started`, `failed` or `undone`)
-and the operation that undoes it. An unknown id is a usage error (exit 2).
+and the operation that undoes it; archived batches are found too. An unknown id is a usage error
+(exit 2).
 
 ## tpfs recover
 
