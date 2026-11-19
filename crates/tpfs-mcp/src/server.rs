@@ -500,10 +500,9 @@ fn show(p: &Path) -> String {
 /// double quotes on Windows (where `"` cannot occur in a path).
 fn shell_quote(s: &str) -> String {
 	if cfg!(windows) {
-		// For cmd.exe and PowerShell argument parsing: a trailing backslash would escape the
-		// closing quote, so it is doubled.
-		let tail = s.len() - s.trim_end_matches('\\').len();
-		format!("\"{s}{}\"", "\\".repeat(tail))
+		// PowerShell (the default Windows terminal): single quotes take everything literally
+		// (`$`, backtick, `%`); an inner `'` is doubled.
+		format!("'{}'", s.replace('\'', "''"))
 	} else if s.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-+,:@".contains(&b)) {
 		s.to_owned()
 	} else {
@@ -518,7 +517,7 @@ mod tests {
 	#[test]
 	fn shell_words_survive_a_paste() {
 		if cfg!(windows) {
-			assert_eq!(shell_quote(r"C:\tpfs state\"), r#""C:\tpfs state\\""#);
+			assert_eq!(shell_quote(r"C:\Users\x$y\it's"), r"'C:\Users\x$y\it''s'");
 		} else {
 			assert_eq!(shell_quote("/home/u/tpfs"), "/home/u/tpfs");
 			assert_eq!(shell_quote("/x/a b"), "'/x/a b'");

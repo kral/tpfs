@@ -390,3 +390,28 @@ fn moving_onto_a_folder_explains_the_full_path() {
 	assert!(err, "{v}");
 	assert!(v.to_string().contains("full new path"), "{v}");
 }
+
+/// Rewriting the pending plan *and* its stored digest consistently after approval does not
+/// transfer the approval: it is bound to the digest the human approved.
+#[test]
+fn approval_is_bound_to_the_approved_digest() {
+	let mut f = Fixture::new(Approval::Terminal);
+	let a = f.root.join("a.txt");
+	let b = f.root.join("b.txt");
+	fs::write(&a, "A").unwrap();
+	fs::write(&b, "B").unwrap();
+	let id = f.propose(json!({ "ops": [{ "op": "trash", "path": a }] }));
+	let store = f.server.store().clone();
+	store.approve(&store.get(&id).unwrap()).unwrap();
+
+	let file = f.state.join("pending").join(format!("{id}.json"));
+	let mut pending: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+	let other = tpfs_core::Plan::new(vec![tpfs_core::Op::Trash { path: b.clone() }], "");
+	pending["plan"] = serde_json::to_value(&other).unwrap();
+	pending["digest"] = json!(other.digest());
+	fs::write(&file, pending.to_string()).unwrap();
+
+	let (v, err) = f.tool("apply_plan", json!({ "planId": id }));
+	assert!(err, "{v}");
+	assert!(a.exists() && b.exists());
+}

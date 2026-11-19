@@ -264,11 +264,12 @@ fn random_plans_crashed_anywhere_are_recovered_exactly() {
 		let before = s.snapshot();
 		let p = |rng: &mut Rng| s.root.join(rng.pick(&names));
 		let ops: Vec<Op> = (0..1 + rng.next() % 3)
-			.map(|_| match rng.next() % 5 {
+			.map(|_| match rng.next() % 6 {
 				0 => Op::Move { from: p(&mut rng), to: p(&mut rng) },
 				1 => Op::Copy { from: p(&mut rng), to: p(&mut rng) },
 				2 => Op::Trash { path: p(&mut rng) },
 				3 => Op::Mkdir { path: p(&mut rng) },
+				4 => Op::Rmdir { path: p(&mut rng) },
 				_ => Op::Rename { path: p(&mut rng), new_name: "r.txt".into() },
 			})
 			.collect();

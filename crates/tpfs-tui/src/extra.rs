@@ -1,7 +1,6 @@
 //! Small helpers: local time formatting, the F3 viewer's content, Nerd Font icons.
 
 use std::{
-	fs::File,
 	io::Read,
 	path::Path,
 	time::{SystemTime, UNIX_EPOCH},
@@ -97,7 +96,18 @@ pub(crate) fn view_lines(path: &Path) -> Result<Vec<String>, String> {
 	if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
 		return Err("not a regular file".into());
 	}
-	File::open(path).and_then(|f| f.take(LIMIT).read_to_end(&mut buf)).map_err(|e| e.to_string())?;
+	let mut options = std::fs::OpenOptions::new();
+	options.read(true);
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::OpenOptionsExt;
+		// Never blocks (a FIFO swapped in after the check) and does not follow a link swapped in.
+		options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+	}
+	options
+		.open(&std::fs::canonicalize(path).map_err(|e| e.to_string())?)
+		.and_then(|f| f.take(LIMIT).read_to_end(&mut buf))
+		.map_err(|e| e.to_string())?;
 
 	let binary = buf.contains(&0) || std::str::from_utf8(&buf).is_err() && buf.len() < 4096;
 	let mut lines: Vec<String> = if binary {

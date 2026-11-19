@@ -400,7 +400,9 @@ fn check_names(path: &Path) -> Result<(), String> {
 				&& stem.chars().count() == 4
 				&& stem[3..].chars().all(|d| d.is_ascii_digit() || "¹²³".contains(d)));
 		// Characters Windows refuses in names (`:` would also open an alternate data stream).
-		let forbidden = name.chars().any(|c| matches!(c, ':' | '<' | '>' | '"' | '|' | '?' | '*') || c < ' ');
+		// `/` inside a component only happens in a verbatim (`\\?\`) path, where it is not a
+		// separator — but would become one once the prefix is dropped.
+		let forbidden = name.chars().any(|c| matches!(c, ':' | '<' | '>' | '"' | '|' | '?' | '*' | '/') || c < ' ');
 		if forbidden || name.ends_with(['.', ' ']) || device {
 			return Err(format!("Windows cannot use this name safely: '{}'", sanitize(name.as_ref().as_ref())));
 		}

@@ -56,8 +56,13 @@ impl Store {
 	}
 
 	pub fn get(&self, id: &str) -> io::Result<Pending> {
-		let bytes = fs::read(self.file(id)?).map_err(|e| {
-			io::Error::new(e.kind(), format!("no pending plan '{id}' (already applied, rejected or never proposed)"))
+		let file = self.file(id)?;
+		let bytes = fs::read(&file).map_err(|e| match e.kind() {
+			io::ErrorKind::NotFound => io::Error::new(
+				e.kind(),
+				format!("no pending plan '{id}' (already applied, rejected or never proposed)"),
+			),
+			_ => io::Error::new(e.kind(), format!("{}: {e}", tpfs_core::sanitize(file.as_os_str()))),
 		})?;
 		serde_json::from_slice(&bytes).map_err(io::Error::other)
 	}
@@ -126,7 +131,11 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 	let mut options = fs::OpenOptions::new();
 	options.write(true).create(true).truncate(true);
 	#[cfg(unix)]
-	std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+	{
+		use std::os::unix::fs::OpenOptionsExt;
+		// O_NOFOLLOW: a symlink planted after the check below is refused, not followed.
+		options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+	}
 	// Never write through a planted symlink (e.g. an `.approved` file pointing at ~/.bashrc).
 	tpfs_core::check_private_file(path)?;
 	let mut f = options.open(path)?;

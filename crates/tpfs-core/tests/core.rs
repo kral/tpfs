@@ -1742,7 +1742,7 @@ fn undoing_rmdir_leaves_a_folder_made_since_alone() {
 	fs::create_dir(&d).unwrap();
 	fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
 	fs::write(d.join("secret"), "S").unwrap();
-	let _ = undo(&s);
+	assert!(undo(&s).is_err(), "undo went ahead over a folder made since");
 	assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700, "the user's folder was opened up");
 	assert_eq!(fs::read_to_string(d.join("secret")).unwrap(), "S");
 }

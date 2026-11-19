@@ -621,3 +621,33 @@ fn a_crash_after_rmdir_restores_the_folders_own_mode() {
 	assert!(report.errors.is_empty(), "{:?}", report.errors);
 	assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
 }
+
+/// A crash before a `mkdir` ran, then another program makes that folder: recovery leaves it alone
+/// (only a folder renamed into place by the step itself, as journaled, is tpfs's).
+#[test]
+fn recovery_leaves_a_folder_made_by_someone_else_after_a_crash() {
+	let s = Sandbox::new();
+	let p = s.root.join("new");
+	let plan = Plan::new(vec![Op::Mkdir { path: p.clone() }], "");
+	let default_hook = panic::take_hook();
+	panic::set_hook(Box::new(|_| {}));
+	let crashed = panic::catch_unwind(AssertUnwindSafe(|| {
+		let v = s.validator();
+		let mut j = s.journal();
+		let _ = Executor::new(&v, &mut j, s.state.join("trash"))
+			.hook(|_, ph| {
+				if ph == Phase::BeforeApply {
+					panic!("simulated crash")
+				}
+			})
+			.execute(&plan, Source::Human);
+	}));
+	panic::set_hook(default_hook);
+	assert!(crashed.is_err());
+	fs::create_dir(&p).unwrap(); // someone else's, empty
+	let v = s.validator();
+	let mut j = s.journal();
+	let report = Executor::new(&v, &mut j, s.state.join("trash")).recover().unwrap();
+	assert!(report.errors.is_empty(), "{:?}", report.errors);
+	assert!(p.is_dir(), "recovery removed a folder tpfs did not make");
+}

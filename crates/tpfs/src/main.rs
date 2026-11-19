@@ -508,7 +508,7 @@ fn run(args: Args) -> Res {
 				let approved = if store.is_approved(p) { "approved" } else { "waiting" };
 				println!(
 					"{}  {:<8} {} op(s)  {}",
-					p.id,
+					tpfs_core::sanitize(p.id.as_ref()),
 					approved,
 					p.plan.ops.len(),
 					tpfs_core::sanitize(p.plan.reason.as_ref())

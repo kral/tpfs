@@ -383,6 +383,21 @@ impl Fs {
 			copied.push(Copied::of(rel, &meta));
 			// tpfs's own work entries (a volume's trash, partial copies) are never copied along.
 			for name in self.list(from)?.into_iter().filter(|n| !crate::validate::is_own_name(n)) {
+				// Never into another disk mounted below (like `cp -x`, but refusing: a move would
+				// then empty that disk).
+				#[cfg(unix)]
+				{
+					use std::os::unix::fs::MetadataExt;
+					if fs::symlink_metadata(from.join(&name)).is_ok_and(|m| m.is_dir() && m.dev() != meta.dev()) {
+						return Err(io::Error::new(
+							io::ErrorKind::Unsupported,
+							format!(
+								"{} is a mount point (another disk inside the folder); it is not copied or moved",
+								crate::sanitize(from.join(&name).as_os_str())
+							),
+						));
+					}
+				}
 				self.copy_tree(&from.join(&name), &to.join(&name), &rel.join(&name), copied)?;
 			}
 			return self.set_dir_mode(to, safe_permissions(&meta));
