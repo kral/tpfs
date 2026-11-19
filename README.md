@@ -64,6 +64,7 @@ tpfs
 
 ## Documentation
 
+- [The problem](docs/the-problem.md): how AI agents destroy files today, and what tpfs does about it
 - [Getting started](docs/getting-started.md): build, first plan, preview, approve, execute, undo
 - [Concepts](docs/concepts.md): plans, validation, risk, digest, journal, trash, roots, state folder
 - [Command line](docs/cli.md): every command, flag and exit code
