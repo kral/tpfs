@@ -227,6 +227,7 @@ impl Validator {
 				if !sim.exists(&path) {
 					return Err(format!("Does not exist: {}", show(&path)));
 				}
+				refuse_mount_point(&path)?;
 				sim.set(path, false);
 				Ok(())
 			}
@@ -265,6 +266,9 @@ impl Validator {
 		let from = self.resolve(from)?;
 		let to = self.resolve(to)?;
 		self.holds_state(&from)?;
+		if is_move {
+			refuse_mount_point(&from)?;
+		}
 
 		if !sim.exists(&from) {
 			return Err(format!("Source does not exist: {}", show(&from)));
@@ -401,6 +405,26 @@ fn check_names(path: &Path) -> Result<(), String> {
 			return Err(format!("Windows cannot use this name safely: '{}'", sanitize(name.as_ref().as_ref())));
 		}
 	}
+	Ok(())
+}
+
+/// A folder where another file system is mounted cannot be moved or trashed (the kernel refuses,
+/// and copying it into a trash on its own volume would copy it into itself): refused up front.
+fn refuse_mount_point(path: &Path) -> Result<(), String> {
+	#[cfg(unix)]
+	if let Some(parent) = path.parent() {
+		use std::os::unix::fs::MetadataExt;
+		if let (Ok(m), Ok(p)) = (fs::symlink_metadata(path), fs::symlink_metadata(parent))
+			&& m.is_dir()
+			&& m.dev() != p.dev()
+		{
+			return Err(format!(
+				"{} is a mount point (another disk is mounted there); unmount it, or work on what is inside it",
+				show(path)
+			));
+		}
+	}
+	let _ = path;
 	Ok(())
 }
 

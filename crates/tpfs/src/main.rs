@@ -486,8 +486,13 @@ fn run(args: Args) -> Res {
 			if args.roots.is_empty() {
 				return Err(usage("at least one --root <dir> is required"));
 			}
-			let config =
-				tpfs_mcp::Config { roots: args.roots.clone(), state: state_dir(&args)?, approval: args.approval };
+			let config = tpfs_mcp::Config {
+				roots: args.roots.clone(),
+				// Absolute: the agent's client may start the server anywhere, and the human
+				// runs the hinted `tpfs approve --home …` from somewhere else again.
+				state: std::path::absolute(state_dir(&args)?).map_err(|e| e.to_string())?,
+				approval: args.approval,
+			};
 			let mut server = tpfs_mcp::Server::new(config).map_err(|e| format!("invalid root: {e}"))?;
 			eprintln!("tpfs mcp: serving on stdio");
 			server.run(io::stdin().lock(), io::stdout().lock()).map_err(|e| e.to_string())?;

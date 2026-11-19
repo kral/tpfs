@@ -136,9 +136,7 @@ impl Server {
 	/// The exact command the human runs: with `--home` naming this server's state folder, so it
 	/// finds the plan whatever TPFS_HOME or --home the server was started with.
 	fn approve_command(&self, id: &str) -> String {
-		let home = show(&self.config.state);
-		let home = if home.contains([' ', '\'', '"']) { format!("\"{home}\"") } else { home };
-		format!("tpfs approve {id} --home {home}")
+		format!("tpfs approve {id} --home {}", shell_quote(&show(&self.config.state)))
 	}
 
 	fn initialize(&self, params: &Value) -> Value {
@@ -492,4 +490,16 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
 
 fn show(p: &Path) -> String {
 	sanitize(p.as_os_str())
+}
+
+/// A path as one shell word, safe to paste: single quotes on POSIX shells (an inner `'` as `'\''`),
+/// double quotes on Windows (where `"` cannot occur in a path).
+fn shell_quote(s: &str) -> String {
+	if cfg!(windows) {
+		format!("\"{s}\"")
+	} else if s.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-+,:@".contains(&b)) {
+		s.to_owned()
+	} else {
+		format!("'{}'", s.replace('\'', "'\\''"))
+	}
 }

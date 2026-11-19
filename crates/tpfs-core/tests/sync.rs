@@ -294,3 +294,18 @@ fn mirror_deletions_are_planned_except_under_an_empty_source_folder() {
 	assert!(trashed[0].contains("extra"), "{trashed:?}");
 	assert!(sp.skipped.iter().any(|k| k.rel.ends_with("p1.jpg") && k.why.contains("empty")), "{:?}", sp.skipped);
 }
+
+/// A source folder holding only tpfs work entries or Finder/Explorer metadata still counts as
+/// empty for the mirror guard.
+#[test]
+fn a_source_folder_with_only_metadata_counts_as_empty() {
+	let e = Env::new();
+	fs::create_dir(e.left.join("photos")).unwrap();
+	fs::write(e.left.join("photos/.DS_Store"), "x").unwrap();
+	fs::write(e.left.join("photos/.tpfs-part-0123abcd-0"), "x").unwrap();
+	e.file(&e.right.join("photos/p1.jpg"), "P", 0);
+	let cmp = compare(&e.left, &e.right, true).unwrap();
+	let sp = sync_plan(&e.left, &e.right, &cmp, SyncOptions { direction: Direction::LeftToRight, mirror: true });
+	assert!(!sp.plan.ops.iter().any(|op| op.to_string().contains("p1.jpg")), "{:?}", sp.plan.ops);
+	assert!(sp.skipped.iter().any(|k| k.rel.ends_with("p1.jpg") && k.why.contains("empty")), "{:?}", sp.skipped);
+}

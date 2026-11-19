@@ -424,14 +424,25 @@ impl<'a> Executor<'a> {
 			}
 			_ => {}
 		}
-		if !already_applied(&step.inverse) {
+		let recreates = matches!(step.inverse, Op::Mkdir { .. }) && step.mode.is_some();
+		let made_here = if already_applied(&step.inverse) {
+			false
+		} else {
+			if recreates {
+				// Marks "this inverse made the folder", so a rerun after a crash before its chmod
+				// still restores the mode — and never touches a folder someone else made instead.
+				self.journal.write(&Entry::UndoPublished { batch: batch.to_owned(), index: step.index })?;
+			}
 			let journal = &mut self.journal;
 			let mut publish = || journal.write(&Entry::UndoPublished { batch: batch.to_owned(), index: step.index });
 			apply(&step.inverse, fs, &self.trash, &label, step.index, None, &mut publish)?;
+			true
+		};
+		// Restore a removed folder's own permissions, not the default ones.
+		if made_here || (recreates && step.undo_published) {
+			restore_mode(fs, &step.inverse, step.mode)?;
 		}
-		// Restore a removed folder's own permissions, not the default ones — also when an earlier,
-		// interrupted attempt already recreated it.
-		restore_mode(fs, &step.inverse, step.mode)
+		Ok(())
 	}
 
 	/// A journaled operation replayed by undo or recovery must stay where tpfs may act: below the
@@ -548,7 +559,9 @@ impl<'a> Executor<'a> {
 					continue;
 				}
 				let mut clean_step = true;
+				let mut recreated_now = false;
 				for fix in cleanup(&step.forward, &step.inverse, &tag(&batch.id, step.index), step.published) {
+					recreated_now |= matches!(&fix, Fix::Op(Op::Mkdir { .. }));
 					let result = match &fix {
 						Fix::Op(op) => {
 							self.check_journaled(op).map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))
@@ -561,7 +574,12 @@ impl<'a> Executor<'a> {
 						clean_step = false;
 					}
 				}
-				if clean_step && let Err(e) = restore_mode(&fs, &step.inverse, step.mode) {
+				// The folder this clean-up just recreated gets its own permissions back (one that was
+				// never removed still has them).
+				if clean_step
+					&& recreated_now
+					&& let Err(e) = restore_mode(&fs, &step.inverse, step.mode)
+				{
 					errors.push(clean(format!("{}: {e}", step.inverse)));
 					clean_step = false;
 				}
@@ -599,9 +617,14 @@ impl<'a> Executor<'a> {
 		// create one; for other paths an existing one is anchored (undo moves out of it).
 		let mut trashes: Vec<PathBuf> = Vec::new();
 		for op in ops {
-			// Trash steps use it; so may the clean-up of a copy or move that fails half way.
-			let create = matches!(op, Op::Trash { .. } | Op::Copy { .. } | Op::Move { .. });
+			// Trash steps use it; so may the clean-up of a copy or move that fails half way (only on
+			// the target's volume: nothing is ever trashed on a copy's source volume).
+			let target = match op {
+				Op::Copy { to, .. } | Op::Move { to, .. } => Some(to.as_path()),
+				_ => None,
+			};
 			for p in op.paths() {
+				let create = matches!(op, Op::Trash { .. } | Op::Move { .. }) || Some(p) == target;
 				// A target that does not exist yet lives on the file system of its nearest existing
 				// folder: that trash is used too (clean-up of a cross-device move, its undo).
 				let Some(p) = p.ancestors().find(|a| fs::symlink_metadata(a).is_ok()) else { continue };
@@ -779,11 +802,15 @@ fn both_exist(old: &Path, new: &Path) -> io::Error {
 
 /// A folder recreated by an inverse `mkdir` gets the permissions it had before its `rmdir`.
 fn restore_mode(fs: &Fs, inverse: &Op, mode: Option<u32>) -> io::Result<()> {
+	// Only a folder of the user's own (tpfs recreated it, or an interrupted attempt did): a folder
+	// someone else made there meanwhile is left as it is (and could not be changed anyway).
 	#[cfg(unix)]
 	if let (Op::Mkdir { path }, Some(mode)) = (inverse, mode)
 		&& let Some(path) = normalize(path)
-		&& fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir())
-	{
+		&& fs::symlink_metadata(&path).is_ok_and(|m| {
+			use std::os::unix::fs::MetadataExt;
+			m.is_dir() && m.uid() == rustix::process::geteuid().as_raw()
+		}) {
 		use std::os::unix::fs::PermissionsExt;
 		return crate::fsops::set_dir_mode_at(fs, &path, fs::Permissions::from_mode(mode));
 	}

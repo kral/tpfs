@@ -420,7 +420,11 @@ fn draw_input(f: &mut Frame, title: &str, value: &str) {
 	let lines = vec![
 		Line::raw(""),
 		Line::from(vec![
-			Span::styled(format!(" {value}"), Style::new().fg(Color::White).bg(Color::Blue)),
+			// Shown sanitised (no bidi or control characters reordering what the user sees).
+			Span::styled(
+				format!(" {}", tpfs_core::sanitize(value.as_ref())),
+				Style::new().fg(Color::White).bg(Color::Blue),
+			),
 			Span::styled("_", Style::new().fg(Color::Yellow).bg(Color::Blue)),
 		]),
 		Line::raw(""),

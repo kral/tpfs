@@ -310,6 +310,12 @@ impl Action {
 	}
 }
 
+/// Entries that do not make a folder "not empty" for the mirror guard: tpfs's own, and the
+/// metadata files Finder and Explorer leave in any folder they open.
+fn ignorable(name: &std::ffi::OsStr) -> bool {
+	crate::validate::is_own_name(name) || matches!(name.to_str(), Some(".DS_Store" | "desktop.ini" | "Thumbs.db"))
+}
+
 /// The action for one item under the given options.
 pub fn action(item: &Item, opts: SyncOptions) -> Action {
 	use Action::*;
@@ -354,10 +360,13 @@ pub fn sync_plan(left: &Path, right: &Path, cmp: &Comparison, opts: SyncOptions)
 	// everything under the matching target folder: those trashes are never planned. Checked per
 	// folder, on the source itself (identical files are not among the differences).
 	let source = |rel: &Path| if opts.direction == Direction::RightToLeft { right.join(rel) } else { left.join(rel) };
-	let empty_source = |rel: &Path| {
-		rel.ancestors().skip(1).any(|dir| {
-			fs::read_dir(source(dir))
-				.is_ok_and(|mut rd| !rd.any(|e| e.is_ok_and(|e| !crate::validate::is_own_name(&e.file_name()))))
+	// Only the immediate parent can be the empty one (a higher folder contains it); one look per
+	// folder, however many items it would trash.
+	let mut empty_parents: std::collections::HashMap<PathBuf, bool> = std::collections::HashMap::new();
+	let mut empty_source = |rel: &Path| {
+		let dir = rel.parent().unwrap_or(Path::new("")).to_path_buf();
+		*empty_parents.entry(dir).or_insert_with_key(|dir| {
+			fs::read_dir(source(dir)).is_ok_and(|mut rd| !rd.any(|e| e.is_ok_and(|e| !ignorable(&e.file_name()))))
 		})
 	};
 	let mut ops = Vec::new();

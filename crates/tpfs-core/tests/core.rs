@@ -1727,3 +1727,22 @@ fn a_lost_first_undo_record_of_an_older_batch_is_noticed() {
 	drop(j);
 	assert!(undo(&s).is_err());
 }
+
+/// Undo of an `rmdir` when someone made a folder of that name since: its permissions and
+/// contents stay as they are (undo only restores the mode of a folder it recreated itself).
+#[cfg(unix)]
+#[test]
+fn undoing_rmdir_leaves_a_folder_made_since_alone() {
+	use std::os::unix::fs::PermissionsExt;
+	let s = Sandbox::new();
+	let d = s.root.join("shared");
+	fs::create_dir(&d).unwrap();
+	fs::set_permissions(&d, fs::Permissions::from_mode(0o777)).unwrap();
+	run(&s, vec![Op::Rmdir { path: d.clone() }]);
+	fs::create_dir(&d).unwrap();
+	fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
+	fs::write(d.join("secret"), "S").unwrap();
+	let _ = undo(&s);
+	assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700, "the user's folder was opened up");
+	assert_eq!(fs::read_to_string(d.join("secret")).unwrap(), "S");
+}

@@ -381,7 +381,8 @@ impl Fs {
 		} else if ft.is_dir() {
 			self.mkdir(to)?;
 			copied.push(Copied::of(rel, &meta));
-			for name in self.list(from)? {
+			// tpfs's own work entries (a volume's trash, partial copies) are never copied along.
+			for name in self.list(from)?.into_iter().filter(|n| !crate::validate::is_own_name(n)) {
 				self.copy_tree(&from.join(&name), &to.join(&name), &rel.join(&name), copied)?;
 			}
 			return self.set_dir_mode(to, safe_permissions(&meta));
@@ -662,16 +663,24 @@ pub(crate) fn sync_parent(path: &Path) {
 
 /// fsync a directory so entries created in it survive a power loss (Unix; NTFS journals metadata).
 fn sync_dir(dir: &Path) {
+	// Not following a link, and never blocking (a FIFO swapped in for the folder must not hang a
+	// batch that holds the journal lock).
 	#[cfg(unix)]
-	if let Ok(d) = File::open(dir) {
-		let _ = d.sync_all();
+	if let Ok(fd) = rustix::fs::open(
+		dir,
+		rustix::fs::OFlags::RDONLY
+			| rustix::fs::OFlags::DIRECTORY
+			| rustix::fs::OFlags::NOFOLLOW
+			| rustix::fs::OFlags::NONBLOCK
+			| rustix::fs::OFlags::CLOEXEC,
+		rustix::fs::Mode::empty(),
+	) {
+		let _ = File::from(fd).sync_all();
 	}
 	#[cfg(not(unix))]
 	let _ = dir;
 }
 
-/// Whether two paths name the same file (same device and inode), e.g. `a.txt` and `A.txt`
-/// on a case-insensitive file system.
 /// Number of names (hard links) of the entry at `p`, not following a final link.
 pub(crate) fn link_count(p: &Path) -> Option<u64> {
 	#[cfg(unix)]
@@ -690,6 +699,8 @@ pub(crate) fn link_count(p: &Path) -> Option<u64> {
 	}
 }
 
+/// Whether two paths name the same file (same device and inode), e.g. `a.txt` and `A.txt`
+/// on a case-insensitive file system.
 pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
 	#[cfg(unix)]
 	{
