@@ -14,6 +14,13 @@ use crate::{
 /// Upper bound on operations in one plan.
 pub const MAX_OPS: usize = 10_000;
 
+/// Longest plan reason, in characters. The reason is journaled with the batch, and every journal
+/// record must stay far below the journal's line limit.
+pub const MAX_REASON: usize = 10_000;
+
+/// Longest path accepted, in bytes (PATH_MAX on Linux; Windows long paths fit too).
+pub const MAX_PATH: usize = 4096;
+
 /// A problem found in a plan. `index` points at the offending operation (0-based), if any.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Issue {
@@ -145,6 +152,15 @@ impl Validator {
 			};
 			return vec![Issue { index: None, message }];
 		}
+		if plan.reason.chars().count() > MAX_REASON {
+			return vec![Issue {
+				index: None,
+				message: format!(
+					"The reason is too long ({} characters, limit {MAX_REASON}).",
+					plan.reason.chars().count()
+				),
+			}];
+		}
 		if plan.ops.len() > self.max_ops {
 			return vec![Issue {
 				index: None,
@@ -265,6 +281,9 @@ impl Validator {
 	/// `Photos.` or an 8.3 short name on Windows — are recognised as the same root.
 	fn resolve(&self, path: &Path) -> Result<PathBuf, String> {
 		let path = normalize(path).ok_or_else(|| format!("Path must be absolute: {}", show(path)))?;
+		if path.as_os_str().len() > MAX_PATH {
+			return Err(format!("Path is longer than {MAX_PATH} bytes."));
+		}
 		if path.to_str().is_none() {
 			// The plan, its digest and the journal store paths as JSON strings.
 			return Err(format!("File names that are not valid Unicode are not supported yet: {}", show(&path)));

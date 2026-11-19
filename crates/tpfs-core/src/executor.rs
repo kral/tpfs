@@ -35,6 +35,8 @@ pub enum ExecError {
 	Rejected(Vec<Issue>),
 	/// A step failed; the steps before it were rolled back (errors listed if rollback was incomplete).
 	Failed { step: usize, error: String, rollback_errors: Vec<String> },
+	/// An interrupted or damaged batch has to be dealt with first (`recover`, or by hand).
+	Blocked(String),
 	/// Undo of `batch` stopped; the steps reverted so far stay reverted and `undo` resumes there.
 	Undo { batch: String, error: String },
 	/// The journal could not be written; execution stopped before touching the disk further.
@@ -61,6 +63,7 @@ impl fmt::Display for ExecError {
 				rollback_errors.join("; ")
 			),
 			ExecError::Undo { batch, error } => write!(f, "cannot undo batch {batch}: {error}"),
+			ExecError::Blocked(why) => f.write_str(why),
 			ExecError::Journal(e) => write!(f, "journal error: {e}"),
 		}
 	}
@@ -142,6 +145,15 @@ impl<'a> Executor<'a> {
 		let issues = self.validator.validate(plan);
 		if !issues.is_empty() {
 			return Err(ExecError::Rejected(issues));
+		}
+
+		// Never build on top of an interrupted batch: its rollback would later run over this one.
+		if let Some(b) = self.journal.batches()?.into_iter().find(|b| b.status == BatchStatus::Incomplete) {
+			return Err(ExecError::Blocked(format!(
+				"batch {} was interrupted{}; run `tpfs recover` first",
+				b.id,
+				if b.damaged { " and its journal records are damaged" } else { "" }
+			)));
 		}
 
 		let batch = new_batch_id();
@@ -234,7 +246,11 @@ impl<'a> Executor<'a> {
 		{
 			return Err(ExecError::Undo {
 				batch: b.id.clone(),
-				error: "it was interrupted and must be rolled back first (`tpfs recover`)".into(),
+				error: if b.damaged {
+					"its journal records are damaged; fix it by hand (see `tpfs log`)".into()
+				} else {
+					"it was interrupted and must be rolled back first (`tpfs recover`)".into()
+				},
 			});
 		}
 		let Some(batch) = batches.into_iter().rev().find(|b| b.status == BatchStatus::Committed) else {
@@ -290,10 +306,30 @@ impl<'a> Executor<'a> {
 	}
 
 	/// Roll back batches that were interrupted (begun but never committed or aborted).
+	///
+	/// An interrupted batch with committed batches after it is not rolled back automatically: its
+	/// inverses would run over those later changes. It is reported instead.
 	pub fn recover(&mut self) -> Result<RecoveryReport, ExecError> {
-		let batches: Vec<_> =
-			self.journal.batches()?.into_iter().filter(|b| b.status == BatchStatus::Incomplete).collect();
-		self.recover_batches(batches)
+		let all = self.journal.batches()?;
+		let mut report = RecoveryReport::default();
+		let mut batches = Vec::new();
+		for (i, b) in all.iter().enumerate() {
+			if b.status != BatchStatus::Incomplete {
+				continue;
+			}
+			if all[i + 1..].iter().any(|later| later.status == BatchStatus::Committed) {
+				report.errors.push(format!(
+					"batch {} was interrupted before newer changes were made; it is not rolled back automatically",
+					b.id
+				));
+			} else {
+				batches.push(b.clone());
+			}
+		}
+		let mut rest = self.recover_batches(batches)?;
+		report.rolled_back.append(&mut rest.rolled_back);
+		report.errors.append(&mut rest.errors);
+		Ok(report)
 	}
 
 	/// Roll back the newest batch if, and only if, it was interrupted: the change "Undo" means.

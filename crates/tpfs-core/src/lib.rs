@@ -23,4 +23,4 @@ pub use executor::{BatchReport, ExecError, Executor, Phase, RecoveryReport, Sour
 pub use journal::{BatchStatus, BatchView, Entry, Journal, Step};
 pub use op::{Op, Plan};
 pub use path::{canonicalize, check_private_file, normalize, private_dir, system_roots};
-pub use validate::{Issue, MAX_OPS, Validator};
+pub use validate::{Issue, MAX_OPS, MAX_PATH, MAX_REASON, Validator};

@@ -252,13 +252,29 @@ impl Journal {
 	/// All batches in journal order.
 	pub fn batches(&mut self) -> io::Result<Vec<BatchView>> {
 		let mut batches: Vec<BatchView> = Vec::new();
-		// Batches that were open when an unreadable line appeared.
+		// Batches that were open when an unreadable line appeared, until the next readable record.
 		let mut suspect: Vec<String> = Vec::new();
 		for e in self.records()? {
 			let Some(e) = e else {
-				suspect.extend(batches.iter().filter(|b| b.status == BatchStatus::Incomplete).map(|b| b.id.clone()));
+				for b in batches.iter().filter(|b| b.status == BatchStatus::Incomplete) {
+					if !suspect.contains(&b.id) {
+						suspect.push(b.id.clone());
+					}
+				}
 				continue;
 			};
+			// Anything readable after the damage — except recovery closing a suspect batch, the normal
+			// end of a crash with a torn last line — means records of the open batches may be lost
+			// (an intent, a done, or the commit itself).
+			if !suspect.is_empty() {
+				let closes_suspect = matches!(&e, Entry::Abort { batch } if suspect.contains(batch));
+				if !closes_suspect {
+					for b in batches.iter_mut().filter(|b| suspect.contains(&b.id)) {
+						b.damaged = true;
+					}
+				}
+				suspect.clear();
+			}
 			if let Entry::Begin { batch, at, source, reason, v, .. } = &e {
 				batches.push(BatchView {
 					id: batch.clone(),
@@ -272,16 +288,20 @@ impl Journal {
 				continue;
 			}
 
-			let Some(b) = batches.iter_mut().rev().find(|b| b.id == e.batch()) else { continue };
-			// Execution records after the damage: one of this batch's own records may be lost.
-			// (A torn last line followed only by recovery's `abort` is the normal crash case.)
-			if suspect.contains(&b.id)
-				&& matches!(
-					e,
-					Entry::Intent { .. } | Entry::Done { .. } | Entry::Published { .. } | Entry::Commit { .. }
-				) {
-				b.damaged = true;
+			// A record without its `begin` (lost to damage): keep it visible as a damaged batch
+			// instead of dropping it, so undo cannot silently skip over it.
+			if !batches.iter().any(|b| b.id == e.batch()) {
+				batches.push(BatchView {
+					id: e.batch().to_owned(),
+					at: 0,
+					source: String::new(),
+					reason: "(its first journal record is unreadable)".into(),
+					status: BatchStatus::Incomplete,
+					damaged: true,
+					steps: Vec::new(),
+				});
 			}
+			let Some(b) = batches.iter_mut().rev().find(|b| b.id == e.batch()) else { continue };
 			match e {
 				Entry::Intent { index, forward, inverse, .. } => {
 					b.steps.push(Step {

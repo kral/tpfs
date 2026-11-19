@@ -515,15 +515,36 @@ fn recover_last_only_touches_an_interrupted_newest_batch() {
 		j.append(&Entry::Done { batch: id.into(), index: 0, check: None }).unwrap();
 	};
 	crashed(&mut j, "old");
-	// something newer happened after the interrupted batch
 	let v = Validator::new([&s.root]).unwrap();
+	// A new batch on top of an interrupted one is refused…
 	let newer = s.root.join("newer");
-	Executor::new(&v, &mut j, s.trash())
-		.execute(&Plan::new(vec![Op::Mkdir { path: newer.clone() }], ""), Source::Human)
-		.unwrap();
+	let plan = Plan::new(vec![Op::Mkdir { path: newer.clone() }], "");
+	assert!(matches!(Executor::new(&v, &mut j, s.trash()).execute(&plan, Source::Human), Err(ExecError::Blocked(_))));
+	// …but an old journal may already have one (written before this rule): simulate it.
+	j.append(&Entry::Begin {
+		batch: "n".into(),
+		at: 0,
+		source: "human".into(),
+		reason: String::new(),
+		digest: String::new(),
+		v: 1,
+	})
+	.unwrap();
+	j.append(&Entry::Intent {
+		batch: "n".into(),
+		index: 0,
+		forward: Op::Mkdir { path: newer.clone() },
+		inverse: Op::Rmdir { path: newer.clone() },
+	})
+	.unwrap();
+	fs::create_dir(&newer).unwrap();
+	j.append(&Entry::Done { batch: "n".into(), index: 0, check: None }).unwrap();
+	j.append(&Entry::Commit { batch: "n".into() }).unwrap();
 
 	let r = Executor::new(&v, &mut j, s.trash()).recover_last().unwrap();
 	assert!(r.rolled_back.is_empty(), "an older interrupted batch must not be rolled back by Undo");
+	let r = Executor::new(&v, &mut j, s.trash()).recover().unwrap();
+	assert!(r.rolled_back.is_empty() && r.errors[0].contains("newer changes"), "{r:?}");
 	assert!(dir.exists() && newer.exists());
 
 	fs::remove_dir(&dir).unwrap();
@@ -801,4 +822,66 @@ fn preview_and_risk_see_the_path_that_is_acted_on() {
 	let line = &plan.preview()[0];
 	assert!(!line.contains("..") && line.ends_with("Photos"), "{line}");
 	assert_eq!(tpfs_core::risk::assess(&plan, Source::Human).level, tpfs_core::risk::Level::High);
+}
+
+#[test]
+fn a_huge_reason_is_rejected_before_anything_is_journaled() {
+	let s = Sandbox::new();
+	let plan = Plan::new(vec![Op::Mkdir { path: s.root.join("d") }], "\u{1}".repeat(tpfs_core::MAX_REASON + 1));
+	assert!(messages(&s.validator(), &plan)[0].contains("too long"));
+	let mut j = s.journal();
+	assert!(matches!(
+		Executor::new(&s.validator(), &mut j, s.trash()).execute(&plan, Source::Human),
+		Err(ExecError::Rejected(_))
+	));
+	assert!(j.batches().unwrap().is_empty());
+}
+
+#[test]
+fn a_lost_commit_or_begin_is_damage_not_a_reason_to_roll_back_or_skip() {
+	let s = Sandbox::new();
+	let a = s.file("a.txt", "A");
+	let b = s.root.join("b.txt");
+	run(&s, vec![Op::Move { from: a.clone(), to: b.clone() }]);
+	let path = s.state.join("journal.jsonl");
+	// Damage the commit line of that batch, then let another batch follow.
+	let text = fs::read_to_string(&path).unwrap();
+	let damaged: String = text
+		.lines()
+		.map(|l| if l.contains("\"commit\"") { "xxxxxxxx garbage\n".to_owned() } else { format!("{l}\n") })
+		.collect();
+	fs::write(&path, damaged).unwrap();
+	let mut j = s.journal();
+	j.append(&Entry::Begin {
+		batch: "later".into(),
+		at: 0,
+		source: "human".into(),
+		reason: String::new(),
+		digest: String::new(),
+		v: 1,
+	})
+	.unwrap();
+	j.append(&Entry::Commit { batch: "later".into() }).unwrap();
+	let batches = j.batches().unwrap();
+	assert!(batches[0].damaged, "{batches:?}");
+	let report = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
+	assert!(report.rolled_back.is_empty(), "a committed batch whose commit line was lost must not be rolled back");
+	assert!(b.exists() && !a.exists());
+
+	// A batch whose begin is unreadable stays visible (damaged) and undo does not skip past it.
+	let s = Sandbox::new();
+	run(&s, vec![Op::Mkdir { path: s.root.join("first") }]);
+	run(&s, vec![Op::Mkdir { path: s.root.join("second") }]);
+	let text = fs::read_to_string(path_of(&s)).unwrap();
+	let mut lines: Vec<&str> = text.lines().collect();
+	let second_begin = lines.iter().rposition(|l| l.contains("\"begin\"")).unwrap();
+	lines[second_begin] = "0 unreadable";
+	fs::write(path_of(&s), lines.join("\n") + "\n").unwrap();
+	let err = undo(&s).unwrap_err();
+	assert!(err.to_string().contains("damaged"), "{err}");
+	assert!(s.root.join("first").is_dir() && s.root.join("second").is_dir());
+}
+
+fn path_of(s: &Sandbox) -> PathBuf {
+	s.state.join("journal.jsonl")
 }
