@@ -101,22 +101,42 @@ fn run_external(external: External) -> Result<String, String> {
 				None => ("sh".into(), "-c"),
 			};
 			let mut run = Command::new(&shell);
-			run.arg(flag).current_dir(&cwd);
-			// cmd.exe does not read the quoting Rust applies to arguments: hand it the line as typed.
-			#[cfg(windows)]
 			if flag == "/C" {
-				std::os::windows::process::CommandExt::raw_arg(&mut run, &command);
+				// cmd.exe does not read the quoting Rust applies to arguments, and cannot start in a
+				// network folder: hand it the line as typed, after a `pushd` there when needed.
+				let (in_dir, line) = cmd_line(&cwd.to_string_lossy(), &command);
+				if in_dir {
+					run.current_dir(&cwd);
+				}
+				#[cfg(windows)]
+				std::os::windows::process::CommandExt::raw_arg(&mut run, &line);
+				#[cfg(not(windows))]
+				run.arg(&line);
 			} else {
-				run.arg(&command);
+				run.arg(flag).arg(&command).current_dir(&cwd);
 			}
-			#[cfg(not(windows))]
-			run.arg(&command);
 			let status = run.status().map_err(|e| format!("{shell}: {e}"))?;
 			print!("\n[{status}] Press Enter to return to tpfs… ");
 			io::stdout().flush().ok();
 			io::stdin().lock().read_line(&mut String::new()).ok();
 			Ok(format!("Shell command finished ({status}); shell commands are not journaled."))
 		}
+	}
+}
+
+/// The arguments for `cmd.exe` to run `command` in `cwd`, as typed: `/S /C "<line>"`, so cmd
+/// strips exactly the outer quotes it was given. A network folder (`\\server\share`) cannot be
+/// cmd's starting folder (it would fall back to C:\Windows), so the line starts with `pushd`
+/// there, which maps a drive letter for it. `true` when `cwd` can be the starting folder.
+fn cmd_line(cwd: &str, command: &str) -> (bool, String) {
+	let cwd = match cwd.strip_prefix(r"\\?\UNC\") {
+		Some(rest) => format!(r"\\{rest}"),
+		None => cwd.strip_prefix(r"\\?\").unwrap_or(cwd).to_owned(),
+	};
+	if cwd.starts_with(r"\\") {
+		(false, format!(r#"/S /C "pushd "{cwd}" && {command}""#))
+	} else {
+		(true, format!(r#"/S /C "{command}""#))
 	}
 }
 
@@ -177,6 +197,18 @@ mod tests {
 		std::fs::write(tmp.path().join("nano"), "").unwrap();
 		assert_eq!(editor_from(None, None, path(), false).as_deref(), Some("nano"));
 		assert_eq!(editor_from(None, None, None, true).as_deref(), Some("notepad"));
+	}
+
+	#[test]
+	fn cmd_runs_the_line_as_typed_and_in_network_folders() {
+		assert_eq!(
+			cmd_line(r"C:\Users\me", r#""C:\Program Files\x.exe" "a b""#),
+			(true, r#"/S /C ""C:\Program Files\x.exe" "a b"""#.to_owned())
+		);
+		let share = (false, r#"/S /C "pushd "\\nas\photos\2024" && del /q *.tmp""#.to_owned());
+		assert_eq!(cmd_line(r"\\nas\photos\2024", "del /q *.tmp"), share);
+		assert_eq!(cmd_line(r"\\?\UNC\nas\photos\2024", "del /q *.tmp"), share);
+		assert_eq!(cmd_line(r"\\?\D:\x", "dir").1, r#"/S /C "dir""#);
 	}
 
 	#[test]
