@@ -77,7 +77,7 @@ fn compare_classifies_differences() {
 		got,
 		[
 			("conflict.txt".into(), Diff::Conflict),
-			(Path::new("deep/a/b.jpg").to_string_lossy().into_owned(), Diff::OnlyLeft),
+			(["deep", "a", "b.jpg"].iter().collect::<PathBuf>().to_string_lossy().into_owned(), Diff::OnlyLeft),
 			("newer-left.txt".into(), Diff::LeftNewer),
 			("only-left.txt".into(), Diff::OnlyLeft),
 			("only-right.txt".into(), Diff::OnlyRight),
