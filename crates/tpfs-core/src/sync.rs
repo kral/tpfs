@@ -143,11 +143,18 @@ fn walk(
 
 	// On file systems that ignore letter case, `A.txt` and `a.txt` are one file: pairing them by
 	// exact name would plan a copy onto an existing file. They are reported, not synced.
+	// Folded names of each side, built once (lookups stay logarithmic for big folders).
+	let fold = |m: &BTreeMap<std::ffi::OsString, Meta>| -> std::collections::BTreeSet<String> {
+		if CASE_INSENSITIVE {
+			m.keys().map(|k| k.to_string_lossy().to_lowercase()).collect()
+		} else {
+			Default::default()
+		}
+	};
+	let (lf, rf) = (fold(&l), fold(&r));
 	if CASE_INSENSITIVE {
-		let folded: BTreeMap<String, &std::ffi::OsString> =
-			r.keys().map(|k| (k.to_string_lossy().to_lowercase(), k)).collect();
 		for name in l.keys().filter(|k| !r.contains_key(*k)) {
-			if folded.contains_key(&name.to_string_lossy().to_lowercase()) {
+			if rf.contains(&name.to_string_lossy().to_lowercase()) {
 				out.items.push(Item {
 					rel: rel.join(name),
 					diff: Diff::CaseMismatch,
@@ -157,10 +164,10 @@ fn walk(
 			}
 		}
 	}
-	let case_twin = |name: &std::ffi::OsString, other: &BTreeMap<std::ffi::OsString, Meta>| {
-		CASE_INSENSITIVE
-			&& !other.contains_key(name)
-			&& other.keys().any(|k| k.to_string_lossy().to_lowercase() == name.to_string_lossy().to_lowercase())
+	let case_twin = |name: &std::ffi::OsString,
+	                 other: &BTreeMap<std::ffi::OsString, Meta>,
+	                 folded: &std::collections::BTreeSet<String>| {
+		CASE_INSENSITIVE && !other.contains_key(name) && folded.contains(&name.to_string_lossy().to_lowercase())
 	};
 
 	let mut names: Vec<&std::ffi::OsString> = l.keys().chain(r.keys()).collect();
@@ -168,7 +175,8 @@ fn walk(
 	names.dedup();
 
 	for name in names {
-		if case_twin(name, if l.contains_key(name) { &r } else { &l }) {
+		let in_left = l.contains_key(name);
+		if case_twin(name, if in_left { &r } else { &l }, if in_left { &rf } else { &lf }) {
 			continue; // reported above
 		}
 		let rel = rel.join(name);
@@ -335,6 +343,13 @@ pub fn sync_plan(left: &Path, right: &Path, cmp: &Comparison, opts: SyncOptions)
 
 	for item in cmp.items.iter().filter(|i| i.diff != Diff::Same) {
 		let (l, r) = (left.join(&item.rel), right.join(&item.rel));
+		if item.rel.to_str().is_none() {
+			skipped.push(Skipped {
+				rel: item.rel.clone(),
+				why: "the name is not valid Unicode; handle it by hand".into(),
+			});
+			continue;
+		}
 		match action(item, opts) {
 			Action::CopyToRight => {
 				ops.push(Op::Copy { from: l, to: r });

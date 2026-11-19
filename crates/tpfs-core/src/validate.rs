@@ -183,8 +183,15 @@ impl Validator {
 				self.holds_state(&source)?;
 				let parent = source.parent().ok_or("Cannot rename a file system root.")?;
 				let target = parent.join(new_name);
-				if target != source && same_file(&source, &target) && !sim.state.contains_key(&target) {
-					// Only the letter case differs, on a case-insensitive file system.
+				let case_only =
+					source.file_name().map(|n| n.to_string_lossy().to_lowercase()) == Some(new_name.to_lowercase());
+				if target != source && case_only && same_file(&source, &target) && !sim.state.contains_key(&target) {
+					// Only the letter case differs, on a case-insensitive file system (a hard link
+					// under another name is a different entry, and goes the normal way).
+					check_names(&target)?;
+					if !sim.exists(&source) {
+						return Err(format!("Source does not exist: {}", show(&source)));
+					}
 					sim.set(source, false);
 					sim.set(target, true);
 					return Ok(());
@@ -359,7 +366,7 @@ fn check_names(path: &Path) -> Result<(), String> {
 		let stem = name.split('.').next().unwrap_or_default().trim_end().to_ascii_uppercase();
 		let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
 			|| ((stem.starts_with("COM") || stem.starts_with("LPT"))
-				&& stem.len() == 4
+				&& stem.chars().count() == 4
 				&& stem[3..].chars().all(|d| ('1'..='9').contains(&d) || "¹²³".contains(d)));
 		if name.contains(':') || name.ends_with(['.', ' ']) || device {
 			return Err(format!("Windows cannot use this name safely: '{}'", sanitize(name.as_ref().as_ref())));

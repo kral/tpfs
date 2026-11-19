@@ -12,6 +12,10 @@ pub fn sanitize(name: &OsStr) -> String {
 		for ch in chunk.valid().chars() {
 			if is_dangerous(ch) {
 				let _ = write!(out, "\\u{{{:x}}}", ch as u32);
+			} else if ch == '\\' && cfg!(unix) {
+				// On Unix a backslash is an ordinary name character: escape it, so a name that
+				// literally contains `\u{202e}` cannot pass for one with the real character.
+				out.push_str("\\\\");
 			} else {
 				out.push(ch);
 			}
