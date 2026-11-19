@@ -29,6 +29,7 @@ impl Source {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ExecError {
 	/// The plan did not pass validation; nothing was touched.
 	Rejected(Vec<Issue>),
@@ -210,7 +211,7 @@ impl<'a> Executor<'a> {
 					}
 					rollback_errors.extend(self.revert(&fs, &applied, &batch));
 					self.journal.append(&Entry::Abort { batch })?;
-					return Err(ExecError::Failed { step: i, error: error.to_string(), rollback_errors });
+					return Err(ExecError::Failed { step: i, error: format!("{op}: {error}"), rollback_errors });
 				}
 			}
 		}

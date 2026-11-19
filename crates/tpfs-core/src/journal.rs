@@ -76,6 +76,7 @@ impl Entry {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BatchStatus {
 	/// Started but neither committed nor aborted — interrupted by a crash; `recover` rolls it back.
 	Incomplete,
@@ -183,6 +184,9 @@ impl Journal {
 		self.corrupt
 	}
 
+	/// Append one record and fsync it. For the executor and for tests that build journals by hand;
+	/// undo and recovery never trust a record to lead outside the roots (see `Executor`).
+	#[doc(hidden)]
 	pub fn append(&mut self, entry: &Entry) -> io::Result<()> {
 		let json = serde_json::to_string(entry).map_err(io::Error::other)?;
 		let line = format!("{:08x} {json}\n", crc32fast::hash(json.as_bytes()));

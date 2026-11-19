@@ -1,14 +1,15 @@
 use std::{fmt, path::PathBuf};
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::display::sanitize;
 
 /// One file operation. Paths are absolute; `to` is the full destination path, not a folder to drop into.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "op", rename_all = "lowercase", deny_unknown_fields)]
+#[non_exhaustive]
 pub enum Op {
 	/// Move a file or directory.
 	Move { from: PathBuf, to: PathBuf },
@@ -31,7 +32,8 @@ pub enum Op {
 /// An ordered list of operations plus a short human-readable reason.
 /// Unknown fields are rejected: an agent that invents an option such as `force` must learn that it
 /// does not exist, instead of believing it took effect.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Plan {
 	pub ops: Vec<Op>,
@@ -62,6 +64,7 @@ impl Plan {
 		Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 	}
 
+	#[cfg(feature = "schema")]
 	/// JSON Schema of a plan, generated from the Rust types so prompts and code never drift apart.
 	pub fn schema() -> serde_json::Value {
 		serde_json::to_value(schemars::schema_for!(Plan)).expect("schema serialises")

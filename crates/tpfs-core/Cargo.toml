@@ -7,9 +7,13 @@ rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
 
+[features]
+# JSON Schema of a plan (`Plan::schema`), for prompts and MCP tool definitions.
+schema = ["dep:schemars"]
+
 [dependencies]
 crc32fast  = { workspace = true }
-schemars   = { workspace = true }
+schemars   = { workspace = true, optional = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 sha2       = { workspace = true }

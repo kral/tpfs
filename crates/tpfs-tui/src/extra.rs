@@ -43,28 +43,28 @@ pub(crate) fn format_time(t: SystemTime) -> (String, String) {
 
 #[cfg(unix)]
 fn local(secs: i64) -> (i64, u32, u32, u32, u32) {
-	// SAFETY: localtime_r writes only into the provided struct.
-	unsafe {
-		let t: libc::time_t = secs as libc::time_t;
-		let mut tm: libc::tm = std::mem::zeroed();
-		if libc::localtime_r(&t, &mut tm).is_null() {
-			return utc(secs);
-		}
-		(tm.tm_year as i64 + 1900, tm.tm_mon as u32 + 1, tm.tm_mday as u32, tm.tm_hour as u32, tm.tm_min as u32)
+	let t = secs as libc::time_t;
+	// SAFETY: `tm` holds only integers and (on some systems) a `tm_zone` pointer, for which all
+	// zeroes (null) is a valid value.
+	let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+	// SAFETY: both pointers are valid for the call; localtime_r is the thread-safe variant and only
+	// writes `tm`. It reads TZ from the environment, which tpfs never modifies (no setenv).
+	if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+		return utc(secs);
 	}
+	(tm.tm_year as i64 + 1900, tm.tm_mon as u32 + 1, tm.tm_mday as u32, tm.tm_hour as u32, tm.tm_min as u32)
 }
 
 #[cfg(windows)]
 fn local(secs: i64) -> (i64, u32, u32, u32, u32) {
-	// SAFETY: localtime_s (_localtime64_s) writes only into the provided struct.
-	unsafe {
-		let t: libc::time_t = secs as libc::time_t;
-		let mut tm: libc::tm = std::mem::zeroed();
-		if libc::localtime_s(&mut tm, &t) != 0 {
-			return utc(secs);
-		}
-		(tm.tm_year as i64 + 1900, tm.tm_mon as u32 + 1, tm.tm_mday as u32, tm.tm_hour as u32, tm.tm_min as u32)
+	let t = secs as libc::time_t;
+	// SAFETY: `tm` holds only integers, for which all zeroes is a valid value.
+	let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+	// SAFETY: both pointers are valid for the call; localtime_s only writes `tm`.
+	if unsafe { libc::localtime_s(&mut tm, &t) } != 0 {
+		return utc(secs);
 	}
+	(tm.tm_year as i64 + 1900, tm.tm_mon as u32 + 1, tm.tm_mday as u32, tm.tm_hour as u32, tm.tm_min as u32)
 }
 
 #[cfg(not(any(unix, windows)))]

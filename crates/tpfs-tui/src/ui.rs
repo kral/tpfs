@@ -229,6 +229,7 @@ fn op_lines(op: &tpfs_core::Op, width: usize) -> Vec<String> {
 		Op::Trash { path } => vec![line("TRASH", s(path))],
 		Op::Mkdir { path } => vec![line("MKDIR", s(path))],
 		Op::Rmdir { path } => vec![line("RMDIR", s(path))],
+		other => vec![truncate_middle(&other.to_string(), width)],
 	}
 }
 
@@ -244,6 +245,7 @@ fn totals(plan: &tpfs_core::Plan) -> String {
 			Op::Trash { .. } => 3,
 			Op::Mkdir { .. } => 4,
 			Op::Rmdir { .. } => 5,
+			_ => continue,
 		}] += 1;
 	}
 	let names = ["move", "copy", "rename", "trash", "mkdir", "rmdir"];
@@ -285,22 +287,44 @@ fn draw_confirm(
 		Level::Medium => {
 			(DIALOG.fg(Color::Blue).add_modifier(Modifier::BOLD), format!("Risk: MEDIUM — {}", risk.reasons.join("; ")))
 		}
-		Level::High => {
-			(DIALOG.fg(Color::Red).add_modifier(Modifier::BOLD), format!("Risk: HIGH — {}", risk.reasons.join("; ")))
-		}
+		_ => (DIALOG.fg(Color::Red).add_modifier(Modifier::BOLD), format!("Risk: HIGH — {}", risk.reasons.join("; "))),
 	};
 	let mut foot: Vec<Line> = vec![Line::styled(truncate_right(&format!("Total: {}", totals(plan)), w), DIALOG)];
 	foot.extend(wrap(&risk_text, w).into_iter().map(|l| Line::styled(l, risk_style)));
-	let ops: Vec<String> = plan.ops.iter().flat_map(|op| op_lines(op, w)).collect();
+	// Only the visible window is formatted: a 10 000-operation plan costs nothing per redraw.
+	let line_count = |op: &tpfs_core::Op| match op {
+		tpfs_core::Op::Move { .. } | tpfs_core::Op::Copy { .. } | tpfs_core::Op::Rename { .. } => 2,
+		_ => 1,
+	};
+	let total_lines: usize = plan.ops.iter().map(line_count).sum();
 
 	// Space for the list after the fixed parts; problems get at most a third of what is left.
 	let free = (rect.height as usize).saturating_sub(2 + head.len() + foot.len() + 3);
 	let shown_issues = issues.len().min(6).min((free / 3).max(1));
 	let rows = free.saturating_sub(shown_issues + usize::from(issues.len() > shown_issues));
-	let fits = w >= 20 && rows >= 2.min(ops.len().max(1));
-	let max_offset = ops.len().saturating_sub(rows.max(1));
+	let fits = w >= 20 && rows >= 2.min(total_lines.max(1));
+	let max_offset = total_lines.saturating_sub(rows.max(1));
 	let offset = offset.min(max_offset);
-	let at_end = fits && offset + rows >= ops.len();
+	let at_end = fits && offset + rows >= total_lines;
+	let window: Vec<String> = {
+		let mut out = Vec::with_capacity(rows);
+		let mut line = 0;
+		for op in &plan.ops {
+			let n = line_count(op);
+			if line + n > offset {
+				for (k, l) in op_lines(op, w).into_iter().enumerate() {
+					if line + k >= offset && out.len() < rows {
+						out.push(l);
+					}
+				}
+			}
+			line += n;
+			if out.len() >= rows {
+				break;
+			}
+		}
+		out
+	};
 
 	let buttons = if !issues.is_empty() {
 		"[ Esc: Close ]".to_owned()
@@ -310,8 +334,8 @@ fn draw_confirm(
 		match risk.level {
 			Level::Low => "[ Enter: Proceed ]   [ Esc: Cancel ]".to_owned(),
 			Level::Medium => "[ Y: Proceed ]   [ Esc: Cancel ]".to_owned(),
-			Level::High if at_end => "[ Y: Proceed ]   [ Esc: Cancel ]".to_owned(),
-			Level::High => "↓ PgDn: read the whole list to proceed   [ Esc: Cancel ]".to_owned(),
+			_ if at_end => "[ Y: Proceed ]   [ Esc: Cancel ]".to_owned(),
+			_ => "↓ PgDn: read the whole list to proceed   [ Esc: Cancel ]".to_owned(),
 		}
 	};
 	if issues.is_empty() {
@@ -330,14 +354,10 @@ fn draw_confirm(
 
 	let mut lines = head;
 	if fits {
-		lines.extend(ops.iter().skip(offset).take(rows).map(|l| Line::raw(l.clone())));
-		let shown = rows.min(ops.len());
-		for _ in shown..rows.min(ops.len().max(shown)) {
-			lines.push(Line::raw(""));
-		}
-		if ops.len() > rows {
+		lines.extend(window.into_iter().map(Line::raw));
+		if total_lines > rows {
 			lines.push(Line::styled(
-				format!("lines {}–{} of {} (↑↓ PgUp PgDn)", offset + 1, (offset + rows).min(ops.len()), ops.len()),
+				format!("lines {}–{} of {} (↑↓ PgUp PgDn)", offset + 1, (offset + rows).min(total_lines), total_lines),
 				DIALOG.add_modifier(Modifier::DIM),
 			));
 		} else {

@@ -36,6 +36,7 @@ pub enum Kind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum Diff {
 	OnlyLeft,
 	OnlyRight,
@@ -253,6 +254,7 @@ fn list(dir: &Path, budget: &mut usize) -> io::Result<(BTreeMap<std::ffi::OsStri
 /// preview of it (the commander's sync dialog shows these before the plan is built).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub enum Action {
 	CopyToRight,
 	CopyToLeft,

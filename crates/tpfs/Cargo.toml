@@ -9,7 +9,7 @@ repository.workspace   = true
 
 [dependencies]
 lexopt      = { workspace = true }
-tpfs-core = { workspace = true }
+tpfs-core = { workspace = true, features = ["schema"] }
 tpfs-mcp  = { workspace = true }
 tpfs-tui  = { workspace = true }
 serde_json  = { workspace = true }

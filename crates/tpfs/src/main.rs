@@ -325,7 +325,9 @@ fn run(args: Args) -> Res {
 					BatchStatus::Aborted => "rolled back",
 					BatchStatus::Undone => "undone",
 					BatchStatus::Incomplete => "INCOMPLETE (run `tpfs recover`)",
+					_ => "unknown",
 				};
+				let status = if b.damaged { "DAMAGED (see the journal)" } else { status };
 				println!(
 					"{}  {:<6} {:<10} {} step(s)  {}",
 					tpfs_core::sanitize(b.id.as_ref()),

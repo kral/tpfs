@@ -8,7 +8,7 @@ license.workspace      = true
 repository.workspace   = true
 
 [dependencies]
-tpfs-core = { workspace = true }
+tpfs-core = { workspace = true, features = ["schema"] }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 
