@@ -211,17 +211,16 @@ fn parse_args() -> Result<Args, Fail> {
 				println!("tpfs {}", env!("CARGO_PKG_VERSION"));
 				std::process::exit(0);
 			}
-			Long("root") => args.roots.push(parser.value().map_err(|e| e.to_string())?.into()),
+			Long("root") => args.roots.push(parser.value().map_err(e)?.into()),
 			Long("approve") => {
-				args.approve = Some(parser.value().map_err(|e| e.to_string())?.string().map_err(|e| e.to_string())?)
+				args.approve = Some(parser.value().map_err(e)?.string().map_err(|e| usage(e.to_string()))?)
 			}
 			Long("approval") => {
-				args.approval =
-					match parser.value().map_err(|e| e.to_string())?.string().map_err(|e| e.to_string())?.as_str() {
-						"terminal" => tpfs_mcp::Approval::Terminal,
-						"client" => tpfs_mcp::Approval::Client,
-						other => return Err(usage(format!("unknown approval mode '{other}' (terminal|client)"))),
-					}
+				args.approval = match parser.value().map_err(e)?.string().map_err(|e| usage(e.to_string()))?.as_str() {
+					"terminal" => tpfs_mcp::Approval::Terminal,
+					"client" => tpfs_mcp::Approval::Client,
+					other => return Err(usage(format!("unknown approval mode '{other}' (terminal|client)"))),
+				}
 			}
 			Long("abandon") => {
 				args.abandon = Some(parser.value().map_err(e)?.string().map_err(|e| usage(e.to_string()))?)
@@ -232,19 +231,18 @@ fn parse_args() -> Result<Args, Fail> {
 			Long("apply") => args.do_apply = true,
 			Long("json") => args.json = true,
 			Long("max-ops") => {
-				let v = parser.value().map_err(|e| e.to_string())?.string().map_err(|e| e.to_string())?;
+				let v = parser.value().map_err(e)?.string().map_err(|e| usage(e.to_string()))?;
 				args.max_ops = Some(v.parse().map_err(|_| usage(format!("--max-ops needs a number, got '{v}'")))?);
 			}
-			Long("home") => args.home = Some(parser.value().map_err(|e| e.to_string())?.into()),
+			Long("home") => args.home = Some(parser.value().map_err(e)?.into()),
 			Long("source") => {
-				args.source =
-					match parser.value().map_err(|e| e.to_string())?.string().map_err(|e| e.to_string())?.as_str() {
-						"human" => Source::Human,
-						"agent" => Source::Agent,
-						other => return Err(usage(format!("unknown source '{other}' (human|agent)"))),
-					}
+				args.source = match parser.value().map_err(e)?.string().map_err(|e| usage(e.to_string()))?.as_str() {
+					"human" => Source::Human,
+					"agent" => Source::Agent,
+					other => return Err(usage(format!("unknown source '{other}' (human|agent)"))),
+				}
 			}
-			Value(v) if args.command.is_empty() => args.command = v.string().map_err(|e| e.to_string())?,
+			Value(v) if args.command.is_empty() => args.command = v.string().map_err(|e| usage(e.to_string()))?,
 			Value(v) if args.plan.is_none() => args.plan = Some(v),
 			Value(v) if args.extra.is_none() => args.extra = Some(v),
 			other => return Err(usage(other.unexpected().to_string())),
@@ -678,14 +676,21 @@ fn plan_id(args: &Args) -> Result<String, Fail> {
 }
 
 fn read_plan(source: &std::ffi::OsStr) -> Result<Plan, String> {
-	let text = if source == "-" {
-		let mut s = String::new();
-		io::stdin().read_to_string(&mut s).map_err(|e| e.to_string())?;
-		s
+	// A plan holds at most MAX_OPS steps of bounded size; anything far larger is not a plan.
+	const MAX_PLAN_BYTES: u64 = 64 << 20;
+	let name = tpfs_core::sanitize(source);
+	let input: Box<dyn Read> = if source == "-" {
+		Box::new(io::stdin())
 	} else {
-		fs::read_to_string(source).map_err(|e| format!("{}: {e}", Path::new(source).display()))?
+		Box::new(fs::File::open(source).map_err(|e| format!("{name}: {e}"))?)
 	};
-	serde_json::from_str(&text).map_err(|e| format!("not a valid plan: {e}"))
+	let mut text = String::new();
+	input.take(MAX_PLAN_BYTES + 1).read_to_string(&mut text).map_err(|e| format!("{name}: {e}"))?;
+	if text.len() as u64 > MAX_PLAN_BYTES {
+		return Err(format!("{name}: larger than {} MiB; not a plan", MAX_PLAN_BYTES >> 20));
+	}
+	serde_json::from_str(&text)
+		.map_err(|e| format!("not a valid plan: {}", tpfs_core::sanitize(e.to_string().as_ref())))
 }
 
 fn state_dir(args: &Args) -> Result<PathBuf, String> {

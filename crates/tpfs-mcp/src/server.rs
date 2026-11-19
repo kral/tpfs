@@ -16,6 +16,8 @@ const SUPPORTED_VERSIONS: [&str; 3] = [PROTOCOL_VERSION, "2025-03-26", "2024-11-
 
 /// Longest plan reason accepted from an agent: stricter than the core limit, as the reason is
 /// shown to the human approving it and should stay readable.
+/// Preview lines returned for a valid plan; the rest is counted in `stepCount`.
+const PREVIEW_LINES: usize = 200;
 const AGENT_MAX_REASON: usize = 2_000;
 
 /// Longest JSON-RPC message accepted on stdin.
@@ -158,7 +160,11 @@ impl Server {
 
 	fn call_tool(&mut self, params: &Value) -> Result<Value, (i64, String)> {
 		let name = params.get("name").and_then(Value::as_str).ok_or((-32602, "missing tool name".to_owned()))?;
-		let args = params.get("arguments").cloned().unwrap_or(json!({}));
+		// A missing or null `arguments` means "no arguments" (some clients send null).
+		let args = match params.get("arguments") {
+			None | Some(Value::Null) => json!({}),
+			Some(a) => a.clone(),
+		};
 		let allowed: &[&str] = match name {
 			"list_directory" => &["path", "limit"],
 			"propose_plan" => &["plan"],
@@ -215,16 +221,18 @@ impl Server {
 		const SCAN: usize = 100_000;
 		let mut total = 0usize;
 		let mut entries: Vec<(bool, String, u64)> = Vec::new();
-		for e in fs::read_dir(&dir).map_err(|e| format!("{}: {e}", show(&dir)))?.filter_map(Result::ok) {
+		// Listed relative to the folder's own confined handle: a folder swapped for a link after the
+		// check above is refused instead of followed out of the allowed folders.
+		let listing =
+			tpfs_core::list_confined(self.validator.roots(), &dir).map_err(|e| format!("{}: {e}", show(&dir)))?;
+		for e in listing {
 			// tpfs's own working entries (local trash, partial copies) are not the agent's business.
-			if e.file_name().to_str().is_some_and(|n| n.starts_with(".tpfs-")) {
+			if tpfs_core::is_own_name(&e.name) {
 				continue;
 			}
 			total += 1;
 			if entries.len() < SCAN {
-				let meta = fs::symlink_metadata(e.path()).ok();
-				let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
-				entries.push((is_dir, sanitize(&e.file_name()), meta.map_or(0, |m| m.len())));
+				entries.push((e.dir, sanitize(&e.name), e.size));
 			}
 		}
 		entries.sort_by_cached_key(|e| (!e.0, e.1.to_lowercase()));
@@ -245,7 +253,7 @@ impl Server {
 
 	fn propose_plan(&mut self, args: &Value) -> Result<Value, String> {
 		let plan: Plan = serde_json::from_value(args.get("plan").cloned().ok_or("'plan' is required")?)
-			.map_err(|e| format!("not a valid plan: {e}"))?;
+			.map_err(|e| format!("not a valid plan: {}", sanitize(e.to_string().as_ref())))?;
 		if plan.reason.chars().count() > AGENT_MAX_REASON {
 			return Err(format!("the reason is too long (limit {AGENT_MAX_REASON} characters)"));
 		}
@@ -284,7 +292,9 @@ impl Server {
 			"digest": pending.digest,
 			"risk": format!("{:?}", risk.level),
 			"riskReasons": risk.reasons,
-			"preview": preview,
+			"previewTruncated": preview.len() > PREVIEW_LINES,
+			"preview": preview.iter().take(PREVIEW_LINES).collect::<Vec<_>>(),
+			"stepCount": plan.ops.len(),
 			"next": next,
 		}))
 	}
@@ -379,6 +389,14 @@ fn tools() -> Value {
 		"required": ["plan"],
 		"additionalProperties": false,
 	});
+	if let Some(p) = propose_schema["properties"]["plan"]["properties"].as_object_mut() {
+		if let Some(r) = p.get_mut("reason") {
+			r["maxLength"] = json!(AGENT_MAX_REASON);
+		}
+		if let Some(o) = p.get_mut("ops") {
+			o["maxItems"] = json!(tpfs_core::MAX_OPS);
+		}
+	}
 	if let Some(defs) = defs {
 		propose_schema["$defs"] = defs; // references like #/$defs/Op resolve against the root
 	}
@@ -386,7 +404,7 @@ fn tools() -> Value {
 	json!([
 		{
 			"name": "list_directory",
-			"description": "List a directory inside the allowed folders (names, types, sizes).",
+			"description": "List a directory inside the allowed folders (names, types, sizes). Use it to find the exact absolute paths before proposing a plan.",
 			"inputSchema": {
 				"type": "object",
 				"properties": {
@@ -400,7 +418,7 @@ fn tools() -> Value {
 		},
 		{
 			"name": "propose_plan",
-			"description": "Validate a plan of file operations WITHOUT executing it. Returns a preview, the risk, and a planId. Paths are absolute; for move/copy 'to' is the full destination path. There is no permanent delete: use 'trash'.",
+			"description": "Validate a plan of file operations WITHOUT executing it. Returns a preview, the risk, and a planId. Paths are absolute; for move/copy 'to' is the full destination path. There is no permanent delete: use 'trash'. Nothing changes until a human approves the plan; then call apply_plan with the planId.",
 			"inputSchema": propose_schema,
 			"annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
 		},
@@ -423,7 +441,7 @@ fn tools() -> Value {
 		},
 		{
 			"name": "history",
-			"description": "Your recent batches (agent batches only): id, time (Unix seconds), status (committed, rolled back, undone, interrupted = ask the user to run `tpfs recover`, damaged = its journal records are unreadable; ask the user to check `tpfs log`), number of steps, reason.",
+			"description": "Your recent batches (agent batches only): id, time (Unix seconds), status (committed, rolled back, undone, interrupted = ask the user to run `tpfs recover`, damaged = its journal records are unreadable; ask the user to check `tpfs log`, abandoned = the user gave up recovering it), number of steps, reason.",
 			"inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
 			"annotations": { "readOnlyHint": true, "openWorldHint": false }
 		}

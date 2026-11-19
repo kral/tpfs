@@ -325,34 +325,34 @@ fn the_number_of_waiting_plans_is_limited() {
 	assert!(err && v["error"].as_str().unwrap().contains("too many plans"), "{v}");
 }
 
-/// The real binary over stdio: only protocol on stdout, a clean exit at the end of input.
 #[test]
-fn the_tpfs_mcp_binary_speaks_only_json_rpc_on_stdout() {
-	let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/tpfs");
-	if !bin.exists() {
-		return; // built by the workspace test run; skipped when testing this crate alone
-	}
-	let f = Fixture::new(Approval::Terminal);
-	let mut child = std::process::Command::new(bin)
-		.args(["mcp", "--root", f.root.to_str().unwrap()])
-		.env("TPFS_HOME", &f.state)
-		.stdin(std::process::Stdio::piped())
-		.stdout(std::process::Stdio::piped())
-		.stderr(std::process::Stdio::piped())
-		.spawn()
-		.unwrap();
-	use std::io::Write;
-	let mut stdin = child.stdin.take().unwrap();
-	stdin
-		.write_all(
-			b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}",
-		)
-		.unwrap();
-	drop(stdin);
-	let out = child.wait_with_output().unwrap();
-	assert!(out.status.success());
-	let lines: Vec<Value> =
-		String::from_utf8(out.stdout).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-	assert_eq!(lines.len(), 2, "the last line without a newline is answered too");
-	assert!(String::from_utf8_lossy(&out.stderr).contains("serving on stdio"));
+fn null_arguments_mean_no_arguments_and_limits_are_in_the_schema() {
+	let mut f = Fixture::new(Approval::Terminal);
+	let (v, err) = f.tool("history", Value::Null);
+	assert!(!err, "{v}");
+	let tools = f.rpc("tools/list", json!({}));
+	let propose = tools["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "propose_plan").unwrap();
+	let plan = &propose["inputSchema"]["properties"]["plan"]["properties"];
+	assert_eq!(plan["reason"]["maxLength"], 2000, "{plan}");
+	assert_eq!(plan["ops"]["maxItems"], tpfs_core::MAX_OPS, "{plan}");
+}
+
+#[test]
+fn listing_hides_only_tpfs_work_entries() {
+	let mut f = Fixture::new(Approval::Terminal);
+	fs::write(f.root.join(".tpfs-notes.txt"), "mine").unwrap();
+	fs::write(f.root.join(".tpfs-part-0123abcd-0"), "work").unwrap();
+	let (v, err) = f.tool("list_directory", json!({ "path": f.root }));
+	assert!(!err, "{v}");
+	let names: Vec<&str> = v["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
+	assert_eq!(names, [".tpfs-notes.txt"], "{v}");
+}
+
+#[test]
+fn parse_errors_carry_no_terminal_controls() {
+	let mut f = Fixture::new(Approval::Terminal);
+	let (v, err) = f.tool("propose_plan", json!({ "plan": { "ops": [{ "op": "\u{1b}]52;c;x\u{7}\u{202e}" }] } }));
+	assert!(err, "{v}");
+	let text = v["error"].as_str().unwrap();
+	assert!(!text.chars().any(|c| c.is_control() || c == '\u{202e}'), "{text:?}");
 }

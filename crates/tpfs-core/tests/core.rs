@@ -1371,3 +1371,107 @@ fn an_old_unrecoverable_batch_can_be_abandoned_and_does_not_block_new_work() {
 	assert!(report.errors.is_empty(), "{report:?}");
 	assert!(Executor::new(&s.validator(), &mut j, s.trash()).abandon("new").is_err());
 }
+
+/// A step whose own call fails changed nothing: what another program did meanwhile is left exactly
+/// as it is, even when it looks like the step's result.
+#[test]
+fn a_failed_step_never_reverts_what_someone_else_did() {
+	// move a -> b: another program removes a and writes its own b right before the rename.
+	let s = Sandbox::new();
+	let a = s.file("a.txt", "A");
+	let b = s.root.join("b.txt");
+	let (ra, rb) = (a.clone(), b.clone());
+	let v = s.validator();
+	let mut j = s.journal();
+	let err = Executor::new(&v, &mut j, s.trash())
+		.before_apply(move |_| {
+			fs::remove_file(&ra).unwrap();
+			fs::write(&rb, "OTHER PROGRAM").unwrap();
+		})
+		.execute(&Plan::new(vec![Op::Move { from: a.clone(), to: b.clone() }], ""), Source::Human)
+		.unwrap_err();
+	assert!(matches!(err, ExecError::Failed { step: 0, .. }), "{err}");
+	assert_eq!(fs::read_to_string(&b).unwrap(), "OTHER PROGRAM");
+	assert!(!a.exists(), "the other program's file was moved back to the old name");
+	assert_eq!(j.batches().unwrap()[0].status, BatchStatus::Aborted);
+	drop(j);
+
+	// mkdir x: another program creates x first.
+	let x = s.root.join("x");
+	let rx = x.clone();
+	let mut j = s.journal();
+	let err = Executor::new(&v, &mut j, s.trash())
+		.before_apply(move |_| {
+			fs::create_dir(&rx).unwrap();
+			fs::write(rx.join("theirs"), "T").unwrap();
+		})
+		.execute(&Plan::new(vec![Op::Mkdir { path: x.clone() }], ""), Source::Human)
+		.unwrap_err();
+	assert!(matches!(err, ExecError::Failed { step: 0, .. }), "{err}");
+	assert_eq!(fs::read_to_string(x.join("theirs")).unwrap(), "T");
+	// Recovering afterwards does not judge the failed step from the disk either.
+	let report = Executor::new(&v, &mut j, s.trash()).recover().unwrap();
+	assert!(report.errors.is_empty() && report.rolled_back.is_empty(), "{report:?}");
+	assert!(x.join("theirs").exists());
+}
+
+/// A move that crashed after its rename, with the old name taken again before recovery: the disk
+/// cannot tell what happened, so recovery reports it and keeps the batch incomplete.
+#[test]
+fn recovery_does_not_claim_a_rollback_when_both_names_exist() {
+	let s = Sandbox::new();
+	let a = s.file("a.txt", "A");
+	let b = s.root.join("b.txt");
+	let mut j = s.journal();
+	let batch = "1-crash".to_owned();
+	j.append(&Entry::Begin {
+		batch: batch.clone(),
+		at: 0,
+		source: "human".into(),
+		reason: String::new(),
+		digest: String::new(),
+		v: 1,
+	})
+	.unwrap();
+	j.append(&Entry::Intent {
+		batch: batch.clone(),
+		index: 0,
+		forward: Op::Move { from: a.clone(), to: b.clone() },
+		inverse: Op::Move { from: b.clone(), to: a.clone() },
+	})
+	.unwrap();
+	fs::rename(&a, &b).unwrap();
+	fs::write(&a, "NEW A").unwrap(); // the user saves a new a.txt before recovering
+
+	let v = s.validator();
+	let report = Executor::new(&v, &mut j, s.trash()).recover().unwrap();
+	assert!(report.rolled_back.is_empty(), "{report:?}");
+	assert_eq!(report.errors.len(), 1, "{report:?}");
+	assert_eq!(j.batches().unwrap()[0].status, BatchStatus::Incomplete);
+	assert_eq!(fs::read_to_string(&a).unwrap(), "NEW A");
+	assert_eq!(fs::read_to_string(&b).unwrap(), "A");
+	// The user decides: abandon keeps both and unblocks new work.
+	Executor::new(&v, &mut j, s.trash()).abandon(&batch).unwrap();
+	run_ok(&s, &mut j, vec![Op::Mkdir { path: s.root.join("later") }]);
+}
+
+fn run_ok(s: &Sandbox, j: &mut Journal, ops: Vec<Op>) {
+	Executor::new(&s.validator(), j, s.trash()).execute(&Plan::new(ops, ""), Source::Human).unwrap();
+}
+
+/// Case-only renames in a big folder are validated without reading the folder once per rename.
+#[test]
+fn case_only_renames_in_a_big_folder_validate_quickly() {
+	let s = Sandbox::new();
+	let d = s.dir("big");
+	for i in 0..20_000 {
+		fs::write(d.join(format!("IMG_{i}.JPG")), "").unwrap();
+	}
+	let ops: Vec<Op> = (0..2_000)
+		.map(|i| Op::Rename { path: d.join(format!("IMG_{i}.JPG")), new_name: format!("img_{i}.jpg") })
+		.collect();
+	let started = std::time::Instant::now();
+	let issues = s.validator().validate(&Plan::new(ops, ""));
+	assert!(issues.is_empty(), "{:?}", issues.first());
+	assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
+}

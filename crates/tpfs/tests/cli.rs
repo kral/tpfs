@@ -174,3 +174,61 @@ fn two_way_sync_by_digest_is_idempotent_and_undoable() {
 	assert!(l.join("only-l.txt").exists() && !l.join("only-r.txt").exists());
 	assert!(r.join("only-r.txt").exists() && !r.join("only-l.txt").exists());
 }
+
+/// `tpfs mcp` over stdio: only protocol on stdout, a clean exit at the end of input.
+#[test]
+fn mcp_speaks_only_json_rpc_on_stdout() {
+	use std::io::Write;
+	let tmp = tempfile::TempDir::new().unwrap();
+	let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+	let (root, home) = (base.join("root"), base.join("home"));
+	fs::create_dir(&root).unwrap();
+	let mut child = Command::new(env!("CARGO_BIN_EXE_tpfs"))
+		.args(["mcp", "--root", root.to_str().unwrap()])
+		.env("TPFS_HOME", &home)
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.unwrap();
+	let mut stdin = child.stdin.take().unwrap();
+	stdin
+		.write_all(
+			b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}",
+		)
+		.unwrap();
+	drop(stdin);
+	let out = child.wait_with_output().unwrap();
+	assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+	let stdout = String::from_utf8(out.stdout).unwrap();
+	let lines: Vec<&str> = stdout.lines().collect();
+	assert_eq!(lines.len(), 2, "the last line without a newline is answered too: {stdout}");
+	for (i, l) in lines.iter().enumerate() {
+		assert!(
+			l.starts_with('{') && l.contains("\"jsonrpc\":\"2.0\"") && l.contains(&format!("\"id\":{}", i + 1)),
+			"{l}"
+		);
+	}
+	assert!(String::from_utf8_lossy(&out.stderr).contains("serving on stdio"));
+}
+
+#[test]
+fn hostile_plan_files_print_no_terminal_controls() {
+	let tmp = tempfile::TempDir::new().unwrap();
+	let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+	let plan = base.join("evil.json");
+	fs::write(&plan, "{\"ops\":[{\"op\":\"\\u001b]52;c;eA==\\u0007\\u202eOK\"}]}").unwrap();
+	let o = tpfs(&base.join("home"), &["check", plan.to_str().unwrap(), "--root", base.to_str().unwrap()]);
+	assert_eq!(code(&o), 1, "{}", String::from_utf8_lossy(&o.stderr));
+	let err = String::from_utf8(o.stderr).unwrap();
+	assert!(!err.trim_end().chars().any(|c| c.is_control() || c == '\u{202e}'), "{err:?}");
+}
+
+#[test]
+fn a_missing_option_value_is_a_usage_error() {
+	let tmp = tempfile::TempDir::new().unwrap();
+	let home = tmp.path().join("home");
+	for flag in ["--root", "--approve", "--home", "--source", "--approval", "--max-ops"] {
+		assert_eq!(code(&tpfs(&home, &["apply", "p.json", flag])), 2, "{flag}");
+	}
+}

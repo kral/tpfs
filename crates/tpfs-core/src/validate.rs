@@ -56,7 +56,7 @@ const OWN_PREFIXES: [&str; 3] = [".tpfs-trash-", ".tpfs-part-", ".tpfs-case-"];
 /// Whether a path name is one of tpfs's own work names: `.tpfs-trash-<uid>`, or a partial copy or
 /// case-rename name (`.tpfs-part-<batch>-…`, `.tpfs-case-<batch>-…`). A user's `.tpfs-notes.txt`
 /// is not one.
-pub(crate) fn is_own_name(name: &std::ffi::OsStr) -> bool {
+pub fn is_own_name(name: &std::ffi::OsStr) -> bool {
 	let Some(n) = name.to_str() else { return false };
 	if let Some(uid) = n.strip_prefix(OWN_PREFIXES[0]) {
 		return !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit());
@@ -201,8 +201,10 @@ impl Validator {
 					})
 				};
 				let old_name = source.file_name().map(|n| n.to_string_lossy().to_lowercase());
-				let case_only = target != source && old_name == Some(new_name.to_lowercase()) && !own_entry();
-				let fold = case_only && same_file(&source, &target) && !sim.state.contains_key(&sim_key(&target));
+				let case_only = target != source && old_name == Some(new_name.to_lowercase());
+				// Cheap checks first; the folder is read only for an entry with several names.
+				let alias = case_only && same_file(&source, &target) && !sim.state.contains_key(&sim_key(&target));
+				let fold = alias && (crate::fsops::link_count(&source) == Some(1) || !own_entry());
 				if fold {
 					// Only the letter case differs, on a case-insensitive file system (a hard link
 					// under another name is a different entry, and goes the normal way).

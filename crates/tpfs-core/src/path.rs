@@ -119,12 +119,21 @@ pub fn private_dir(dir: &Path) -> io::Result<()> {
 	}
 	#[cfg(not(unix))]
 	{
-		// Windows: the folder inherits the ACL of the user's profile; refuse a reparse point.
+		// Windows: only a folder inside the user's own profile is private by default (the profile's ACL
+		// grants nobody else access, and it is inherited); a folder elsewhere, such as `D:\tpfs` or
+		// `C:\tpfs`, inherits "Authenticated Users: Modify" from the drive root, and could have been
+		// created by another user. Such folders, and links, are refused.
 		fs::create_dir_all(dir)?;
-		if fs::symlink_metadata(dir)?.file_type().is_symlink() {
+		let real = canonicalize(dir)?;
+		let profile = std::env::var_os("USERPROFILE").and_then(|p| canonicalize(Path::new(&p)).ok());
+		let inside = profile.is_some_and(|p| real.starts_with(&p) && real != p);
+		if fs::symlink_metadata(dir)?.file_type().is_symlink() || !inside {
 			return Err(io::Error::new(
 				io::ErrorKind::PermissionDenied,
-				format!("refusing to use {}: it is a link", dir.display()),
+				format!(
+					"refusing to use {}: the state folder must be a real folder inside your user profile (%USERPROFILE%), where only you can write",
+					dir.display()
+				),
 			));
 		}
 		Ok(())

@@ -60,6 +60,12 @@ pub enum Entry {
 		batch: String,
 		index: usize,
 	},
+	/// A step whose own call failed: it changed nothing beyond tpfs's own marks, which were cleaned
+	/// up. Rollback and recovery leave it alone instead of judging it from the disk.
+	Failed {
+		batch: String,
+		index: usize,
+	},
 	Commit {
 		batch: String,
 	},
@@ -88,6 +94,7 @@ impl Entry {
 			| Entry::Published { batch, .. }
 			| Entry::Check { batch, .. }
 			| Entry::UndoPublished { batch, .. }
+			| Entry::Failed { batch, .. }
 			| Entry::Commit { batch }
 			| Entry::Abort { batch }
 			| Entry::Abandon { batch }
@@ -140,6 +147,8 @@ pub struct Step {
 	pub mode: Option<u32>,
 	/// See [`Entry::UndoPublished`].
 	pub undo_published: bool,
+	/// See [`Entry::Failed`].
+	pub failed: bool,
 	pub undone: bool,
 }
 
@@ -365,6 +374,7 @@ impl Journal {
 						check: None,
 						mode: None,
 						undo_published: false,
+						failed: false,
 						undone: false,
 					});
 				}
@@ -393,6 +403,11 @@ impl Journal {
 				Entry::UndoStep { index, .. } => {
 					if let Some(s) = step_mut(&mut b.steps, index) {
 						s.undone = true;
+					}
+				}
+				Entry::Failed { index, .. } => {
+					if let Some(s) = step_mut(&mut b.steps, index) {
+						s.failed = true;
 					}
 				}
 				Entry::Commit { .. } => b.status = BatchStatus::Committed,

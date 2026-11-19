@@ -412,7 +412,7 @@ fn a_link_swapped_in_before_a_step_is_not_followed() {
 	assert!(!outside.join("f.txt").exists());
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn link_dir(target: &Path, link: &Path) {
 	std::os::unix::fs::symlink(target, link).unwrap();
 }
@@ -441,4 +441,51 @@ fn copying_a_junction_is_refused_up_front() {
 	link_dir(&target, &j);
 	let issues = s.validator().validate(&Plan::new(vec![Op::Copy { from: j, to: s.root.join("copy") }], ""));
 	assert!(issues.len() == 1 && issues[0].message.contains("not supported on Windows"), "{issues:?}");
+}
+
+/// Every kind of operation, on every platform: a folder on the way swapped for a link (a symlink, or
+/// a junction on Windows) after the step's re-check makes the step fail, and nothing outside the
+/// root is touched — neither pulled in (source side) nor written to (target side).
+#[test]
+fn a_link_swapped_in_redirects_no_kind_of_operation() {
+	type Case = fn(&Path, &Path) -> Op; // (root, sub) -> op through sub
+	let cases: [(&str, Case); 7] = [
+		("move out of", |r, sub| Op::Move { from: sub.join("f.txt"), to: r.join("grabbed.txt") }),
+		("move into", |r, sub| Op::Move { from: r.join("g.txt"), to: sub.join("g.txt") }),
+		("copy out of", |r, sub| Op::Copy { from: sub.join("f.txt"), to: r.join("grabbed.txt") }),
+		("rename in", |_, sub| Op::Rename { path: sub.join("f.txt"), new_name: "h.txt".into() }),
+		("trash in", |_, sub| Op::Trash { path: sub.join("f.txt") }),
+		("mkdir in", |_, sub| Op::Mkdir { path: sub.join("new") }),
+		("rmdir in", |_, sub| Op::Rmdir { path: sub.join("empty") }),
+	];
+	for (what, case) in cases {
+		let s = Sandbox::new();
+		let sub = s.root.join("sub");
+		fs::create_dir(&sub).unwrap();
+		fs::write(sub.join("f.txt"), "mine").unwrap();
+		fs::create_dir(sub.join("empty")).unwrap();
+		fs::write(s.root.join("g.txt"), "G").unwrap();
+		let outside = s.base.join("outside");
+		fs::create_dir(&outside).unwrap();
+		fs::write(outside.join("f.txt"), "secret").unwrap();
+		fs::create_dir(outside.join("empty")).unwrap();
+		let plan = Plan::new(vec![case(&s.root, &sub)], "");
+		let (sub2, out2) = (sub.clone(), outside.clone());
+		let v = s.validator();
+		let mut j = s.journal();
+		let result = Executor::new(&v, &mut j, s.state.join("trash"))
+			.before_apply(move |_| {
+				fs::rename(&sub2, sub2.with_file_name("sub-real")).unwrap();
+				link_dir(&out2, &sub2);
+			})
+			.execute(&plan, Source::Human);
+		assert!(result.is_err(), "{what}: went through the link");
+		let mut outside_now: Vec<String> =
+			fs::read_dir(&outside).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+		outside_now.sort();
+		assert_eq!(outside_now, ["empty", "f.txt"], "{what}: the outside folder changed");
+		assert_eq!(fs::read_to_string(outside.join("f.txt")).unwrap(), "secret", "{what}");
+		assert!(!s.root.join("grabbed.txt").exists(), "{what}: an outside file was pulled in");
+		assert_eq!(fs::read_to_string(s.root.join("g.txt")).unwrap(), "G", "{what}");
+	}
 }

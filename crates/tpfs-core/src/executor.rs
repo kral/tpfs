@@ -195,8 +195,7 @@ impl<'a> Executor<'a> {
 			let inverse = self.inverse(op, &batch, i);
 
 			if let Some(issue) = recheck.into_iter().next() {
-				let rollback_errors = self.revert(&fs, &applied, &batch);
-				self.journal.write(&Entry::Abort { batch })?;
+				let rollback_errors = self.roll_back(&batch)?;
 				return Err(ExecError::Failed { step: i, error: issue.message, rollback_errors });
 			}
 
@@ -247,13 +246,23 @@ impl<'a> Executor<'a> {
 					// Clean up what this step may have left, judged from the disk and from whether its
 					// copy was published. A target that is not provably ours is left alone.
 					let mut rollback_errors = Vec::new();
-					for fix in cleanup(op, &inverse, &tag(&batch, i), published.get()) {
-						if let Err(e) = apply_fix(&fix, &fs, &self.trash, &format!("{batch}-rollback"), i) {
+					// The step's own call failed, so it did nothing that the disk alone could prove: only
+					// tpfs's own marks (a partial copy, a published copy, a case-rename's temporary
+					// name) are cleaned up — never an entry that merely looks like this step's result.
+					let ours = |f: &Fix| match f {
+						Fix::Op(_) => published.get(),
+						Fix::Conflict { .. } => false,
+						_ => true,
+					};
+					for fix in cleanup(op, &inverse, &tag(&batch, i), published.get()).into_iter().filter(ours) {
+						if let Err(e) = apply_fix(&fix, &fs, &self.trash, &format!("{batch}-recover"), i) {
 							rollback_errors.push(clean(format!("{fix}: {e}")));
 						}
 					}
-					rollback_errors.extend(self.revert(&fs, &applied, &batch));
-					self.journal.write(&Entry::Abort { batch })?;
+					if rollback_errors.is_empty() {
+						self.journal.write(&Entry::Failed { batch: batch.clone(), index: i })?;
+					}
+					rollback_errors.extend(self.roll_back(&batch)?);
 					return Err(ExecError::Failed { step: i, error: clean(format!("{op}: {error}")), rollback_errors });
 				}
 			}
@@ -495,6 +504,9 @@ impl<'a> Executor<'a> {
 					}
 					continue;
 				}
+				if step.failed {
+					continue; // its own call failed and its marks were cleaned up
+				}
 				for fix in cleanup(&step.forward, &step.inverse, &tag(&batch.id, step.index), step.published) {
 					let result = match &fix {
 						Fix::Op(op) => {
@@ -519,17 +531,14 @@ impl<'a> Executor<'a> {
 		Ok(report)
 	}
 
-	fn revert(&self, fs: &Fs, inverses: &[Op], batch: &str) -> Vec<String> {
-		inverses
-			.iter()
-			.enumerate()
-			.rev()
-			.filter_map(|(i, inv)| {
-				apply(inv, fs, &self.trash, &format!("{batch}-rollback"), i, None, &mut || Ok(()))
-					.err()
-					.map(|e| clean(format!("{inv}: {e}")))
-			})
-			.collect()
+	/// Roll back the batch being executed after a step failed, exactly as `recover` would after a
+	/// crash at this point — journaled the same way, so a crash during the rollback itself is resumed
+	/// by the next `recover`. On errors the batch stays incomplete (the user runs `tpfs recover`).
+	fn roll_back(&mut self, batch: &str) -> Result<Vec<String>, ExecError> {
+		let Some(view) = self.journal.batches()?.into_iter().rev().find(|b| b.id == batch) else {
+			return Ok(vec![format!("batch {batch} is missing from the journal")]);
+		};
+		Ok(self.recover_batches(vec![view])?.errors)
 	}
 
 	/// The operation that undoes `op`. Computed *before* `op` runs, so it can be journaled first.
@@ -697,9 +706,24 @@ fn apply(
 		}
 		Op::Trash { path } => {
 			let path = n(path)?;
-			let slot = match planned {
-				Some(Op::Move { from, .. }) => from.clone(),
-				_ => trash_slot(trash, batch, index, &path),
+			let (slot, tag) = match planned {
+				Some(Op::Move { from, .. }) => (from.clone(), tag),
+				// Clean-up trashes (undo, recovery) are not journaled: one that was interrupted is
+				// resumed by taking a fresh slot when its own is taken (its partial copy is dropped
+				// first), so running it again always converges and never needs to replace anything.
+				_ => {
+					let mut k = 0usize;
+					loop {
+						let label = if k == 0 { batch.to_owned() } else { format!("{batch}-{k}") };
+						let slot = trash_slot(trash, &label, index, &path);
+						let t = self::tag(&label, index);
+						remove_part(fs, &part_path(&slot, &t))?;
+						if !exists(&slot) {
+							break (slot, t);
+						}
+						k += 1;
+					}
+				}
 			};
 			let parent = slot.parent().ok_or_else(|| io::Error::other("trash slot without a parent"))?;
 			fs::create_dir_all(parent)?;
@@ -740,6 +764,13 @@ enum Fix {
 		target: PathBuf,
 		source: PathBuf,
 	},
+	/// Both the step's source and its target exist and they are different files: either the step
+	/// never ran and someone created the target, or it ran and someone reused the source name. Which
+	/// one cannot be told from the disk, so nothing is touched and the batch stays incomplete.
+	Conflict {
+		target: PathBuf,
+		source: PathBuf,
+	},
 	/// A letter-case rename stopped between its two renames.
 	RestoreCase {
 		tmp: PathBuf,
@@ -758,6 +789,12 @@ impl fmt::Display for Fix {
 				crate::sanitize(source.as_os_str()),
 				crate::sanitize(target.as_os_str())
 			),
+			Fix::Conflict { target, source } => write!(
+				f,
+				"CHECK {} AND {} (both exist; tell which is which, then `tpfs recover --abandon <batch>`)",
+				crate::sanitize(source.as_os_str()),
+				crate::sanitize(target.as_os_str())
+			),
 			Fix::RestoreCase { tmp, path } => {
 				write!(f, "RENAME {} BACK TO {}", crate::sanitize(tmp.as_os_str()), crate::sanitize(path.as_os_str()))
 			}
@@ -773,6 +810,10 @@ fn apply_fix(fix: &Fix, fs: &Fs, trash: &Path, batch: &str, index: usize) -> io:
 			apply(&Op::Trash { path: rest.to_path_buf() }, fs, trash, batch, index, None, &mut || Ok(()))
 		}),
 		Fix::RestoreCase { tmp, path } => fs.rename_noreplace(tmp, path),
+		Fix::Conflict { .. } => Err(io::Error::new(
+			io::ErrorKind::AlreadyExists,
+			"cannot tell from the disk whether this step took effect; nothing was changed",
+		)),
 	}
 }
 
@@ -815,6 +856,8 @@ fn cleanup(forward: &Op, inverse: &Op, tag: &str, published: bool) -> Vec<Fix> {
 					fixes.push(Fix::Op(inverse.clone()));
 				} else if published {
 					fixes.push(Fix::MergeBack { target, source });
+				} else {
+					fixes.push(Fix::Conflict { target, source });
 				}
 			}
 		}
@@ -826,6 +869,8 @@ fn cleanup(forward: &Op, inverse: &Op, tag: &str, published: bool) -> Vec<Fix> {
 				fixes.push(Fix::RestoreCase { tmp, path: source });
 			} else if exists(&target) && (!exists(&source) || same_file(&target, &source)) {
 				fixes.push(Fix::Op(inverse.clone()));
+			} else if exists(&target) && target != source {
+				fixes.push(Fix::Conflict { target, source });
 			}
 		}
 		_ => {}
