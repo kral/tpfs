@@ -85,7 +85,7 @@ fn run_external(external: External) -> Result<String, String> {
 		}
 		External::Shell { command, cwd } => {
 			let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".into());
-			println!("{}> {command}", cwd.display());
+			println!("{}> {}", tpfs_core::sanitize(cwd.as_os_str()), tpfs_core::sanitize(command.as_ref()));
 			let status = Command::new(&shell)
 				.arg("-c")
 				.arg(&command)

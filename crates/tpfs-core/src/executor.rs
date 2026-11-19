@@ -206,12 +206,12 @@ impl<'a> Executor<'a> {
 					let mut rollback_errors = Vec::new();
 					for fix in cleanup(op, &inverse, &tag(&batch, i), published.get()) {
 						if let Err(e) = apply_fix(&fix, &fs, &self.trash, &format!("{batch}-rollback"), i) {
-							rollback_errors.push(format!("{fix}: {e}"));
+							rollback_errors.push(clean(format!("{fix}: {e}")));
 						}
 					}
 					rollback_errors.extend(self.revert(&fs, &applied, &batch));
 					self.journal.append(&Entry::Abort { batch })?;
-					return Err(ExecError::Failed { step: i, error: format!("{op}: {error}"), rollback_errors });
+					return Err(ExecError::Failed { step: i, error: clean(format!("{op}: {error}")), rollback_errors });
 				}
 			}
 		}
@@ -265,7 +265,7 @@ impl<'a> Executor<'a> {
 			// After a crash between an inverse and its record, the inverse is already applied.
 			if !already_applied(&step.inverse) {
 				apply(&step.inverse, &fs, &self.trash, &format!("{}-undo", batch.id), step.index, None, &mut || Ok(()))
-					.map_err(|e| fail(format!("{}: {e}", step.inverse)))?;
+					.map_err(|e| fail(clean(format!("{}: {e}", step.inverse))))?;
 			}
 			self.journal.append(&Entry::UndoStep { batch: batch.id.clone(), index: step.index })?;
 			reverted += 1;
@@ -331,7 +331,7 @@ impl<'a> Executor<'a> {
 					}
 					.and_then(|()| apply_fix(&fix, &fs, &self.trash, &format!("{}-recover", batch.id), step.index));
 					if let Err(e) = result {
-						errors.push(format!("{fix}: {e}"));
+						errors.push(clean(format!("{fix}: {e}")));
 					}
 				}
 			}
@@ -354,7 +354,7 @@ impl<'a> Executor<'a> {
 			.filter_map(|(i, inv)| {
 				apply(inv, fs, &self.trash, &format!("{batch}-rollback"), i, None, &mut || Ok(()))
 					.err()
-					.map(|e| format!("{inv}: {e}"))
+					.map(|e| clean(format!("{inv}: {e}")))
 			})
 			.collect()
 	}
@@ -375,6 +375,11 @@ impl<'a> Executor<'a> {
 			Op::Rmdir { path } => Op::Mkdir { path: n(path) },
 		}
 	}
+}
+
+/// Error text for people and agents: io errors embed raw paths, which may carry terminal escapes.
+fn clean(text: String) -> String {
+	crate::sanitize(std::ffi::OsStr::new(&text))
 }
 
 /// Whether `op` (an inverse) has already taken effect, so replaying it after a crash is skipped.
@@ -537,11 +542,8 @@ impl fmt::Display for Fix {
 fn apply_fix(fix: &Fix, fs: &Fs, trash: &Path, batch: &str, index: usize) -> io::Result<()> {
 	match fix {
 		Fix::Op(op) => apply(op, fs, trash, batch, index, None, &mut || Ok(())),
-		Fix::RemovePart(part) => {
-			remove_part(part);
-			Ok(())
-		}
-		Fix::MergeBack { target, source } => merge_back(target, source, &mut |rest| {
+		Fix::RemovePart(part) => remove_part(part),
+		Fix::MergeBack { target, source } => merge_back(fs, target, source, &tag(batch, index), &mut |rest| {
 			apply(&Op::Trash { path: rest.to_path_buf() }, fs, trash, batch, index, None, &mut || Ok(()))
 		}),
 		Fix::RestoreCase { tmp, path } => fs.rename_noreplace(tmp, path),

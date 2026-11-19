@@ -18,7 +18,9 @@ pub(crate) struct Fs {
 }
 
 impl Fs {
-	/// Plain path-based operations (undo and recovery replay inverses that may lead anywhere).
+	/// Plain path-based operations (no roots). Production code always confines; this is the
+	/// non-Linux implementation of `confined` and a test helper.
+	#[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
 	pub(crate) fn unconfined() -> Self {
 		Self {
 			#[cfg(target_os = "linux")]
@@ -104,6 +106,15 @@ impl Fs {
 		fs::read_dir(dir)?.map(|e| e.map(|e| e.file_name())).collect()
 	}
 
+	/// Permissions of a directory just created by a copy, set through a confined descriptor.
+	fn set_dir_mode(&self, dir: &Path, perms: std::fs::Permissions) -> io::Result<()> {
+		#[cfg(target_os = "linux")]
+		if let Some(result) = linux::set_dir_mode(&self.anchors, dir, perms.clone()) {
+			return result;
+		}
+		set_dir_mode(dir, perms)
+	}
+
 	fn symlink(&self, target: &Path, path: &Path) -> io::Result<()> {
 		#[cfg(target_os = "linux")]
 		if let Some(result) = linux::symlink(&self.anchors, target, path) {
@@ -177,7 +188,12 @@ impl Fs {
 		});
 		if let Err(e) = result {
 			// The partial copy is ours and the source is untouched: drop it.
-			remove_part(part);
+			if let Err(r) = remove_part(part) {
+				return Err(io::Error::new(
+					e.kind(),
+					format!("{e}; the partial copy {} could not be removed: {r}", part.display()),
+				));
+			}
 			return Err(e);
 		}
 		sync_parent(to);
@@ -209,7 +225,7 @@ impl Fs {
 			for name in self.list(from)? {
 				self.copy_tree(&from.join(&name), &to.join(&name), &rel.join(&name), copied)?;
 			}
-			return fs::set_permissions(to, meta.permissions());
+			return self.set_dir_mode(to, meta.permissions());
 		} else if ft.is_symlink() {
 			self.symlink(&fs::read_link(from)?, to)?;
 		} else {
@@ -336,16 +352,58 @@ fn sync_tree_dirs(root: &Path, copied: &[Copied]) {
 	}
 }
 
-/// Delete a partial copy that only tpfs ever saw (its private `part` name).
-pub(crate) fn remove_part(part: &Path) {
-	match fs::symlink_metadata(part) {
-		Ok(m) if m.is_dir() => {
-			let _ = fs::remove_dir_all(part);
+/// Delete a partial copy that only tpfs ever saw (its private `part` name). Folders copied with a
+/// read-only mode are made writable first, or the removal would fail and leave the copy behind.
+pub(crate) fn remove_part(part: &Path) -> io::Result<()> {
+	let m = match std::fs::symlink_metadata(part) {
+		Ok(m) => m,
+		Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+		Err(e) => return Err(e),
+	};
+	if !m.is_dir() {
+		return std::fs::remove_file(part);
+	}
+	fn writable(dir: &Path) {
+		if let Ok(m) = std::fs::symlink_metadata(dir)
+			&& m.is_dir()
+		{
+			let mut p = m.permissions();
+			#[cfg(unix)]
+			std::os::unix::fs::PermissionsExt::set_mode(&mut p, 0o700);
+			#[cfg(not(unix))]
+			#[allow(clippy::permissions_set_readonly_false)]
+			p.set_readonly(false);
+			let _ = set_dir_mode(dir, p);
+			if let Ok(rd) = std::fs::read_dir(dir) {
+				for e in rd.flatten() {
+					writable(&e.path());
+				}
+			}
 		}
-		Ok(_) => {
-			let _ = fs::remove_file(part);
+	}
+	writable(part);
+	std::fs::remove_dir_all(part)
+}
+
+/// Set a directory's permissions through a handle opened without following a final symlink, so
+/// a symlink swapped in for it cannot redirect the change to another file.
+fn set_dir_mode(dir: &Path, perms: std::fs::Permissions) -> io::Result<()> {
+	#[cfg(unix)]
+	{
+		use rustix::fs::{Mode, OFlags};
+		let fd = rustix::fs::open(
+			dir,
+			OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+			Mode::empty(),
+		)?;
+		File::from(fd).set_permissions(perms)
+	}
+	#[cfg(not(unix))]
+	{
+		if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
+			return Err(io::Error::new(io::ErrorKind::PermissionDenied, "refused: became a link"));
 		}
-		Err(_) => {}
+		std::fs::set_permissions(dir, perms)
 	}
 }
 
@@ -356,16 +414,18 @@ pub(crate) fn part_path(to: &Path, tag: &str) -> PathBuf {
 
 /// Put back into `source` what a cross-device move had already removed from it, taking it from the
 /// published copy at `target`; then move the rest of `target` (duplicates of what is still in
-/// `source`) to `trash_rest`. Used when such a move stopped half way.
+/// `source`) to `trash_rest`. Used when such a move stopped half way. Every step goes through `fs`
+/// (confined to the roots): a folder swapped for a symlink meanwhile is refused, not followed.
 pub(crate) fn merge_back(
+	fs: &Fs,
 	target: &Path,
 	source: &Path,
+	tag: &str,
 	trash_rest: &mut dyn FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
-	let fs = Fs::unconfined();
 	let mut entries = Vec::new();
-	collect(target, Path::new(""), &mut entries)?;
-	for (rel, is_dir) in &entries {
+	collect(fs, target, Path::new(""), &mut entries)?;
+	for (i, (rel, is_dir)) in entries.iter().enumerate() {
 		let src = if rel.as_os_str().is_empty() { source.to_path_buf() } else { source.join(rel) };
 		if *is_dir {
 			if !crate::path::exists(&src) {
@@ -376,24 +436,23 @@ pub(crate) fn merge_back(
 		if crate::path::exists(&src) {
 			continue;
 		}
-		let tgt = target.join(rel);
-		let part = part_path(&src, "restore");
-		fs.move_any(&tgt, &src, &part, &mut || Ok(()))?;
+		let part = part_path(&src, &format!("{tag}-restore-{i}"));
+		remove_part(&part)?; // a leftover of an earlier, interrupted attempt
+		fs.move_any(&target.join(rel), &src, &part, &mut || Ok(()))?;
 	}
 	// Folders now empty were fully restored; whatever is left duplicates the source.
 	for (rel, _) in entries.iter().rev().filter(|(_, d)| *d) {
-		let _ = fs::remove_dir(target.join(rel));
+		let _ = fs.rmdir(&target.join(rel));
 	}
 	if crate::path::exists(target) { trash_rest(target) } else { Ok(()) }
 }
 
-fn collect(path: &Path, rel: &Path, out: &mut Vec<(PathBuf, bool)>) -> io::Result<()> {
-	let is_dir = fs::symlink_metadata(path)?.is_dir();
+fn collect(fs: &Fs, path: &Path, rel: &Path, out: &mut Vec<(PathBuf, bool)>) -> io::Result<()> {
+	let is_dir = std::fs::symlink_metadata(path)?.is_dir();
 	out.push((rel.to_path_buf(), is_dir));
 	if is_dir {
-		for entry in fs::read_dir(path)? {
-			let name = entry?.file_name();
-			collect(&path.join(&name), &rel.join(&name), out)?;
+		for name in fs.list(path)? {
+			collect(fs, &path.join(&name), &rel.join(&name), out)?;
 		}
 	}
 	Ok(())
@@ -545,6 +604,13 @@ mod linux {
 				Err(e) => Err(e.into()),
 			}
 		})())
+	}
+
+	pub(super) fn set_dir_mode(anchors: &[Anchor], dir: &Path, perms: std::fs::Permissions) -> Option<io::Result<()>> {
+		Some(locate(anchors, dir)?.and_then(|(fd, name)| {
+			let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+			File::from(openat(&fd, name, flags, Mode::empty())?).set_permissions(perms)
+		}))
 	}
 
 	pub(super) fn unlink(anchors: &[Anchor], path: &Path) -> Option<io::Result<()>> {
@@ -706,6 +772,7 @@ mod tests {
 		let err = Fs::unconfined()
 			.move_any(&from, &to, &part_path(&to, "t"), &mut || fs::write(&late, "written meanwhile"))
 			.unwrap_err();
+		let fs_ = Fs::unconfined();
 		assert!(err.to_string().contains("left there"), "{err}");
 		assert_eq!(fs::read_to_string(&late).unwrap(), "written meanwhile");
 		assert_eq!(fs::read_to_string(to.join("photo.jpg")).unwrap(), "photo");
@@ -713,7 +780,7 @@ mod tests {
 
 		// Rolling back puts the moved file home and keeps the late one.
 		let mut rest = Vec::new();
-		merge_back(&to, &from, &mut |p| {
+		merge_back(&fs_, &to, &from, "t", &mut |p| {
 			rest.push(p.to_path_buf());
 			Ok(())
 		})
@@ -756,7 +823,7 @@ mod tests {
 		// sub/b was already removed from the source when the move stopped.
 
 		let mut rest = Vec::new();
-		merge_back(&target, &source, &mut |p| {
+		merge_back(&Fs::unconfined(), &target, &source, "t", &mut |p| {
 			rest.push(p.to_path_buf());
 			Ok(())
 		})
@@ -787,5 +854,57 @@ mod tests {
 		// …and so is listing through it.
 		assert!(fs_.list(&root.join("swapped/x")).is_err());
 		assert_eq!(fs_.list(&root.join("src")).unwrap(), ["a"]);
+	}
+
+	/// The rollback of a half-done cross-device move is confined like everything else.
+	#[test]
+	fn merge_back_does_not_follow_a_planted_symlink() {
+		let t = tempfile::TempDir::new().unwrap();
+		let base = crate::path::canonicalize(t.path()).unwrap();
+		let (root, outside) = (base.join("root"), base.join("outside"));
+		let (target, source) = (root.join("target"), root.join("source"));
+		fs::create_dir_all(target.join("sub")).unwrap();
+		fs::write(target.join("sub/authorized_keys"), "attacker").unwrap();
+		fs::create_dir_all(&source).unwrap();
+		fs::create_dir_all(&outside).unwrap();
+		// The source's `sub` was removed by the move; the attacker plants a link in its place.
+		std::os::unix::fs::symlink(&outside, source.join("sub")).unwrap();
+
+		let fs_ = Fs::confined(std::slice::from_ref(&root));
+		let result = merge_back(&fs_, &target, &source, "t", &mut |_| Ok(()));
+		assert!(result.is_err());
+		assert!(!outside.join("authorized_keys").exists(), "wrote through the planted link");
+	}
+
+	/// A symlink swapped in for a copied folder does not get that folder's mode.
+	#[test]
+	fn folder_mode_is_not_applied_through_a_symlink() {
+		use std::os::unix::fs::PermissionsExt;
+		let t = tempfile::TempDir::new().unwrap();
+		let base = crate::path::canonicalize(t.path()).unwrap();
+		let root = base.join("root");
+		fs::create_dir_all(&root).unwrap();
+		let victim = base.join("bashrc");
+		fs::write(&victim, "x").unwrap();
+		fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+		std::os::unix::fs::symlink(&victim, root.join("copied")).unwrap();
+
+		let fs_ = Fs::confined(std::slice::from_ref(&root));
+		assert!(fs_.set_dir_mode(&root.join("copied"), fs::Permissions::from_mode(0o777)).is_err());
+		assert!(set_dir_mode(&root.join("copied"), fs::Permissions::from_mode(0o777)).is_err());
+		assert_eq!(fs::metadata(&victim).unwrap().permissions().mode() & 0o777, 0o600);
+	}
+
+	/// A partial copy with read-only folders inside is still removed.
+	#[test]
+	fn partial_copies_with_read_only_folders_are_removed() {
+		use std::os::unix::fs::PermissionsExt;
+		let t = tempfile::TempDir::new().unwrap();
+		let part = t.path().join(".tpfs-part-x");
+		fs::create_dir_all(part.join("ro")).unwrap();
+		fs::write(part.join("ro/f"), "f").unwrap();
+		fs::set_permissions(part.join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
+		remove_part(&part).unwrap();
+		assert!(!part.exists());
 	}
 }

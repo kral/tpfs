@@ -353,3 +353,20 @@ fn copies_never_read_through_fifos() {
 	assert!(err.to_string().contains("special file"), "{err}");
 	assert!(!s.root.join("dir-copy").exists(), "the partial copy is removed");
 }
+
+/// Error messages carry file names; they must not carry terminal escapes with them.
+#[cfg(unix)]
+#[test]
+fn errors_never_contain_raw_escape_sequences() {
+	let s = Sandbox::new();
+	let dir = s.root.join("dir");
+	fs::create_dir(&dir).unwrap();
+	mkfifo(&dir.join("x\u{1b}]52;c;aGk=\u{7}\u{1b}[2Jy"));
+	let v = s.validator();
+	let mut j = s.journal();
+	let err = Executor::new(&v, &mut j, s.state.join("trash"))
+		.execute(&Plan::new(vec![Op::Copy { from: dir, to: s.root.join("copy") }], ""), Source::Human)
+		.unwrap_err()
+		.to_string();
+	assert!(!err.contains('\u{1b}') && !err.contains('\u{7}'), "{err:?}");
+}
