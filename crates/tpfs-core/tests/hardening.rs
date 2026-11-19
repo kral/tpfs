@@ -677,6 +677,10 @@ fn read_only_entries_are_removed_on_windows() {
 	let base = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
 	let other = TempDir::new_in(&base).unwrap();
 	let root = tpfs_core::canonicalize(other.path()).unwrap();
+	let drive = |p: &std::path::Path| p.components().next().map(|c| c.as_os_str().to_ascii_lowercase());
+	if drive(&root) == drive(&s.state) {
+		eprintln!("skipped cross-volume: the target folder and the state are on one drive");
+	}
 	let f = root.join("ro.txt");
 	fs::write(&f, "R").unwrap();
 	attrib(&["-a", "+r"], &f);
@@ -688,4 +692,16 @@ fn read_only_entries_are_removed_on_windows() {
 	assert!(!f.exists());
 	Executor::new(&v, &mut j, s.state.join("trash")).undo_last().unwrap();
 	assert_eq!(fs::read_to_string(&f).unwrap(), "R");
+
+	// A read-only folder (Explorer marks customised folders so) trashed across drives and back.
+	let g = root.join("custom");
+	fs::create_dir(&g).unwrap();
+	fs::write(g.join("desktop.ini"), "[.ShellClassInfo]").unwrap();
+	attrib(&["+r"], &g);
+	Executor::new(&v, &mut j, s.state.join("trash"))
+		.execute(&Plan::new(vec![Op::Trash { path: g.clone() }], ""), Source::Human)
+		.unwrap();
+	assert!(!g.exists());
+	Executor::new(&v, &mut j, s.state.join("trash")).undo_last().unwrap();
+	assert!(g.join("desktop.ini").exists());
 }

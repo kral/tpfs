@@ -468,15 +468,16 @@ fn run(args: Args) -> Res {
 				return Ok(ExitCode::SUCCESS);
 			}
 			let report = Executor::new(&validator, &mut journal, trash).recover().map_err(|e| e.to_string())?;
-			if report.rolled_back.is_empty() && report.errors.is_empty() {
-				println!("Nothing to recover.");
-			} else {
-				println!("Rolled back {} interrupted batch(es).", report.rolled_back.len());
+			match (report.rolled_back.len(), report.errors.is_empty()) {
+				(0, true) => println!("Nothing to recover."),
+				(0, false) => println!("Nothing rolled back."),
+				(n, _) => println!("Rolled back {n} interrupted batch(es)."),
 			}
 			for e in &report.errors {
 				eprintln!("  error: {e}");
 			}
-			if !report.errors.is_empty() {
+			// Batches recover can retry (as opposed to those it only reports, which say what to do).
+			if report.errors.iter().any(|e| !e.contains("--abandon")) {
 				eprintln!("Fix the cause of each error, then run `tpfs recover` again (finished steps are skipped).");
 			}
 			Ok(if report.errors.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) })
@@ -507,8 +508,7 @@ fn run(args: Args) -> Res {
 		}
 		"pending" => {
 			let store = tpfs_mcp::Store::new(&state_dir(&args)?);
-			let pending = store.list().map_err(|e| e.to_string())?;
-			let damaged = store.damaged();
+			let (pending, damaged) = store.scan();
 			if pending.is_empty() && damaged.is_empty() {
 				println!("No pending plans.");
 			}

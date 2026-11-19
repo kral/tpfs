@@ -59,7 +59,7 @@ const OWN_PREFIXES: [&str; 3] = [".tpfs-trash-", ".tpfs-part-", ".tpfs-case-"];
 pub fn is_own_name(name: &std::ffi::OsStr) -> bool {
 	// Letter case ignored: on a volume that ignores it (FAT, exFAT, APFS, NTFS, casefold folders)
 	// `.TPFS-TRASH-1000` is the same folder as tpfs's trash.
-	let Some(n) = name.to_str().map(str::to_ascii_lowercase) else { return false };
+	let Some(n) = name.to_str().map(fold) else { return false };
 	let n = n.as_str();
 	if let Some(uid) = n.strip_prefix(OWN_PREFIXES[0]) {
 		return !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit());
@@ -69,6 +69,31 @@ pub fn is_own_name(name: &std::ffi::OsStr) -> bool {
 			rest.split('-').next().is_some_and(|b| b.len() >= 8 && b.bytes().all(|c| c.is_ascii_hexdigit()))
 		})
 	})
+}
+
+/// A name as a case-insensitive volume compares it: lower case, with the letters that fold to
+/// plain ASCII (`ſ` → `s`, Kelvin sign → `k`) folded too, so no spelling slips past a check.
+fn fold(name: &str) -> String {
+	name.to_lowercase().replace('\u{17f}', "s")
+}
+
+/// Whether `path` is `base` or inside it, letter case ignored: on a volume that ignores case,
+/// `/data/.TPFS` is the state folder `/data/.tpfs`. Over-matching on a case-sensitive volume only
+/// refuses more.
+fn within(path: &Path, base: &Path) -> bool {
+	let (mut p, mut b) = (path.components(), base.components());
+	loop {
+		match (b.next(), p.next()) {
+			(None, _) => return true,
+			(Some(_), None) => return false,
+			(Some(x), Some(y)) => {
+				let (x, y) = (x.as_os_str().to_string_lossy(), y.as_os_str().to_string_lossy());
+				if x != y && fold(&x) != fold(&y) {
+					return false;
+				}
+			}
+		}
+	}
 }
 
 impl Validator {
@@ -132,7 +157,7 @@ impl Validator {
 	/// A source that would carry tpfs's state with it (moving, copying or trashing a folder that
 	/// contains the state directory).
 	fn holds_state(&self, path: &Path) -> Result<(), String> {
-		match self.protected.iter().find(|p| p.starts_with(path)) {
+		match self.protected.iter().find(|p| within(p, path)) {
 			Some(p) => Err(format!("{} contains tpfs's state ({}); leave it out of the plan.", show(path), show(p))),
 			None => Ok(()),
 		}
@@ -344,7 +369,7 @@ impl Validator {
 		if path.components().any(|c| is_own_name(c.as_os_str())) {
 			return Err(format!("This is tpfs's own working data and cannot be changed by a plan: {}", show(&path)));
 		}
-		if self.protected.iter().any(|p| path.starts_with(p)) {
+		if self.protected.iter().any(|p| within(&path, p)) {
 			return Err(format!(
 				"This is tpfs's state (journal, trash, approvals) and cannot be part of a plan: {}",
 				show(&path)
@@ -430,11 +455,21 @@ fn refuse_mount_point(path: &Path) -> Result<(), String> {
 	Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+	/// A path the tests treat as another disk mounted there.
+	pub(crate) static FAKE_MOUNT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Whether a folder is the root of a mount: on Linux as the kernel says (a bind mount has the same
 /// device, a btrfs subvolume a different one without being a mount point), on other Unix systems
 /// by a device different from its parent's. Always false on Windows, where mounted volumes are
 /// reparse points and refused as links.
 pub(crate) fn is_mount_point(path: &Path) -> bool {
+	#[cfg(test)]
+	if FAKE_MOUNT.with(|f| f.borrow().as_deref() == Some(path)) {
+		return true;
+	}
 	#[cfg(target_os = "linux")]
 	if let Ok(st) = rustix::fs::statx(
 		rustix::fs::CWD,
@@ -628,4 +663,24 @@ fn human(bytes: u64) -> String {
 		unit += 1;
 	}
 	if unit == 0 { format!("{bytes} B") } else { format!("{value:.1} {}", UNITS[unit]) }
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A tree wider than the plan's budget is not measured: `None`, with no more pending paths
+	/// held than the budget allowed.
+	#[test]
+	fn tree_size_stops_at_the_budget() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		for i in 0..50 {
+			fs::write(tmp.path().join(format!("f{i}")), "x").unwrap();
+		}
+		let mut budget = 10;
+		assert_eq!(tree_size(tmp.path(), &mut budget), None);
+		let mut budget = 100;
+		assert_eq!(tree_size(tmp.path(), &mut budget), Some(50));
+		assert_eq!(budget, 49);
+	}
 }

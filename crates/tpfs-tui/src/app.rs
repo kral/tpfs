@@ -331,6 +331,9 @@ impl App {
 
 	fn on_dialog_key(&mut self, key: KeyEvent) {
 		match (self.dialog.take(), key.code) {
+			(Some(Dialog::Confirm { .. } | Dialog::Undo { .. } | Dialog::Sync { .. }), KeyCode::Esc) => {
+				self.status = "Cancelled; nothing was changed.".into();
+			}
 			(Some(_), KeyCode::Esc) => {}
 			(Some(Dialog::View { title, lines, offset }), code) => {
 				let last = lines.len().saturating_sub(1);
@@ -511,6 +514,7 @@ impl App {
 		// A folder name is trimmed; a new file name is taken exactly as typed (no silent change).
 		let value = if matches!(kind, InputKind::Rename(_)) { value } else { value.trim() };
 		if value.trim().is_empty() {
+			self.status = "Nothing to do: the name is empty.".into();
 			return;
 		}
 		let plan = match kind {
@@ -541,10 +545,12 @@ impl App {
 		let result = self.journal().and_then(|mut j| {
 			Executor::new(&self.validator(), &mut j, self.state.join("trash"))
 				.execute(plan, Source::Human)
-				.map(|b| format!("Done: {} step(s). Ctrl+Z to undo.", b.steps))
+				.map(|b| {
+					format!("{}: done, {} step(s). Ctrl+Z to undo.", tpfs_core::sanitize(plan.reason.as_ref()), b.steps)
+				})
 				.map_err(|e| one_line(&e))
 		});
-		self.status = result.unwrap_or_else(|e| format!("Failed: {e}"));
+		self.status = result.unwrap_or_else(|e| format!("{} failed: {e}", tpfs_core::sanitize(plan.reason.as_ref())));
 		self.panels.iter_mut().for_each(|p| p.marked.clear());
 		self.reload();
 	}
@@ -664,7 +670,7 @@ impl App {
 					let area = self.areas.panels[i];
 					let row = m.row.saturating_sub(area.y + 1) as usize;
 					let index = self.panels[i].offset + row;
-					if m.row > area.y && index < self.panels[i].entries.len() {
+					if m.row > area.y && m.row + 1 < area.y + area.height && index < self.panels[i].entries.len() {
 						let now = Instant::now();
 						let double = matches!(self.last_click, Some((t, p, r)) if p == i && r == index && now - t < Duration::from_millis(400));
 						self.panels[i].cursor = index;

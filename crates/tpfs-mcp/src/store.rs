@@ -73,29 +73,36 @@ impl Store {
 	}
 
 	/// Ids of pending files that cannot be read as plans (for `tpfs pending`, so they can be rejected).
+	/// Ids of pending plans that cannot be read or parsed (listed so they can be rejected).
 	pub fn damaged(&self) -> Vec<String> {
-		let Ok(entries) = fs::read_dir(&self.dir) else { return vec![] };
-		let mut out: Vec<String> = entries
-			.filter_map(Result::ok)
-			.filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-			.filter(|e| fs::read(e.path()).ok().and_then(|b| serde_json::from_slice::<Pending>(&b).ok()).is_none())
-			.filter_map(|e| e.path().file_stem().and_then(|s| s.to_str()).map(str::to_owned))
-			.filter(|id| check_id(id).is_ok())
-			.collect();
-		out.sort();
-		out
+		self.scan().1
 	}
 
 	pub fn list(&self) -> io::Result<Vec<Pending>> {
-		let Ok(entries) = fs::read_dir(&self.dir) else { return Ok(vec![]) };
-		let mut out: Vec<Pending> = entries
-			.filter_map(Result::ok)
-			.filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-			.filter_map(|e| fs::read(e.path()).ok())
-			.filter_map(|b| serde_json::from_slice(&b).ok())
-			.collect();
-		out.sort_by_key(|p| p.created);
-		Ok(out)
+		Ok(self.scan().0)
+	}
+
+	/// Every pending plan, oldest first, and the ids of the damaged ones, in one read.
+	pub fn scan(&self) -> (Vec<Pending>, Vec<String>) {
+		let (mut plans, mut damaged) = (Vec::new(), Vec::new());
+		let Ok(entries) = fs::read_dir(&self.dir) else { return (plans, damaged) };
+		for e in entries.filter_map(Result::ok) {
+			let path = e.path();
+			if path.extension().is_none_or(|x| x != "json") {
+				continue;
+			}
+			match fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Pending>(&b).ok()) {
+				Some(p) => plans.push(p),
+				None => {
+					if let Some(id) = path.file_stem().and_then(|s| s.to_str()).filter(|id| check_id(id).is_ok()) {
+						damaged.push(id.to_owned());
+					}
+				}
+			}
+		}
+		plans.sort_by_key(|p| p.created);
+		damaged.sort();
+		(plans, damaged)
 	}
 
 	/// Record a human approval of exactly this pending plan (by digest).

@@ -444,6 +444,23 @@ impl Fs {
 		if let Some(result) = confined::rmdir(&self.anchors, path) {
 			return result;
 		}
+		// Windows refuses to remove a read-only folder (the private trash holds copies that kept
+		// the attribute): clear it first, and put it back if the removal still fails.
+		#[cfg(windows)]
+		if let Ok(m) = fs::symlink_metadata(path)
+			&& m.permissions().readonly()
+		{
+			let original = m.permissions();
+			let mut p = original.clone();
+			#[allow(clippy::permissions_set_readonly_false)]
+			p.set_readonly(false);
+			fs::set_permissions(path, p)?;
+			let result = fs::remove_dir(path);
+			if result.is_err() {
+				let _ = fs::set_permissions(path, original);
+			}
+			return result;
+		}
 		fs::remove_dir(path)
 	}
 }
@@ -696,7 +713,7 @@ pub(crate) fn sync_parent(path: &Path) {
 }
 
 /// fsync a directory so entries created in it survive a power loss (Unix; NTFS journals metadata).
-fn sync_dir(dir: &Path) {
+pub(crate) fn sync_dir(dir: &Path) {
 	// Not following a link, and never blocking (a FIFO swapped in for the folder must not hang a
 	// batch that holds the journal lock).
 	#[cfg(unix)]
@@ -1515,11 +1532,16 @@ mod confined {
 			}
 			set_basic(h, &b)?;
 		}
-		let result = delete(h);
-		if result.is_err() && read_only {
-			let _ = set_basic(h, &original);
+		match delete(h) {
+			Err(e) if read_only => match set_basic(h, &original) {
+				Ok(()) => Err(e),
+				Err(r) => Err(io::Error::new(
+					e.kind(),
+					format!("{e}; its read-only attribute was cleared and could not be put back: {r}"),
+				)),
+			},
+			result => result,
 		}
-		result
 	}
 
 	pub(super) fn unlink(anchors: &[Anchor], path: &Path) -> Option<io::Result<()>> {

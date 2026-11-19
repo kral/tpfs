@@ -431,15 +431,16 @@ impl<'a> Executor<'a> {
 			let path = n(path);
 			remove_part(fs, &part_path(&path, &t))?; // left by older versions
 			if !exists(&path) {
-				// Created no wider than its owner-only part, so a crash before the record leaves a
-				// private folder that a rerun recognises (see `folder_as_restored`).
-				fs.mkdir_mode(&path, mode & 0o700)?;
+				// Journaled *before* it is made, and made no wider than its owner bits: a rerun after
+				// a crash anywhere here finds the record and a private, empty folder (see
+				// `folder_as_restored`); without the record, a folder there is never taken over.
 				self.journal.write(&Entry::UndoPublished { batch: batch.to_owned(), index: step.index })?;
+				fs.mkdir_mode(&path, mode & 0o700)?;
 				return set_mode(fs, &path, mode);
 			}
 			// Already there: made by an earlier attempt of this undo (journaled, or an empty folder
 			// with exactly the recorded permissions), or by someone else — then undo stops.
-			return if step.undo_published || folder_as_restored(&path, mode) {
+			return if folder_as_restored(&path, mode, step.undo_published) {
 				set_mode(fs, &path, mode)
 			} else {
 				Err(io::Error::new(
@@ -510,9 +511,9 @@ impl<'a> Executor<'a> {
 				continue;
 			}
 			if all[i + 1..].iter().any(|later| later.status == BatchStatus::Committed) {
+				let id = crate::sanitize(b.id.as_ref());
 				report.errors.push(format!(
-					"batch {} was interrupted before newer changes were made; it is not rolled back automatically (see `tpfs log`; to accept the disk as it is: `tpfs recover --abandon {}`)",
-					b.id, b.id
+					"batch {id} was interrupted and newer batches were applied after it, so it is not rolled back automatically: see `tpfs log {id}`, then `tpfs recover --abandon {id}` to accept the disk as it is"
 				));
 			} else {
 				batches.push(b.clone());
@@ -608,13 +609,13 @@ impl<'a> Executor<'a> {
 							.check_path(&path)
 							.map(|_| ())
 							.map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))
-							.and_then(|()| fs.mkdir_mode(&path, mode & 0o700))
 							.and_then(|()| {
-								// Ours from here on; journaled so a rerun still sets the mode.
+								// Journaled before it is made (see the undo path).
 								journal
 									.write(&Entry::UndoPublished { batch: batch.id.clone(), index: step.index })
 									.map_err(|e| io::Error::other(e.to_string()))
 							})
+							.and_then(|()| fs.mkdir_mode(&path, mode & 0o700))
 							.and_then(|()| set_mode(&fs, &path, mode));
 						if let Err(e) = result {
 							errors.push(clean(format!("{fix}: {e}")));
@@ -640,7 +641,7 @@ impl<'a> Executor<'a> {
 					&& let (Op::Rmdir { path }, Some(mode)) = (&step.forward, step.mode)
 					&& let Some(path) = normalize(path)
 					&& path.is_dir()
-					&& (step.undo_published || folder_as_restored(&path, mode))
+					&& folder_as_restored(&path, mode, step.undo_published)
 					&& let Err(e) = set_mode(&fs, &path, mode)
 				{
 					errors.push(clean(format!("{}: {e}", step.inverse)));
@@ -863,21 +864,24 @@ fn both_exist(old: &Path, new: &Path) -> io::Error {
 	)
 }
 
-/// Whether `path` is an empty folder with the recorded `mode`, or with no more than its owner bits:
-/// what an interrupted undo or recovery of an `rmdir` leaves (see `Fs::mkdir_mode`).
-fn folder_as_restored(path: &Path, mode: u32) -> bool {
+/// Whether `path` is an empty folder an interrupted undo or recovery of an `rmdir` left: with the
+/// recorded `mode`, or — only when that attempt was journaled (`ours`) — with no more than its
+/// owner bits, before the mode was set (see `Fs::mkdir_mode`).
+fn folder_as_restored(path: &Path, mode: u32, ours: bool) -> bool {
 	let Ok(m) = fs::symlink_metadata(path) else { return false };
 	// The recorded mode, or what our creation left before the mode was set (owner bits only,
 	// narrowed by the umask).
 	#[cfg(unix)]
 	let same_mode = {
 		use std::os::unix::fs::PermissionsExt;
+		// Set-group-ID is inherited from a shared parent folder: it says nothing about who made it.
 		let now = m.permissions().mode() & 0o7777;
-		now == mode || now & !(mode & 0o700) == 0
+		let base = now & 0o777;
+		now == mode || (ours && base & !(mode & 0o700) == 0)
 	};
 	#[cfg(not(unix))]
 	let same_mode = {
-		let _ = mode;
+		let _ = (mode, ours);
 		true
 	};
 	m.is_dir() && same_mode && fs::read_dir(path).is_ok_and(|mut rd| rd.next().is_none())
@@ -892,6 +896,9 @@ fn set_mode(fs: &Fs, path: &Path, mode: u32) -> io::Result<()> {
 	}
 	#[cfg(not(unix))]
 	let _ = (fs, mode);
+	// The folder's own inode too: a file system that logs fsync per inode could otherwise keep
+	// the step's record but lose the mode.
+	crate::fsops::sync_dir(path);
 	sync_parent(path);
 	Ok(())
 }
@@ -1200,4 +1207,34 @@ fn now_secs() -> u64 {
 fn new_batch_id() -> String {
 	let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
 	format!("{nanos:x}-{:x}", std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{Plan, Validator};
+
+	/// A copy never enters another disk mounted inside the folder: it stops there and leaves
+	/// nothing behind (a move falling back to a copy would otherwise empty that disk).
+	#[test]
+	fn a_copy_stops_at_a_disk_mounted_inside() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let base = crate::path::canonicalize(tmp.path()).unwrap();
+		let root = base.join("root");
+		let inner = root.join("src").join("inner");
+		fs::create_dir_all(&inner).unwrap();
+		fs::write(root.join("src").join("a"), "A").unwrap();
+		fs::write(inner.join("file"), "F").unwrap();
+		crate::validate::FAKE_MOUNT.with(|f| *f.borrow_mut() = Some(inner.clone()));
+		let v = Validator::new([&root]).unwrap();
+		let mut j = Journal::open(base.join("state").join("journal.jsonl")).unwrap();
+		let dst = root.join("dst");
+		let err = Executor::new(&v, &mut j, base.join("state").join("trash"))
+			.execute(&Plan::new(vec![Op::Copy { from: root.join("src"), to: dst.clone() }], ""), Source::Human)
+			.unwrap_err();
+		assert!(err.to_string().contains("mount point"), "{err}");
+		assert!(!dst.exists());
+		assert!(fs::read_dir(&root).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().starts_with(".tpfs-")));
+		assert_eq!(fs::read_to_string(inner.join("file")).unwrap(), "F");
+	}
 }

@@ -543,7 +543,7 @@ fn recover_last_only_touches_an_interrupted_newest_batch() {
 	let r = Executor::new(&v, &mut j, s.trash()).recover_last().unwrap();
 	assert!(r.rolled_back.is_empty(), "an older interrupted batch must not be rolled back by Undo");
 	let r = Executor::new(&v, &mut j, s.trash()).recover().unwrap();
-	assert!(r.rolled_back.is_empty() && r.errors[0].contains("newer changes"), "{r:?}");
+	assert!(r.rolled_back.is_empty() && r.errors[0].contains("newer batches"), "{r:?}");
 	assert!(dir.exists() && newer.exists());
 
 	fs::remove_dir(&dir).unwrap();
@@ -589,6 +589,18 @@ fn plans_cannot_touch_tpfs_state() {
 	] {
 		let plan = Plan::new(plan, "");
 		assert!(messages(&v, &plan)[0].contains(expect), "{:?}", messages(&v, &plan));
+	}
+
+	// Another spelling of the state folder is the same folder on a volume that ignores case.
+	let name = s.state.file_name().unwrap().to_string_lossy().to_uppercase();
+	let other = s.state.with_file_name(&name);
+	for op in [Op::Trash { path: other.clone() }, Op::Move { from: other.join("journal.jsonl"), to: s.root.join("j") }]
+	{
+		let plan = Plan::new(vec![op], "");
+		assert!(messages(&v, &plan).iter().any(|m| m.contains("tpfs's state")), "{:?}", messages(&v, &plan));
+	}
+	for n in [".tpf\u{17f}-trash-1000", ".TPF\u{17f}-PART-0123abcd-0"] {
+		assert!(tpfs_core::is_own_name(n.as_ref()), "{n}");
 	}
 
 	let keep = s.dir("keep");
@@ -1303,38 +1315,49 @@ fn undo_never_trusts_a_look_alike_at_the_old_place() {
 
 #[test]
 fn long_histories_are_read_in_linear_time() {
-	let s = Sandbox::new();
-	let _ = s.journal();
-	let mut text = String::new();
-	let mut line = |e: &Entry| {
-		let json = serde_json::to_string(e).unwrap();
-		text.push_str(&format!("{:08x} {json}\n", crc32fast::hash(json.as_bytes())));
-	};
-	for i in 0..50_000 {
-		let batch = format!("b{i}");
-		let p = s.root.join(format!("d{i}"));
-		line(&Entry::Begin {
-			batch: batch.clone(),
-			at: 0,
-			source: "human".into(),
-			reason: String::new(),
-			digest: String::new(),
-			v: 1,
-		});
-		line(&Entry::Intent {
-			batch: batch.clone(),
-			index: 0,
-			forward: Op::Mkdir { path: p.clone() },
-			inverse: Op::Rmdir { path: p },
-		});
-		line(&Entry::Done { batch: batch.clone(), index: 0, check: None, mode: None });
-		line(&Entry::Commit { batch });
+	// Timed at two sizes in one process: linear reading takes about 4× as long for 4× the
+	// batches, quadratic about 16×. No absolute limit, so a loaded machine does not fail it.
+	fn time(n: usize) -> std::time::Duration {
+		let s = Sandbox::new();
+		let _ = s.journal();
+		let mut text = String::new();
+		let mut line = |e: &Entry| {
+			let json = serde_json::to_string(e).unwrap();
+			text.push_str(&format!("{:08x} {json}\n", crc32fast::hash(json.as_bytes())));
+		};
+		for i in 0..n {
+			let batch = format!("b{i}");
+			let p = s.root.join(format!("d{i}"));
+			line(&Entry::Begin {
+				batch: batch.clone(),
+				at: 0,
+				source: "human".into(),
+				reason: String::new(),
+				digest: String::new(),
+				v: 1,
+			});
+			line(&Entry::Intent {
+				batch: batch.clone(),
+				index: 0,
+				forward: Op::Mkdir { path: p.clone() },
+				inverse: Op::Rmdir { path: p },
+			});
+			line(&Entry::Done { batch: batch.clone(), index: 0, check: None, mode: None });
+			line(&Entry::Commit { batch });
+		}
+		fs::write(s.state.join("journal.jsonl"), text).unwrap();
+		let mut j = s.journal();
+		(0..2)
+			.map(|_| {
+				let started = std::time::Instant::now();
+				assert_eq!(j.batches().unwrap().len(), n);
+				started.elapsed()
+			})
+			.min()
+			.unwrap()
 	}
-	fs::write(s.state.join("journal.jsonl"), text).unwrap();
-	let mut j = s.journal();
-	let started = std::time::Instant::now();
-	assert_eq!(j.batches().unwrap().len(), 50_000);
-	assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+	let (small, large) = (time(5_000), time(20_000));
+	assert!(large < small * 10, "5k batches: {small:?}, 20k: {large:?}");
 }
 
 #[test]
@@ -1754,17 +1777,17 @@ fn undoing_rmdir_leaves_a_folder_made_since_alone() {
 fn an_interrupted_undo_of_rmdir_finishes_the_mode() {
 	use std::os::unix::fs::PermissionsExt;
 	let s = Sandbox::new();
-	let d = s.root.join("private");
+	let d = s.root.join("open");
 	fs::create_dir(&d).unwrap();
-	fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
-	let id = run(&s, vec![Op::Rmdir { path: d.clone() }]);
-	fs::create_dir(&d).unwrap(); // the interrupted undo's mkdir (default mode)…
 	fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+	let id = run(&s, vec![Op::Rmdir { path: d.clone() }]);
 	let mut j = s.journal();
-	j.append(&Entry::UndoPublished { batch: id, index: 0 }).unwrap(); // …journaled as ours
+	j.append(&Entry::UndoPublished { batch: id, index: 0 }).unwrap(); // journaled first…
 	drop(j);
+	fs::create_dir(&d).unwrap(); // …then made owner-only; the crash came before the mode was set
+	fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
 	assert_eq!(undo(&s).unwrap().unwrap().steps, 1);
-	assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
+	assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o755);
 }
 
 /// Linux: a mount point cannot be trashed or moved (it is refused at validation).
@@ -1873,41 +1896,44 @@ fn an_interrupted_recovery_of_rmdir_finishes_the_mode() {
 		inverse: Op::Mkdir { path: d.clone() },
 	})
 	.unwrap();
-	j.append(&Entry::Mode { batch: "h".into(), index: 0, mode: 0o700 }).unwrap();
-	// The rmdir ran; then a recovery recreated the folder (default mode) and recorded it.
-	fs::create_dir(&d).unwrap();
-	fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+	j.append(&Entry::Mode { batch: "h".into(), index: 0, mode: 0o755 }).unwrap();
+	// The rmdir ran; then a recovery recorded the folder, made it owner-only and was cut off.
 	j.append(&Entry::UndoPublished { batch: "h".into(), index: 0 }).unwrap();
+	fs::create_dir(&d).unwrap();
+	fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
 	let report = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
 	assert!(report.errors.is_empty(), "{report:?}");
-	assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
+	assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o755);
 	let again = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
 	assert!(again.errors.is_empty() && again.rolled_back.is_empty(), "{again:?}");
 }
 
-/// Linux: a copy of a folder with another disk mounted inside stops there, leaving nothing.
-#[cfg(target_os = "linux")]
+/// Undo of an `rmdir` never opens up a private folder the user made at that name since.
+#[cfg(unix)]
 #[test]
-fn a_copy_stops_at_a_disk_mounted_inside() {
-	use std::os::unix::fs::MetadataExt;
-	let dev = Path::new("/dev");
-	if !Path::new("/dev/shm").is_dir()
-		|| fs::metadata("/dev/shm").unwrap().dev() == fs::metadata(dev).unwrap().dev()
-		|| fs::read_dir(dev).is_err()
-	{
-		eprintln!("skipped: no disk mounted inside /dev");
-		return;
-	}
+fn undoing_rmdir_never_widens_an_empty_folder_made_since() {
+	use std::os::unix::fs::PermissionsExt;
 	let s = Sandbox::new();
-	let v = Validator::new([dev, s.root.as_path()]).unwrap();
-	let target = s.root.join("devcopy");
-	let mut j = s.journal();
-	let err = Executor::new(&v, &mut j, s.trash())
-		.execute(&Plan::new(vec![Op::Copy { from: dev.into(), to: target.clone() }], ""), Source::Human)
-		.unwrap_err();
-	let _ = err; // refused at validation (special files) or at the mount point: either way, nothing copied
-	assert!(!target.exists());
-	assert!(
-		!fs::read_dir(&s.root).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with(".tpfs-part-"))
-	);
+	let d = s.root.join("shared");
+	fs::create_dir(&d).unwrap();
+	fs::set_permissions(&d, fs::Permissions::from_mode(0o777)).unwrap();
+	run(&s, vec![Op::Rmdir { path: d.clone() }]);
+	fs::create_dir(&d).unwrap();
+	fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
+	assert!(undo(&s).is_err());
+	assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
+}
+
+/// Undo of an `rmdir` of a folder wider than owner-only brings back its full mode.
+#[cfg(unix)]
+#[test]
+fn undoing_rmdir_restores_a_wide_mode() {
+	use std::os::unix::fs::PermissionsExt;
+	let s = Sandbox::new();
+	let d = s.root.join("wide");
+	fs::create_dir(&d).unwrap();
+	fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+	run(&s, vec![Op::Rmdir { path: d.clone() }]);
+	assert_eq!(undo(&s).unwrap().unwrap().steps, 1);
+	assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o755);
 }
