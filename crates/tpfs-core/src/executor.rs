@@ -84,7 +84,8 @@ pub struct RecoveryReport {
 
 /// Executes validated plans, step by step, through the write-ahead journal.
 pub struct Executor<'a> {
-	validator: &'a Validator,
+	/// The caller's validator, with tpfs's own state (journal folder, trash) protected on top.
+	validator: Validator,
 	journal: &'a mut Journal,
 	trash: PathBuf,
 	hook: Option<Box<dyn FnMut(usize, Phase) + 'a>>,
@@ -101,7 +102,10 @@ pub enum Phase {
 
 impl<'a> Executor<'a> {
 	pub fn new(validator: &'a Validator, journal: &'a mut Journal, trash: impl Into<PathBuf>) -> Self {
-		Self { validator, journal, trash: trash.into(), hook: None }
+		let trash = trash.into();
+		let state = journal.path().parent().map(Path::to_path_buf);
+		let validator = validator.clone().with_protected(state.into_iter().chain([trash.clone()]));
+		Self { validator, journal, trash, hook: None }
 	}
 
 	/// Test hook, to simulate another program changing the file system mid-plan or a crash.

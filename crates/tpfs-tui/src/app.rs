@@ -100,7 +100,7 @@ pub(crate) struct Areas {
 impl App {
 	pub fn new(left: PathBuf, right: PathBuf, state: PathBuf, icons: bool) -> io::Result<Self> {
 		// The human may work anywhere; confinement against symlinks still applies below the root.
-		let validator = Validator::new(tpfs_core::system_roots())?;
+		let validator = Validator::new(tpfs_core::system_roots())?.with_protected([&state]);
 		Ok(Self {
 			panels: [Panel::new(&left), Panel::new(&right)],
 			active: 0,

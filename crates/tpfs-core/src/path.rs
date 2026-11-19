@@ -68,6 +68,63 @@ fn strip_verbatim(s: &str) -> Option<String> {
 	(out.len() <= MAX).then_some(out)
 }
 
+/// Create (if needed) a directory only the current user can use, and refuse one that is not:
+/// a symlink, owned by someone else, or writable by group or others. tpfs keeps its journal,
+/// trash and approvals in such directories; anyone able to write there could forge them.
+pub fn private_dir(dir: &Path) -> io::Result<()> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+		fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+		let m = fs::symlink_metadata(dir)?;
+		let uid = rustix::process::geteuid().as_raw();
+		if !m.is_dir() || m.uid() != uid || m.permissions().mode() & 0o022 != 0 {
+			return Err(io::Error::new(
+				io::ErrorKind::PermissionDenied,
+				format!(
+					"refusing to use {}: it must be a real folder owned by you and not writable by others (chmod 700)",
+					dir.display()
+				),
+			));
+		}
+		Ok(())
+	}
+	#[cfg(not(unix))]
+	{
+		// Windows: the folder inherits the ACL of the user's profile; refuse a reparse point.
+		fs::create_dir_all(dir)?;
+		if fs::symlink_metadata(dir)?.file_type().is_symlink() {
+			return Err(io::Error::new(
+				io::ErrorKind::PermissionDenied,
+				format!("refusing to use {}: it is a link", dir.display()),
+			));
+		}
+		Ok(())
+	}
+}
+
+/// Refuse a private file that is a symlink, or (Unix) not owned by the user or readable by others.
+pub fn check_private_file(path: &Path) -> io::Result<()> {
+	let m = match fs::symlink_metadata(path) {
+		Ok(m) => m,
+		Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+		Err(e) => return Err(e),
+	};
+	let bad = m.file_type().is_symlink() || !m.is_file();
+	#[cfg(unix)]
+	let bad = bad || {
+		use std::os::unix::fs::{MetadataExt, PermissionsExt};
+		m.uid() != rustix::process::geteuid().as_raw() || m.permissions().mode() & 0o077 != 0
+	};
+	if bad {
+		return Err(io::Error::new(
+			io::ErrorKind::PermissionDenied,
+			format!("refusing to use {}: it must be a regular file owned by you, private (chmod 600)", path.display()),
+		));
+	}
+	Ok(())
+}
+
 /// Whether something exists at `path` without following a final symlink.
 pub(crate) fn exists(path: &Path) -> bool {
 	fs::symlink_metadata(path).is_ok()

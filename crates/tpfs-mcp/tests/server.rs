@@ -170,9 +170,10 @@ fn agent_undoes_only_agent_batches() {
 	assert!(err && v["error"].as_str().unwrap().contains("human"), "{v}");
 	assert!(human_dir.exists());
 
+	// History shows the agent only its own batches.
 	let (v, _) = f.tool("history", json!({}));
-	assert_eq!(v["batches"][0]["source"], "human");
-	assert_eq!(v["batches"][1]["source"], "agent");
+	assert_eq!(v["batches"].as_array().unwrap().len(), 1, "{v}");
+	assert_eq!(v["batches"][0]["source"], "agent");
 }
 
 #[test]
@@ -190,4 +191,17 @@ fn bad_input_lines_get_errors_and_the_session_goes_on() {
 	assert_eq!(replies[1]["error"]["code"], -32600);
 	assert_eq!(replies[2]["id"], 9);
 	assert_eq!(replies[2]["result"], json!({}));
+}
+
+#[test]
+#[cfg(unix)]
+fn listing_does_not_follow_a_final_symlink_out_of_the_roots() {
+	let mut f = Fixture::new(Approval::Terminal);
+	let outside = f.root.parent().unwrap().join("outside");
+	fs::create_dir(&outside).unwrap();
+	fs::write(outside.join("secret.txt"), "s").unwrap();
+	std::os::unix::fs::symlink(&outside, f.root.join("link")).unwrap();
+	let (v, err) = f.tool("list_directory", json!({ "path": f.root.join("link") }));
+	assert!(err && v.to_string().contains("symlink"), "{v}");
+	assert!(!v.to_string().contains("secret"));
 }

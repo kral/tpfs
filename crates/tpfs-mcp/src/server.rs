@@ -39,7 +39,7 @@ pub struct Server {
 
 impl Server {
 	pub fn new(config: Config) -> io::Result<Self> {
-		let validator = Validator::new(&config.roots)?;
+		let validator = Validator::new(&config.roots)?.with_protected([&config.state]);
 		let store = Store::new(&config.state);
 		Ok(Self { config, validator, store })
 	}
@@ -152,6 +152,11 @@ impl Server {
 		let path = args.get("path").and_then(Value::as_str).ok_or("'path' is required")?;
 		let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(500).clamp(1, 5000) as usize;
 		let dir = self.validator.check_path(Path::new(path))?;
+		// check_path allows a symlink as the last component (operations act on the link itself);
+		// listing would follow it out of the allowed folders.
+		if fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
+			return Err(format!("{} is a symlink; list the folder it points to only if that is allowed", show(&dir)));
+		}
 
 		let mut entries: Vec<(bool, String, u64)> = fs::read_dir(&dir)
 			.map_err(|e| format!("{}: {e}", show(&dir)))?
@@ -268,9 +273,11 @@ impl Server {
 	fn history(&mut self) -> Result<Value, String> {
 		let mut journal = self.journal()?;
 		let batches = journal.batches().map_err(|e| e.to_string())?;
+		// Only the agent's own batches: human batches name folders outside the agent's roots.
 		let recent: Vec<Value> = batches
 			.iter()
 			.rev()
+			.filter(|b| b.source == Source::Agent.as_str())
 			.take(20)
 			.map(|b| json!({ "batch": b.id, "source": b.source, "status": format!("{:?}", b.status), "steps": b.steps.len(), "reason": sanitize(b.reason.as_ref()) }))
 			.collect();

@@ -39,7 +39,16 @@ impl fmt::Display for Issue {
 #[derive(Clone, Debug)]
 pub struct Validator {
 	roots: Vec<PathBuf>,
+	protected: Vec<PathBuf>,
 	max_ops: usize,
+}
+
+/// Names tpfs uses for its own work inside user folders: local trash, partial copies, case renames.
+const OWN_PREFIXES: [&str; 3] = [".tpfs-trash-", ".tpfs-part-", ".tpfs-case-"];
+
+/// Whether a path name is one of tpfs's own work names.
+pub(crate) fn is_own_name(name: &std::ffi::OsStr) -> bool {
+	name.to_str().is_some_and(|n| OWN_PREFIXES.iter().any(|p| n.starts_with(p)))
 }
 
 impl Validator {
@@ -62,7 +71,31 @@ impl Validator {
 		if out.is_empty() {
 			return Err(io::Error::new(io::ErrorKind::InvalidInput, "at least one allowed root is required"));
 		}
-		Ok(Self { roots: out, max_ops: MAX_OPS })
+		Ok(Self { roots: out, protected: Vec::new(), max_ops: MAX_OPS })
+	}
+
+	/// Folders no plan may touch, read or contain: tpfs's state directory (journal, trash, pending
+	/// approvals). Without this an agent whose root contains the state could forge the journal or
+	/// approve its own plan.
+	pub fn with_protected<I, P>(mut self, paths: I) -> Self
+	where
+		I: IntoIterator<Item = P>,
+		P: AsRef<Path>,
+	{
+		for p in paths {
+			let p = p.as_ref();
+			// Both spellings: the one plans will use (canonical) and the one given.
+			for q in [crate::path::canonicalize(p).ok(), normalize(p)].into_iter().flatten() {
+				if !self.protected.contains(&q) {
+					self.protected.push(q);
+				}
+			}
+		}
+		self
+	}
+
+	pub fn protected(&self) -> &[PathBuf] {
+		&self.protected
 	}
 
 	/// Raise (or lower) the operation limit, for a plan the user built on purpose, such as a photo
@@ -74,6 +107,15 @@ impl Validator {
 
 	pub fn roots(&self) -> &[PathBuf] {
 		&self.roots
+	}
+
+	/// A source that would carry tpfs's state with it (moving, copying or trashing a folder that
+	/// contains the state directory).
+	fn holds_state(&self, path: &Path) -> Result<(), String> {
+		match self.protected.iter().find(|p| p.starts_with(path)) {
+			Some(p) => Err(format!("{} contains tpfs's state ({}); leave it out of the plan.", show(path), show(p))),
+			None => Ok(()),
+		}
 	}
 
 	fn root_of(&self, path: &Path) -> Option<&Path> {
@@ -122,6 +164,7 @@ impl Validator {
 					return Err(format!("Invalid file name: '{}'", sanitize(new_name.as_ref())));
 				}
 				let source = self.resolve(path)?;
+				self.holds_state(&source)?;
 				let parent = source.parent().ok_or("Cannot rename a file system root.")?;
 				let target = parent.join(new_name);
 				if target != source && same_file(&source, &target) && !sim.state.contains_key(&target) {
@@ -137,6 +180,7 @@ impl Validator {
 				if self.is_root(&path) {
 					return Err("Cannot trash an allowed root folder.".into());
 				}
+				self.holds_state(&path)?;
 				if !sim.exists(&path) {
 					return Err(format!("Does not exist: {}", show(&path)));
 				}
@@ -177,6 +221,7 @@ impl Validator {
 	fn transfer(&self, from: &Path, to: &Path, is_move: bool, sim: &mut Sim) -> Result<(), String> {
 		let from = self.resolve(from)?;
 		let to = self.resolve(to)?;
+		self.holds_state(&from)?;
 
 		if !sim.exists(&from) {
 			return Err(format!("Source does not exist: {}", show(&from)));
@@ -214,6 +259,15 @@ impl Validator {
 		if path.to_str().is_none() {
 			// The plan, its digest and the journal store paths as JSON strings.
 			return Err(format!("File names that are not valid Unicode are not supported yet: {}", show(&path)));
+		}
+		if path.components().any(|c| is_own_name(c.as_os_str())) {
+			return Err(format!("This is tpfs's own working data and cannot be changed by a plan: {}", show(&path)));
+		}
+		if self.protected.iter().any(|p| path.starts_with(p)) {
+			return Err(format!(
+				"This is tpfs's state (journal, trash, approvals) and cannot be part of a plan: {}",
+				show(&path)
+			));
 		}
 		let root = self.root_of(&path).ok_or_else(|| format!("Outside the allowed folders: {}", show(&path)))?;
 		match symlink_in_between(&path, root) {

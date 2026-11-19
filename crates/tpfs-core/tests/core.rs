@@ -540,3 +540,60 @@ fn non_unicode_names_are_rejected_without_a_panic() {
 	));
 	assert!(path.exists());
 }
+
+#[test]
+fn plans_cannot_touch_tpfs_state() {
+	let s = Sandbox::new();
+	let base = s.root.parent().unwrap().to_path_buf();
+	let mut j = s.journal(); // creates the state folder
+	let v = Validator::new([&base]).unwrap().with_protected([&s.state]);
+
+	let journal = s.state.join("journal.jsonl");
+	let evil = s.file("evil.jsonl", "forged");
+	for (plan, expect) in [
+		(vec![Op::Trash { path: journal.clone() }], "tpfs's state"),
+		(vec![Op::Copy { from: evil.clone(), to: s.state.join("pending.approved") }], "tpfs's state"),
+		(vec![Op::Mkdir { path: s.root.join(".tpfs-part-x") }], "own working data"),
+	] {
+		let plan = Plan::new(plan, "");
+		assert!(messages(&v, &plan)[0].contains(expect), "{:?}", messages(&v, &plan));
+	}
+
+	let keep = s.dir("keep");
+	let nested = Validator::new([&base]).unwrap().with_protected([keep.join("state")]);
+	let plan = Plan::new(vec![Op::Trash { path: keep.clone() }], "");
+	assert!(messages(&nested, &plan)[0].contains("contains tpfs's state"), "{:?}", messages(&nested, &plan));
+
+	// The executor protects its own state even when the caller's validator does not.
+	let plain = Validator::new([&base]).unwrap();
+	let plan = Plan::new(vec![Op::Trash { path: journal.clone() }], "");
+	assert!(matches!(
+		Executor::new(&plain, &mut j, s.trash()).execute(&plan, Source::Agent),
+		Err(ExecError::Rejected(_))
+	));
+	assert!(journal.exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn state_folder_must_be_private() {
+	use std::os::unix::fs::PermissionsExt;
+	let s = Sandbox::new();
+	fs::create_dir(&s.state).unwrap();
+	fs::set_permissions(&s.state, fs::Permissions::from_mode(0o777)).unwrap();
+	assert!(Journal::open(s.state.join("journal.jsonl")).is_err());
+
+	let real = s.root.parent().unwrap().join("real");
+	fs::create_dir(&real).unwrap();
+	fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+	let link = s.root.parent().unwrap().join("link");
+	std::os::unix::fs::symlink(&real, &link).unwrap();
+	assert!(Journal::open(link.join("journal.jsonl")).is_err());
+
+	// A journal that is a symlink is refused too.
+	let ok = s.root.parent().unwrap().join("ok");
+	fs::create_dir(&ok).unwrap();
+	fs::set_permissions(&ok, fs::Permissions::from_mode(0o700)).unwrap();
+	std::os::unix::fs::symlink(real.join("x"), ok.join("journal.jsonl")).unwrap();
+	assert!(Journal::open(ok.join("journal.jsonl")).is_err());
+}

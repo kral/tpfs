@@ -1,5 +1,5 @@
 use std::{
-	fs::{self, File, OpenOptions, TryLockError},
+	fs::{File, OpenOptions, TryLockError},
 	io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
 	path::{Path, PathBuf},
 };
@@ -111,9 +111,10 @@ pub struct Journal {
 impl Journal {
 	pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
 		let path = path.as_ref().to_path_buf();
-		if let Some(dir) = path.parent() {
-			create_private_dir(dir)?;
+		if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+			crate::path::private_dir(dir)?;
 		}
+		crate::path::check_private_file(&path)?;
 
 		let mut options = OpenOptions::new();
 		options.create(true).append(true).read(true);
@@ -282,14 +283,4 @@ fn parse_line(line: &str) -> Option<Entry> {
 	let (crc, json) = line.split_once(' ')?;
 	let crc = u32::from_str_radix(crc, 16).ok()?;
 	(crc32fast::hash(json.as_bytes()) == crc).then(|| serde_json::from_str(json).ok()).flatten()
-}
-
-fn create_private_dir(dir: &Path) -> io::Result<()> {
-	#[cfg(unix)]
-	{
-		use std::os::unix::fs::DirBuilderExt;
-		fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
-	}
-	#[cfg(not(unix))]
-	fs::create_dir_all(dir)
 }

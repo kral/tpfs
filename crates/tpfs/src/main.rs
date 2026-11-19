@@ -274,7 +274,8 @@ fn check(args: &Args, apply: bool) -> Result<ExitCode, String> {
 	if args.roots.is_empty() {
 		return Err("at least one --root <dir> is required".into());
 	}
-	let mut validator = Validator::new(&args.roots).map_err(|e| format!("invalid root: {e}"))?;
+	let mut validator =
+		Validator::new(&args.roots).map_err(|e| format!("invalid root: {e}"))?.with_protected([state_dir(args)?]);
 	if let Some(n) = args.max_ops {
 		// A big plan you made on purpose (a photo clean-up); agents keep the default limit.
 		if args.source == Source::Agent {
@@ -378,7 +379,7 @@ fn sync(args: &Args) -> Result<ExitCode, String> {
 		return Ok(ExitCode::SUCCESS);
 	}
 
-	let validator = Validator::new([&source, &target]).map_err(|e| e.to_string())?;
+	let validator = Validator::new([&source, &target]).map_err(|e| e.to_string())?.with_protected([state_dir(args)?]);
 	let Some((digest, level)) = present(&validator, &sp.plan, args.source) else { return Ok(ExitCode::from(3)) };
 	if !args.do_apply && args.approve.is_none() {
 		println!("Dry run. Apply with --apply, or non-interactively with --approve {digest}");
@@ -425,7 +426,8 @@ fn approve(args: &Args) -> Result<ExitCode, String> {
 		return Err("the stored plan was modified after it was proposed; reject it".into());
 	}
 
-	let validator = Validator::new(&pending.roots).map_err(|e| format!("invalid root: {e}"))?;
+	let validator =
+		Validator::new(&pending.roots).map_err(|e| format!("invalid root: {e}"))?.with_protected([state_dir(args)?]);
 	let issues = validator.validate(&pending.plan);
 	let risk = risk::assess(&pending.plan, Source::Agent);
 

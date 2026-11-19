@@ -103,13 +103,7 @@ fn check_id(id: &str) -> io::Result<&str> {
 }
 
 fn create_private_dir(dir: &Path) -> io::Result<()> {
-	#[cfg(unix)]
-	{
-		use std::os::unix::fs::DirBuilderExt;
-		fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
-	}
-	#[cfg(not(unix))]
-	fs::create_dir_all(dir)
+	tpfs_core::private_dir(dir)
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -118,6 +112,8 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 	options.write(true).create(true).truncate(true);
 	#[cfg(unix)]
 	std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+	// Never write through a planted symlink (e.g. an `.approved` file pointing at ~/.bashrc).
+	tpfs_core::check_private_file(path)?;
 	let mut f = options.open(path)?;
 	f.write_all(bytes)?;
 	f.sync_all()
