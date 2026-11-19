@@ -200,13 +200,10 @@ impl Validator {
 						rd.filter_map(Result::ok).any(|e| e.file_name() == std::ffi::OsStr::new(new_name))
 					})
 				};
-				let case_only = source.file_name().map(|n| n.to_string_lossy().to_lowercase())
-					== Some(new_name.to_lowercase())
-					&& !own_entry();
-				if target != source
-					&& case_only && same_file(&source, &target)
-					&& !sim.state.contains_key(&sim_key(&target))
-				{
+				let old_name = source.file_name().map(|n| n.to_string_lossy().to_lowercase());
+				let case_only = target != source && old_name == Some(new_name.to_lowercase()) && !own_entry();
+				let fold = case_only && same_file(&source, &target) && !sim.state.contains_key(&sim_key(&target));
+				if fold {
 					// Only the letter case differs, on a case-insensitive file system (a hard link
 					// under another name is a different entry, and goes the normal way).
 					check_names(&target)?;
