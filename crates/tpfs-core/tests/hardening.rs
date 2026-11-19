@@ -316,8 +316,10 @@ fn recover_leaves_a_target_that_is_not_ours() {
 /// descriptors and hold their lock.
 #[cfg(unix)]
 fn mkfifo(p: &Path) {
-	use rustix::fs::{CWD, FileType, Mode, mknodat};
-	mknodat(CWD, p, FileType::Fifo, Mode::from_raw_mode(0o600), 0).unwrap();
+	use std::os::unix::ffi::OsStrExt;
+	let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+	// SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+	assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
 }
 
 /// A regular file swapped for a FIFO after validation must not make the copy block forever,

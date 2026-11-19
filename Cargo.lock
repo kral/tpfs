@@ -947,6 +947,7 @@ name = "tpfs-core"
 version = "0.2.0"
 dependencies = [
  "crc32fast",
+ "libc",
  "rustix",
  "schemars",
  "serde",

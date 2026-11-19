@@ -158,8 +158,12 @@ fn refuses_to_copy_special_files() {
 	let s = Sandbox::new();
 	let fifo = s.root.join("pipe");
 	// mknodat, not a `mkfifo` process: a forked child briefly holds other tests' journal locks.
-	rustix::fs::mknodat(rustix::fs::CWD, &fifo, rustix::fs::FileType::Fifo, rustix::fs::Mode::from_raw_mode(0o600), 0)
-		.unwrap();
+	{
+		use std::os::unix::ffi::OsStrExt;
+		let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+		// SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+		assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+	}
 	let m = messages(&s.validator(), &Plan::new(vec![Op::Copy { from: fifo, to: s.root.join("copy") }], ""));
 	assert!(m.len() == 1 && m[0].contains("Special"), "{m:?}");
 }
