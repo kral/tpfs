@@ -112,6 +112,9 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
 		Some(Dialog::View { title, lines, offset }) => draw_view(f, main, title, lines, *offset),
 		None => {}
 	}
+	if let Some(r) = &app.running {
+		draw_running(f, r);
+	}
 }
 
 fn draw_panel(f: &mut Frame, panel: &mut Panel, area: Rect, active: bool, icons: bool) {
@@ -510,6 +513,32 @@ fn draw_sync(
 		lines,
 		if opts.mirror && opts.direction != Direction::Both { Color::Red } else { Color::Black },
 	);
+}
+
+/// Progress of an operation running on its own thread: steps done, a bar, and how to stop it.
+fn draw_running(f: &mut Frame, r: &crate::app::Running) {
+	use std::sync::atomic::Ordering;
+	let done = r.done.load(Ordering::Relaxed);
+	let width = (f.area().width as usize).saturating_sub(14).clamp(20, 60);
+	let mut lines =
+		vec![Line::styled(truncate_middle(&r.label, width), DIALOG.add_modifier(Modifier::BOLD)), Line::raw("")];
+	if let Some(filled) = (done.min(r.total) * width).checked_div(r.total) {
+		lines.push(Line::raw(format!("Step {} of {}", (done + 1).min(r.total), r.total)));
+		lines.push(Line::styled(
+			format!("{}{}", "█".repeat(filled), "░".repeat(width - filled)),
+			DIALOG.fg(Color::Cyan),
+		));
+	} else {
+		lines.push(Line::raw(format!("{done} step(s) done")));
+	}
+	lines.push(Line::raw(format!("{} s", r.started.elapsed().as_secs())));
+	lines.push(Line::raw(""));
+	lines.push(if r.cancel.load(Ordering::Relaxed) {
+		Line::styled("Stopping after the current step…", DIALOG.fg(Color::Red)).centered()
+	} else {
+		Line::raw("[ Esc: stop after the current step ]").centered()
+	});
+	dialog(f, " Working ", lines, Color::Black);
 }
 
 fn draw_drives(f: &mut Frame, panel: usize, items: &[std::path::PathBuf], cursor: usize) {

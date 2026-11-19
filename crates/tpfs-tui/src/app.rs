@@ -1,6 +1,11 @@
 use std::{
 	io,
 	path::PathBuf,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, AtomicUsize, Ordering},
+	},
+	thread::JoinHandle,
 	time::{Duration, Instant},
 };
 
@@ -39,6 +44,8 @@ pub(crate) enum Dialog {
 	/// F9 / Ctrl+Z: which batch would be undone (it may come from an agent or another terminal).
 	Undo {
 		batch: String,
+		/// Steps it reverts, for the progress shown while it runs.
+		steps: usize,
 		lines: Vec<String>,
 	},
 	/// Shift+F2: compare the two panels' folders and preview a sync before building the plan.
@@ -67,6 +74,19 @@ pub(crate) enum External {
 	Shell { command: String, cwd: PathBuf },
 }
 
+/// An operation running on its own thread, so the screen stays live and Esc can stop it.
+pub(crate) struct Running {
+	pub label: String,
+	/// Steps in all (0 when not known).
+	pub total: usize,
+	pub done: Arc<AtomicUsize>,
+	pub cancel: Arc<AtomicBool>,
+	pub started: Instant,
+	/// A plan's own marks in the panels are cleared when it finishes.
+	clears_marks: bool,
+	handle: JoinHandle<String>,
+}
+
 pub(crate) enum InputKind {
 	Mkdir,
 	Rename(PathBuf),
@@ -87,6 +107,7 @@ pub struct App {
 	/// Quick search: letters typed so far, when the last one came, and whether anything matched.
 	pub(crate) quick: Option<Quick>,
 	pub(crate) external: Option<External>,
+	pub(crate) running: Option<Running>,
 	pub(crate) icons: bool,
 	state: PathBuf,
 	validator: Validator,
@@ -123,6 +144,7 @@ impl App {
 			command: None,
 			quick: None,
 			external: None,
+			running: None,
 			icons,
 			state,
 			validator,
@@ -141,6 +163,15 @@ impl App {
 
 	pub fn on_key(&mut self, key: KeyEvent) {
 		if key.kind == KeyEventKind::Release {
+			return;
+		}
+		// While an operation runs, only stopping it is possible.
+		if let Some(r) = &self.running {
+			if key.code == KeyCode::Esc
+				|| (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+			{
+				r.cancel.store(true, Ordering::Relaxed);
+			}
 			return;
 		}
 		if self.dialog.is_some() {
@@ -350,7 +381,7 @@ impl App {
 				self.dialog = Some(Dialog::View { title, lines, offset });
 			}
 			(Some(Dialog::Help), _) => {}
-			(Some(Dialog::Undo { batch, .. }), KeyCode::Char('y' | 'Y')) => self.do_undo(&batch),
+			(Some(Dialog::Undo { batch, steps, .. }), KeyCode::Char('y' | 'Y')) => self.do_undo(&batch, steps),
 			(Some(d @ Dialog::Undo { .. }), _) => self.dialog = Some(d),
 			(Some(Dialog::Sync { cmp, mut opts, offset }), code) => {
 				use tpfs_core::sync::{Direction::*, sync_plan};
@@ -542,17 +573,60 @@ impl App {
 	}
 
 	fn execute(&mut self, plan: &Plan) {
-		let result = self.journal().and_then(|mut j| {
-			Executor::new(&self.validator(), &mut j, self.state.join("trash"))
-				.execute(plan, Source::Human)
-				.map(|b| {
-					format!("{}: done, {} step(s). Ctrl+Z to undo.", tpfs_core::sanitize(plan.reason.as_ref()), b.steps)
-				})
-				.map_err(|e| one_line(&e))
+		let reason = tpfs_core::sanitize(plan.reason.as_ref());
+		let (validator, state, plan) = (self.validator(), self.state.clone(), plan.clone());
+		let label = if reason.is_empty() { "Working".to_owned() } else { reason.clone() };
+		self.start(label, plan.ops.len(), true, move |done, cancel| {
+			let result = Journal::open(state.join("journal.jsonl")).map_err(|e| e.to_string()).and_then(|mut j| {
+				Executor::new(&validator, &mut j, state.join("trash"))
+					.on_step_done(move |n| done.store(n, Ordering::Relaxed))
+					.cancel_on(cancel)
+					.execute(&plan, Source::Human)
+					.map(|b| format!("{reason}: done, {} step(s). Ctrl+Z to undo.", b.steps))
+					.map_err(|e| match e {
+						ExecError::Cancelled { .. } => format!("Stopped: {}", one_line(&e)),
+						e => format!("{reason} failed: {}", one_line(&e)),
+					})
+			});
+			result.unwrap_or_else(|e| e)
 		});
-		self.status = result.unwrap_or_else(|e| format!("{} failed: {e}", tpfs_core::sanitize(plan.reason.as_ref())));
-		self.panels.iter_mut().for_each(|p| p.marked.clear());
-		self.reload();
+	}
+
+	/// Run `work` on its own thread; [`App::tick`] picks up its result (the new status).
+	fn start(
+		&mut self,
+		label: String,
+		total: usize,
+		clears_marks: bool,
+		work: impl FnOnce(Arc<AtomicUsize>, Arc<AtomicBool>) -> String + Send + 'static,
+	) {
+		let (done, cancel) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicBool::new(false)));
+		let (d, c) = (done.clone(), cancel.clone());
+		let handle = std::thread::spawn(move || work(d, c));
+		self.running = Some(Running { label, total, done, cancel, started: Instant::now(), clears_marks, handle });
+	}
+
+	/// Called by the event loop: when the running operation has finished, show its outcome.
+	pub(crate) fn tick(&mut self) {
+		if self.running.as_ref().is_some_and(|r| r.handle.is_finished())
+			&& let Some(r) = self.running.take()
+		{
+			self.status =
+				r.handle.join().unwrap_or_else(|_| "The operation stopped unexpectedly; see `tpfs log`.".into());
+			if r.clears_marks {
+				self.panels.iter_mut().for_each(|p| p.marked.clear());
+			}
+			self.reload();
+		}
+	}
+
+	/// Wait for the running operation (tests).
+	#[cfg(test)]
+	pub(crate) fn wait(&mut self) {
+		while self.running.is_some() {
+			std::thread::sleep(Duration::from_millis(5));
+			self.tick();
+		}
 	}
 
 	/// Show what Undo would revert and ask first: the newest batch may not be this session's.
@@ -595,29 +669,37 @@ impl App {
 				if steps.len() > 12 {
 					lines.push(format!("… and {} more", steps.len() - 12));
 				}
-				self.dialog = Some(Dialog::Undo { batch: b.id, lines });
+				self.dialog = Some(Dialog::Undo { batch: b.id, steps: steps.len(), lines });
 			}
 		}
 	}
 
 	/// Undo, if the newest batch is still the one the user just looked at.
-	fn do_undo(&mut self, expected: &str) {
-		let result = self.journal().and_then(|mut j| {
-			let newest =
-				j.batches().map_err(|e| e.to_string())?.into_iter().rev().find(|b| b.status == BatchStatus::Committed);
-			if newest.is_none_or(|b| b.id != expected) {
-				return Err("the history changed meanwhile; press Undo again to see what it would revert".into());
-			}
-			Executor::new(&self.validator(), &mut j, self.state.join("trash"))
-				.undo_batch(expected)
-				.map(|b| match b {
-					Some(b) => format!("Undone batch {}: {} step(s).", tpfs_core::sanitize(b.id.as_ref()), b.steps),
-					None => "Nothing to undo.".into(),
-				})
-				.map_err(|e| one_line(&e))
+	fn do_undo(&mut self, expected: &str, steps: usize) {
+		let (validator, state, expected) = (self.validator(), self.state.clone(), expected.to_owned());
+		self.start("Undo".into(), steps, false, move |done, cancel| {
+			let result = Journal::open(state.join("journal.jsonl")).map_err(|e| e.to_string()).and_then(|mut j| {
+				let newest = j
+					.batches()
+					.map_err(|e| e.to_string())?
+					.into_iter()
+					.rev()
+					.find(|b| b.status == BatchStatus::Committed);
+				if newest.is_none_or(|b| b.id != expected) {
+					return Err("the history changed meanwhile; press Undo again to see what it would revert".into());
+				}
+				Executor::new(&validator, &mut j, state.join("trash"))
+					.on_step_done(move |n| done.store(n, Ordering::Relaxed))
+					.cancel_on(cancel)
+					.undo_batch(&expected)
+					.map(|b| match b {
+						Some(b) => format!("Undone batch {}: {} step(s).", tpfs_core::sanitize(b.id.as_ref()), b.steps),
+						None => "Nothing to undo.".into(),
+					})
+					.map_err(|e| one_line(&e))
+			});
+			result.unwrap_or_else(|e| format!("Undo failed: {e}"))
 		});
-		self.status = result.unwrap_or_else(|e| format!("Undo failed: {e}"));
-		self.reload();
 	}
 
 	fn reload(&mut self) {
@@ -643,6 +725,9 @@ impl App {
 	}
 
 	pub fn on_mouse(&mut self, m: MouseEvent) {
+		if self.running.is_some() {
+			return; // only Esc does anything while an operation runs
+		}
 		if let Some(Dialog::View { offset, lines, .. }) = &mut self.dialog {
 			match m.kind {
 				MouseEventKind::ScrollUp => *offset = offset.saturating_sub(3),
@@ -769,11 +854,13 @@ mod tests {
 	fn key(app: &mut App, code: KeyCode) {
 		render(app, 100, 30);
 		app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+		app.wait();
 	}
 
 	fn ctrl(app: &mut App, c: char) {
 		render(app, 100, 30);
 		app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+		app.wait();
 	}
 
 	fn select(app: &mut App, name: &str) {
@@ -1122,6 +1209,38 @@ mod tests {
 		}
 	}
 
+	/// While an operation runs, the screen shows its progress, other keys and the mouse do
+	/// nothing, and Esc asks it to stop; its outcome becomes the status.
+	#[test]
+	fn a_running_operation_shows_progress_and_stops_on_esc() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+		fs::create_dir_all(base.join("l")).unwrap();
+		let mut app = App::new(base.join("l"), base.join("l"), base.join("state"), false).unwrap();
+		app.start("Copy big folder".into(), 4, false, |done, cancel| {
+			done.store(1, Ordering::Relaxed);
+			while !cancel.load(Ordering::Relaxed) {
+				std::thread::sleep(Duration::from_millis(2));
+			}
+			"Stopped: as asked".into()
+		});
+		while app.running.as_ref().is_some_and(|r| r.done.load(Ordering::Relaxed) == 0) {
+			std::thread::sleep(Duration::from_millis(2));
+		}
+		let screen = render(&mut app, 80, 24);
+		assert!(
+			screen.contains("Copy big folder") && screen.contains("Step 2 of 4") && screen.contains("Esc"),
+			"{screen}"
+		);
+		app.on_key(KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE));
+		app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+		assert!(app.dialog.is_none() && !app.quit && app.running.is_some());
+		app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+		assert!(render(&mut app, 80, 24).contains("Stopping"));
+		app.wait();
+		assert_eq!(app.status, "Stopped: as asked");
+	}
+
 	#[test]
 	fn a_new_folder_name_cannot_point_elsewhere() {
 		let tmp = tempfile::TempDir::new().unwrap();
@@ -1134,6 +1253,7 @@ mod tests {
 		}
 		assert!(!base.join("escaped").exists() && !base.join("l/a").exists());
 		app.submit_input("fine", &InputKind::Mkdir);
+		app.wait();
 		assert!(base.join("l/fine").is_dir());
 	}
 
@@ -1166,6 +1286,7 @@ mod tests {
 		let mut app = App::new(base.join("l"), base.join("l"), base.join("state"), false).unwrap();
 		let ops: Vec<Op> = (0..20).map(|i| Op::Mkdir { path: base.join(format!("l/d{i:02}")) }).collect();
 		app.execute(&Plan::new(ops, "many"));
+		app.wait();
 		app.undo();
 		assert!(matches!(app.dialog, Some(Dialog::Undo { .. })));
 		for (w, h) in [(80, 24), (80, 16), (60, 12)] {

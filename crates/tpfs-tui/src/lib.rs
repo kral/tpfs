@@ -49,11 +49,16 @@ pub fn run(left: PathBuf, right: PathBuf, state: PathBuf, options: Options) -> i
 	let result = (|| -> io::Result<()> {
 		while !app.quit {
 			terminal.draw(|f| ui::draw(f, &mut app))?;
-			match event::read()? {
-				Event::Key(key) => app.on_key(key),
-				Event::Mouse(mouse) => app.on_mouse(mouse),
-				_ => {}
+			// While an operation runs on its own thread, redraw its progress a few times a second.
+			let ready = app.running.is_none() || event::poll(std::time::Duration::from_millis(150))?;
+			if ready {
+				match event::read()? {
+					Event::Key(key) => app.on_key(key),
+					Event::Mouse(mouse) => app.on_mouse(mouse),
+					_ => {}
+				}
 			}
+			app.tick();
 
 			if let Some(external) = app.external.take() {
 				let _ = execute!(io::stdout(), DisableMouseCapture);

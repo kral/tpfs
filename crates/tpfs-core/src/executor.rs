@@ -39,6 +39,9 @@ pub enum ExecError {
 	Blocked(String),
 	/// Undo of `batch` stopped; the steps reverted so far stay reverted and `undo` resumes there.
 	Undo { batch: String, error: String },
+	/// Stopped on request (see [`Executor::cancel_on`]) before step `step`; the steps before it
+	/// were rolled back (errors listed if rollback was incomplete).
+	Cancelled { step: usize, rollback_errors: Vec<String> },
 	/// The journal could not be written; execution stopped before touching the disk further.
 	Journal(io::Error),
 }
@@ -65,6 +68,19 @@ impl fmt::Display for ExecError {
 			ExecError::Undo { batch, error } => {
 				write!(f, "cannot undo batch {}: {error}", crate::sanitize(batch.as_ref()))
 			}
+			ExecError::Cancelled { step, rollback_errors } if rollback_errors.is_empty() => {
+				write!(
+					f,
+					"stopped on request before step #{}; nothing was changed (earlier steps were rolled back)",
+					step + 1
+				)
+			}
+			ExecError::Cancelled { step, rollback_errors } => write!(
+				f,
+				"stopped on request before step #{}; rollback was incomplete: {} — fix the cause, then run `tpfs recover`",
+				step + 1,
+				rollback_errors.join("; ")
+			),
 			ExecError::Blocked(why) => f.write_str(why),
 			ExecError::Journal(e) => write!(f, "journal error: {e}"),
 		}
@@ -100,6 +116,10 @@ pub struct Executor<'a> {
 	journal: &'a mut Journal,
 	trash: PathBuf,
 	hook: Option<Box<dyn FnMut(usize, Phase) + 'a>>,
+	/// Called with the number of steps done (or undone) so far, after each one.
+	progress: Option<Box<dyn FnMut(usize) + 'a>>,
+	/// Set by another thread to stop before the next step (see [`Executor::cancel_on`]).
+	cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Test hook phases: right before a step touches the disk (after its re-check and intent record),
@@ -121,7 +141,7 @@ impl<'a> Executor<'a> {
 		let trash = absolute_real(&trash.into());
 		let state = journal.path().parent().map(Path::to_path_buf);
 		let validator = validator.clone().with_protected(state.into_iter().chain([trash.clone()]));
-		Self { validator, journal, trash, hook: None }
+		Self { validator, journal, trash, hook: None, progress: None, cancel: None }
 	}
 
 	/// Test hook (feature `test-support`), to simulate another program changing the file system
@@ -131,18 +151,29 @@ impl<'a> Executor<'a> {
 		self.set_hook(hook)
 	}
 
+	#[cfg(feature = "test-support")]
 	fn set_hook(mut self, hook: impl FnMut(usize, Phase) + 'a) -> Self {
 		self.hook = Some(Box::new(hook));
 		self
 	}
 
-	/// Progress: called with the number of steps done after each step that changed the disk.
-	pub fn on_step_done(self, mut f: impl FnMut(usize) + 'a) -> Self {
-		self.set_hook(move |i, phase| {
-			if phase == Phase::AfterApply {
-				f(i + 1)
-			}
-		})
+	/// Progress: called with the number of steps done (by `execute`) or reverted (by undo) so far,
+	/// after each one is journaled.
+	pub fn on_step_done(mut self, f: impl FnMut(usize) + 'a) -> Self {
+		self.progress = Some(Box::new(f));
+		self
+	}
+
+	/// Stop when `flag` is set, before the next step: `execute` then rolls the batch back (a batch
+	/// is all or nothing) and returns [`ExecError::Cancelled`]; an undo keeps what it reverted and
+	/// returns [`ExecError::Undo`] — undo again to finish it. A step already running is finished.
+	pub fn cancel_on(mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+		self.cancel = Some(flag);
+		self
+	}
+
+	fn cancelled(&self) -> bool {
+		self.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
 	}
 
 	/// Test hook (feature `test-support`) that runs only before a step touches the disk.
@@ -199,6 +230,10 @@ impl<'a> Executor<'a> {
 		for (i, op) in resolved.ops.iter().enumerate() {
 			// Re-check this step against the disk as it is right now: earlier steps are already
 			// applied, and the world may have changed since the plan was validated.
+			if self.cancelled() {
+				let rollback_errors = self.roll_back(&batch)?;
+				return Err(ExecError::Cancelled { step: i, rollback_errors });
+			}
 			let recheck = self.validator.validate(&Plan::new(vec![op.clone()], ""));
 			let inverse = self.inverse(op, &batch, i);
 
@@ -252,6 +287,9 @@ impl<'a> Executor<'a> {
 					};
 					self.journal.write(&Entry::Done { batch: batch.clone(), index: i, check, mode })?;
 					applied.push(inverse);
+					if let Some(progress) = &mut self.progress {
+						progress(i + 1);
+					}
 				}
 				Err(error) => {
 					// Clean up what this step may have left, judged from the disk and from whether its
@@ -354,11 +392,19 @@ impl<'a> Executor<'a> {
 		let mut reverted = 0;
 		for step in batch.steps.iter().rev().filter(|s| s.done && !s.undone) {
 			let fail = |error: String| ExecError::Undo { batch: batch.id.clone(), error };
+			if self.cancelled() {
+				return Err(fail(format!(
+					"stopped on request after {reverted} step(s); they stay reverted, and undo again finishes the batch"
+				)));
+			}
 			self.check_journaled(&step.inverse).map_err(fail)?;
 			self.copy_unchanged(step, &batch.id, "undo").map_err(fail)?;
 			self.replay(&fs, &batch.id, "undo", step).map_err(|e| fail(clean(format!("{}: {e}", step.inverse))))?;
 			self.journal.write(&Entry::UndoStep { batch: batch.id.clone(), index: step.index })?;
 			reverted += 1;
+			if let Some(progress) = &mut self.progress {
+				progress(reverted);
+			}
 		}
 
 		self.journal.write(&Entry::Undo { batch: batch.id.clone() })?;
@@ -1368,6 +1414,56 @@ mod tests {
 			}
 			assert_eq!(fs::read_to_string(slot.join("b")).unwrap(), "B");
 		}
+	}
+
+	/// Progress counts each step; a cancel request stops before the next step and rolls the batch
+	/// back (all or nothing), and a cancelled undo keeps what it reverted and finishes when run again.
+	#[test]
+	fn progress_and_cancel() {
+		use std::sync::{
+			Arc,
+			atomic::{AtomicBool, Ordering},
+		};
+		let tmp = tempfile::TempDir::new().unwrap();
+		let base = crate::path::canonicalize(tmp.path()).unwrap();
+		let root = base.join("root");
+		fs::create_dir_all(&root).unwrap();
+		let v = Validator::new([&root]).unwrap();
+		let trash = base.join("state").join("trash");
+		let mut j = Journal::open(base.join("state").join("journal.jsonl")).unwrap();
+		let plan = Plan::new((0..3).map(|i| Op::Mkdir { path: root.join(format!("d{i}")) }).collect(), "");
+
+		let mut seen = Vec::new();
+		Executor::new(&v, &mut j, &trash).on_step_done(|n| seen.push(n)).execute(&plan, Source::Human).unwrap();
+		assert_eq!(seen, [1, 2, 3]);
+		Executor::new(&v, &mut j, &trash).undo_last().unwrap();
+
+		let stop = Arc::new(AtomicBool::new(false));
+		let flag = stop.clone();
+		let err = Executor::new(&v, &mut j, &trash)
+			.cancel_on(stop.clone())
+			.on_step_done(move |n| flag.store(n == 1, Ordering::Relaxed))
+			.execute(&plan, Source::Human)
+			.unwrap_err();
+		assert!(
+			matches!(err, ExecError::Cancelled { step: 1, ref rollback_errors } if rollback_errors.is_empty()),
+			"{err}"
+		);
+		assert!((0..3).all(|i| !root.join(format!("d{i}")).exists()));
+		assert_eq!(j.batches().unwrap().last().unwrap().status, BatchStatus::Aborted);
+
+		Executor::new(&v, &mut j, &trash).execute(&plan, Source::Human).unwrap();
+		let flag = stop.clone();
+		stop.store(false, Ordering::Relaxed);
+		let err = Executor::new(&v, &mut j, &trash)
+			.cancel_on(stop.clone())
+			.on_step_done(move |n| flag.store(n == 1, Ordering::Relaxed))
+			.undo_last()
+			.unwrap_err();
+		assert!(err.to_string().contains("stopped on request after 1 step"), "{err}");
+		assert_eq!((0..3).filter(|i| root.join(format!("d{i}")).exists()).count(), 2);
+		assert_eq!(Executor::new(&v, &mut j, &trash).undo_last().unwrap().unwrap().steps, 2);
+		assert!((0..3).all(|i| !root.join(format!("d{i}")).exists()));
 	}
 
 	/// What changed on disk after validation is caught by each step's own re-check, even where no
