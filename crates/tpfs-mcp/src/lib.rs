@@ -9,4 +9,4 @@ mod server;
 mod store;
 
 pub use server::{Approval, Config, MAX_MESSAGE, PROTOCOL_VERSION, Server};
-pub use store::{Pending, Store};
+pub use store::{MAX_PENDING, Pending, Store};

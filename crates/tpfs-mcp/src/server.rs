@@ -111,6 +111,12 @@ impl Server {
 		let params = message.get("params").cloned().unwrap_or(Value::Null);
 
 		let id = id?; // notifications (e.g. notifications/initialized) are not answered
+		if id.is_null() || !(id.is_string() || id.is_number()) {
+			return Some(rpc_error(Value::Null, -32600, "invalid request: 'id' must be a string or a number"));
+		}
+		if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+			return Some(rpc_error(id, -32600, "invalid request: 'jsonrpc' must be \"2.0\""));
+		}
 		let result = match method {
 			"initialize" => Ok(self.initialize(&params)),
 			"ping" => Ok(json!({})),
@@ -152,6 +158,20 @@ impl Server {
 	fn call_tool(&mut self, params: &Value) -> Result<Value, (i64, String)> {
 		let name = params.get("name").and_then(Value::as_str).ok_or((-32602, "missing tool name".to_owned()))?;
 		let args = params.get("arguments").cloned().unwrap_or(json!({}));
+		let allowed: &[&str] = match name {
+			"list_directory" => &["path", "limit"],
+			"propose_plan" => &["plan"],
+			"apply_plan" => &["planId"],
+			"undo_last" | "history" => &[],
+			_ => return Err((-32602, format!("unknown tool: {name}"))),
+		};
+		let Some(obj) = args.as_object() else {
+			return Ok(tool_result(&json!({ "error": "'arguments' must be an object" }), true));
+		};
+		if let Some(extra) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
+			let msg = format!("unknown argument '{extra}' for {name} (it has: {})", allowed.join(", "));
+			return Ok(tool_result(&json!({ "error": msg }), true));
+		}
 		let outcome = match name {
 			"list_directory" => self.list_directory(&args),
 			"propose_plan" => self.propose_plan(&args),
@@ -161,7 +181,11 @@ impl Server {
 			_ => return Err((-32602, format!("unknown tool: {name}"))),
 		};
 		Ok(match outcome {
-			Ok(v) => tool_result(&v, false),
+			// An invalid plan is reported as a tool error so every client shows it to the model.
+			Ok(v) => {
+				let invalid = v.get("valid") == Some(&Value::Bool(false));
+				tool_result(&v, invalid)
+			}
 			Err(e) => tool_result(&json!({ "error": e }), true),
 		})
 	}
@@ -225,10 +249,14 @@ impl Server {
 		let risk = risk::assess(&plan, Source::Agent);
 		let preview = plan.preview();
 		if !issues.is_empty() {
+			// An error result, so clients surface it; the preview is cut short to spare context.
+			let shown: Vec<&String> = preview.iter().take(20).collect();
+			let issues: Vec<String> = issues.iter().take(50).map(ToString::to_string).collect();
 			return Ok(json!({
 				"valid": false,
-				"issues": issues.iter().map(ToString::to_string).collect::<Vec<_>>(),
-				"preview": preview,
+				"issues": issues,
+				"preview": shown,
+				"previewTruncated": preview.len() > 20,
 			}));
 		}
 
@@ -320,7 +348,7 @@ impl Server {
 			.rev()
 			.filter(|b| b.source == Source::Agent.as_str())
 			.take(20)
-			.map(|b| json!({ "batch": b.id, "at": b.at, "source": b.source, "status": format!("{:?}", b.status), "steps": b.steps.len(), "reason": sanitize(b.reason.as_ref()) }))
+			.map(|b| json!({ "batch": b.id, "at": b.at, "source": b.source, "status": status_word(b.status, b.damaged), "steps": b.steps.len(), "reason": sanitize(b.reason.as_ref()) }))
 			.collect();
 		Ok(json!({ "batches": recent }))
 	}
@@ -341,6 +369,7 @@ fn tools() -> Value {
 		"type": "object",
 		"properties": { "plan": plan_schema },
 		"required": ["plan"],
+		"additionalProperties": false,
 	});
 	if let Some(defs) = defs {
 		propose_schema["$defs"] = defs; // references like #/$defs/Op resolve against the root
@@ -356,7 +385,8 @@ fn tools() -> Value {
 					"path": { "type": "string", "description": "Absolute path." },
 					"limit": { "type": "integer", "minimum": 1, "maximum": 5000, "description": "Maximum entries (default 500)." }
 				},
-				"required": ["path"]
+				"required": ["path"],
+				"additionalProperties": false
 			},
 			"annotations": { "readOnlyHint": true, "openWorldHint": false }
 		},
@@ -364,7 +394,7 @@ fn tools() -> Value {
 			"name": "propose_plan",
 			"description": "Validate a plan of file operations WITHOUT executing it. Returns a preview, the risk, and a planId. Paths are absolute; for move/copy 'to' is the full destination path. There is no permanent delete: use 'trash'.",
 			"inputSchema": propose_schema,
-			"annotations": { "readOnlyHint": true, "openWorldHint": false }
+			"annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
 		},
 		{
 			"name": "apply_plan",
@@ -372,6 +402,7 @@ fn tools() -> Value {
 			"inputSchema": {
 				"type": "object",
 				"properties": { "planId": { "type": "string", "description": "The planId returned by propose_plan." } },
+				"additionalProperties": false,
 				"required": ["planId"]
 			},
 			"annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false }
@@ -379,16 +410,29 @@ fn tools() -> Value {
 		{
 			"name": "undo_last",
 			"description": "Revert the most recent batch, if it was made by an agent.",
-			"inputSchema": { "type": "object", "properties": {} },
+			"inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
 			"annotations": { "readOnlyHint": false, "destructiveHint": true, "openWorldHint": false }
 		},
 		{
 			"name": "history",
-			"description": "Your recent batches (agent batches only): id, time (Unix seconds), status, number of steps, reason.",
-			"inputSchema": { "type": "object", "properties": {} },
+			"description": "Your recent batches (agent batches only): id, time (Unix seconds), status (committed, rolled back, undone, interrupted), number of steps, reason.",
+			"inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
 			"annotations": { "readOnlyHint": true, "openWorldHint": false }
 		}
 	])
+}
+
+fn status_word(s: BatchStatus, damaged: bool) -> &'static str {
+	if damaged {
+		return "damaged";
+	}
+	match s {
+		BatchStatus::Committed => "committed",
+		BatchStatus::Aborted => "rolled back",
+		BatchStatus::Undone => "undone",
+		BatchStatus::Incomplete => "interrupted",
+		_ => "unknown",
+	}
 }
 
 fn tool_result(payload: &Value, is_error: bool) -> Value {

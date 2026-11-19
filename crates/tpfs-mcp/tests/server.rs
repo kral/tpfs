@@ -126,7 +126,7 @@ fn invalid_plans_and_paths_are_reported_not_stored() {
 	let mut f = Fixture::new(Approval::Terminal);
 	let outside = f.root.parent().unwrap().join("outside.txt");
 	let (v, err) = f.tool("propose_plan", json!({ "plan": { "ops": [{ "op": "trash", "path": outside }] } }));
-	assert!(!err && v["valid"] == false, "{v}");
+	assert!(err && v["valid"] == false, "{v}");
 	assert!(v["issues"][0].as_str().unwrap().contains("Outside"));
 
 	let (v, err) = f.tool("list_directory", json!({ "path": f.root.parent().unwrap() }));
@@ -277,7 +277,82 @@ fn an_agent_cannot_raise_the_operation_limit() {
 	let ops: Vec<Value> =
 		(0..=tpfs_core::MAX_OPS).map(|i| json!({ "op": "mkdir", "path": f.root.join(format!("d{i}")) })).collect();
 	let (v, err) = f.tool("propose_plan", json!({ "plan": { "ops": ops } }));
-	assert!(!err && v["valid"] == false, "{}", &v.to_string()[..200.min(v.to_string().len())]);
+	assert!(err && v["valid"] == false, "{}", &v.to_string()[..200.min(v.to_string().len())]);
 	assert!(v["issues"][0].as_str().unwrap().contains("Too many"));
 	assert!(f.server.store().list().unwrap().is_empty(), "an invalid plan is not stored");
+}
+
+#[test]
+fn strict_requests_and_arguments() {
+	let mut f = Fixture::new(Approval::Terminal);
+	assert_eq!(f.server.handle(r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#).unwrap()["error"]["code"], -32600);
+	assert_eq!(f.server.handle(r#"{"id":11,"method":"ping"}"#).unwrap()["error"]["code"], -32600);
+	for (tool, args) in [
+		("list_directory", json!({ "path": f.root, "recursive": true })),
+		("history", json!({ "bogus": 1 })),
+		("undo_last", json!({ "all": true })),
+	] {
+		let (v, err) = f.tool(tool, args);
+		assert!(err && v["error"].as_str().unwrap().contains("unknown argument"), "{tool}: {v}");
+	}
+}
+
+#[test]
+fn polling_until_a_human_approves() {
+	let mut f = Fixture::new(Approval::Terminal);
+	let dir = f.root.join("d");
+	let id = f.propose(json!({ "ops": [{ "op": "mkdir", "path": dir }] }));
+	for _ in 0..2 {
+		let (v, err) = f.tool("apply_plan", json!({ "planId": id }));
+		assert!(err && v["error"].as_str().unwrap().contains("not approved yet"), "{v}");
+	}
+	let pending = f.server.store().get(&id).unwrap();
+	f.server.store().approve(&pending).unwrap();
+	let (v, err) = f.tool("apply_plan", json!({ "planId": id }));
+	assert!(!err && dir.is_dir(), "{v}");
+	let (v, err) = f.tool("apply_plan", json!({ "planId": id }));
+	assert!(err, "an approval is for one execution: {v}");
+}
+
+#[test]
+fn the_number_of_waiting_plans_is_limited() {
+	let mut f = Fixture::new(Approval::Terminal);
+	for i in 0..tpfs_mcp::MAX_PENDING {
+		f.propose(json!({ "ops": [{ "op": "mkdir", "path": f.root.join(format!("d{i}")) }] }));
+	}
+	let (v, err) =
+		f.tool("propose_plan", json!({ "plan": { "ops": [{ "op": "mkdir", "path": f.root.join("one-more") }] } }));
+	assert!(err && v["error"].as_str().unwrap().contains("too many plans"), "{v}");
+}
+
+/// The real binary over stdio: only protocol on stdout, a clean exit at the end of input.
+#[test]
+fn the_tpfs_mcp_binary_speaks_only_json_rpc_on_stdout() {
+	let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/tpfs");
+	if !bin.exists() {
+		return; // built by the workspace test run; skipped when testing this crate alone
+	}
+	let f = Fixture::new(Approval::Terminal);
+	let mut child = std::process::Command::new(bin)
+		.args(["mcp", "--root", f.root.to_str().unwrap()])
+		.env("TPFS_HOME", &f.state)
+		.stdin(std::process::Stdio::piped())
+		.stdout(std::process::Stdio::piped())
+		.stderr(std::process::Stdio::piped())
+		.spawn()
+		.unwrap();
+	use std::io::Write;
+	let mut stdin = child.stdin.take().unwrap();
+	stdin
+		.write_all(
+			b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}",
+		)
+		.unwrap();
+	drop(stdin);
+	let out = child.wait_with_output().unwrap();
+	assert!(out.status.success());
+	let lines: Vec<Value> =
+		String::from_utf8(out.stdout).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+	assert_eq!(lines.len(), 2, "the last line without a newline is answered too");
+	assert!(String::from_utf8_lossy(&out.stderr).contains("serving on stdio"));
 }
