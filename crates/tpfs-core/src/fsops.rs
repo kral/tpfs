@@ -756,7 +756,12 @@ mod confined {
 
 		let (dfd, dname) = side(&dst, to);
 		let create = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-		let dst = openat(dfd, dname, create, Mode::from_raw_mode((meta.permissions().mode() & 0o7777) as rustix::fs::RawMode))?;
+		let dst = openat(
+			dfd,
+			dname,
+			create,
+			Mode::from_raw_mode((meta.permissions().mode() & 0o7777) as rustix::fs::RawMode),
+		)?;
 
 		Ok(Some((File::from(src), File::from(dst))))
 	}
@@ -805,7 +810,7 @@ mod windows {
 	}
 
 	fn wide(p: &Path) -> Vec<u16> {
-		p.as_os_str().encode_wide().chain(Some(0)).collect()
+		crate::path::win_api_path(p).encode_wide().chain(Some(0)).collect()
 	}
 
 	/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` (fails with ERROR_ALREADY_EXISTS) and without

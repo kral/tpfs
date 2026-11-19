@@ -280,7 +280,7 @@ fn run(args: Args) -> Res {
 		"sync" => sync(&args),
 		"undo" => {
 			let (mut journal, trash) = open_state(&args)?;
-			let validator = any_validator(&args)?;
+			let validator = any_validator(&args, &mut journal)?;
 			let last = journal
 				.batches()
 				.map_err(|e| e.to_string())?
@@ -344,7 +344,7 @@ fn run(args: Args) -> Res {
 		}
 		"recover" => {
 			let (mut journal, trash) = open_state(&args)?;
-			let validator = any_validator(&args)?;
+			let validator = any_validator(&args, &mut journal)?;
 			let report = Executor::new(&validator, &mut journal, trash).recover().map_err(|e| e.to_string())?;
 			println!("Rolled back {} interrupted batch(es).", report.rolled_back.len());
 			for e in &report.errors {
@@ -673,8 +673,22 @@ fn open_state(args: &Args) -> Result<(Journal, PathBuf), String> {
 	Ok((journal, dir.join("trash")))
 }
 
-/// Undo and recovery replay what the journal recorded anywhere the user works; below every
-/// system root they still refuse symlinks, and tpfs's own state stays protected.
-fn any_validator(args: &Args) -> Result<Validator, String> {
-	Ok(Validator::new(tpfs_core::system_roots()).map_err(|e| e.to_string())?.with_protected([state_dir(args)?]))
+/// Undo and recovery replay what the journal recorded anywhere the user works: every drive or
+/// `/`, plus (Windows) the network shares the journal names. Below them symlinks are still refused,
+/// and tpfs's own state stays protected.
+fn any_validator(args: &Args, journal: &mut Journal) -> Result<Validator, String> {
+	let mut roots = tpfs_core::system_roots();
+	for b in journal.batches().map_err(|e| e.to_string())? {
+		for step in &b.steps {
+			for p in step.forward.paths().into_iter().chain(step.inverse.paths()) {
+				if let Some(share) = tpfs_core::share_root(p)
+					&& !roots.contains(&share)
+					&& share.is_dir()
+				{
+					roots.push(share);
+				}
+			}
+		}
+	}
+	Ok(Validator::new(roots).map_err(|e| e.to_string())?.with_protected([state_dir(args)?]))
 }

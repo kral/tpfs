@@ -1042,3 +1042,27 @@ fn a_journaled_path_that_only_looks_like_a_trash_is_still_checked() {
 	let report = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
 	assert!(!report.errors.is_empty() && !target.exists(), "{report:?}");
 }
+
+#[test]
+#[cfg(windows)]
+fn windows_long_paths_and_shares() {
+	assert_eq!(tpfs_core::share_root(Path::new(r"\\nas\photos\2024\a.jpg")), Some(PathBuf::from(r"\\nas\photos\")));
+	assert_eq!(tpfs_core::share_root(Path::new(r"C:\x")), None);
+
+	// A file deeper than 260 characters below a short root: validated, moved and undone.
+	let s = Sandbox::new();
+	let mut deep = s.root.clone();
+	while deep.as_os_str().len() < 300 {
+		deep.push("a-rather-long-folder-name");
+	}
+	fs::create_dir_all(&deep).unwrap();
+	let f = deep.join("f.txt");
+	fs::write(&f, "F").unwrap();
+	let moved = deep.join("g.txt");
+	let plan = Plan::new(vec![Op::Move { from: f.clone(), to: moved.clone() }], "");
+	assert!(messages(&s.validator(), &plan).is_empty(), "{:?}", messages(&s.validator(), &plan));
+	run(&s, plan.ops.clone());
+	assert!(moved.exists());
+	undo(&s).unwrap().unwrap();
+	assert!(f.exists());
+}

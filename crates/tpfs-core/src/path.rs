@@ -37,6 +37,21 @@ pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
 	Ok(p)
 }
 
+/// The network share a Windows UNC path is on (`\\server\share\`), which no drive letter covers.
+/// `None` for other paths and on other systems.
+pub fn share_root(p: &Path) -> Option<PathBuf> {
+	match p.components().next()? {
+		std::path::Component::Prefix(pre)
+			if matches!(pre.kind(), std::path::Prefix::UNC(..) | std::path::Prefix::VerbatimUNC(..)) =>
+		{
+			let mut root = PathBuf::from(pre.as_os_str());
+			root.push(std::path::MAIN_SEPARATOR_STR);
+			Some(root)
+		}
+		_ => None,
+	}
+}
+
 /// Roots that cover the whole file system: `/` on Unix, every existing drive on Windows.
 /// For callers that act on the user's behalf anywhere they can browse (commander, GUI, undo).
 pub fn system_roots() -> Vec<PathBuf> {
@@ -50,11 +65,11 @@ pub fn system_roots() -> Vec<PathBuf> {
 	}
 }
 
-/// The non-verbatim spelling of a verbatim Windows path, if it has one that means the same thing:
-/// only drive and UNC paths short enough for the classic API (verbatim is still needed beyond).
+/// The non-verbatim spelling of a verbatim Windows path (drive and UNC paths), whatever its length:
+/// one spelling everywhere, so long and short paths compare alike. Calls that need the verbatim form
+/// for long paths add it back ([`win_api_path`]); std does that by itself.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn strip_verbatim(s: &str) -> Option<String> {
-	const MAX: usize = 259;
 	let out = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
 		format!(r"\\{rest}")
 	} else {
@@ -65,7 +80,20 @@ fn strip_verbatim(s: &str) -> Option<String> {
 		}
 		rest.to_string()
 	};
-	(out.len() <= MAX).then_some(out)
+	Some(out)
+}
+
+/// A path for a raw Win32 call: long absolute paths get the `\\?\` prefix the classic API needs.
+#[cfg(windows)]
+pub(crate) fn win_api_path(p: &Path) -> std::ffi::OsString {
+	let s = p.as_os_str().to_string_lossy();
+	if s.len() < 248 || s.starts_with(r"\\?\") {
+		p.as_os_str().to_owned()
+	} else if let Some(unc) = s.strip_prefix(r"\\") {
+		format!(r"\\?\UNC\{unc}").into()
+	} else {
+		format!(r"\\?\{s}").into()
+	}
 }
 
 /// Create (if needed) a directory only the current user can use, and refuse one that is not:
@@ -160,7 +188,7 @@ mod tests {
 		assert_eq!(strip_verbatim(r"\\?\Volume{abc}\x"), None);
 		assert_eq!(strip_verbatim(r"C:\already"), None);
 		let long = format!(r"\\?\C:\{}", "a".repeat(300));
-		assert_eq!(strip_verbatim(&long), None);
+		assert_eq!(strip_verbatim(&long).map(|s| s.len()), Some(long.len() - 4));
 	}
 
 	#[test]

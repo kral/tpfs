@@ -487,7 +487,7 @@ fn free_space(dir: &Path) -> Option<(u64, u64)> {
 	use std::os::windows::ffi::OsStrExt;
 	use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 	let existing = dir.ancestors().find(|a| a.exists())?;
-	let wide: Vec<u16> = existing.as_os_str().encode_wide().chain(Some(0)).collect();
+	let wide: Vec<u16> = crate::path::win_api_path(existing).encode_wide().chain(Some(0)).collect();
 	let mut free: u64 = 0;
 	// SAFETY: `wide` is NUL-terminated and outlives the call; the out-pointer is a valid u64 and the
 	// two optional out-pointers are null.
