@@ -445,3 +445,14 @@ fn an_approval_symlink_is_refused() {
 	assert!(store.approve(&store.get(&id).unwrap()).is_err());
 	assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
 }
+
+#[test]
+fn deep_paths_are_refused_before_they_cost_time() {
+	let mut f = Fixture::new(Approval::Terminal);
+	let mut p = f.root.clone();
+	for _ in 0..=tpfs_core::MAX_DEPTH {
+		p.push("a");
+	}
+	let (v, err) = f.tool("propose_plan", json!({ "plan": { "ops": [{ "op": "mkdir", "path": p }] } }));
+	assert!(err && v.to_string().contains("folders deep"), "{v}");
+}

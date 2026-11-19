@@ -76,7 +76,8 @@ pub fn is_own_name(name: &std::ffi::OsStr) -> bool {
 /// A name the way the lenient volumes compare it, for checks that must not be dodged by another
 /// spelling of tpfs's own names: lower case; the letters whose case folding is plain ASCII (`ſ`,
 /// the Kelvin sign, the `ﬀ`…`ﬆ` ligatures) folded; and trailing dots and spaces dropped, which
-/// Windows and the FAT/exFAT drivers ignore. Not full Unicode folding or normalisation: the
+/// Windows and the FAT/exFAT drivers ignore; and the invisible characters HFS+ ignores in names
+/// (zero-width and direction marks, soft hyphen) dropped. Not full Unicode folding or normalisation: the
 /// protected names themselves are ASCII, apart from a user's own folder names.
 fn fold(name: &str) -> String {
 	let mut out = String::with_capacity(name.len());
@@ -89,6 +90,13 @@ fn fold(name: &str) -> String {
 			'\u{fb03}' => out.push_str("ffi"),
 			'\u{fb04}' => out.push_str("ffl"),
 			'\u{fb05}' | '\u{fb06}' => out.push_str("st"),
+			'\u{ad}'
+			| '\u{34f}'
+			| '\u{200b}'..='\u{200f}'
+			| '\u{202a}'..='\u{202e}'
+			| '\u{2060}'..='\u{2064}'
+			| '\u{206a}'..='\u{206f}'
+			| '\u{feff}' => {}
 			c => out.push(c),
 		}
 	}
@@ -250,9 +258,15 @@ impl Validator {
 					sim.names
 						.entry(parent.to_path_buf())
 						.or_insert_with(|| {
-							fs::read_dir(parent)
-								.map(|rd| rd.filter_map(Result::ok).map(|e| e.file_name()).collect())
-								.unwrap_or_default()
+							// Bounded: a folder too big to read in full is taken as holding the
+							// name, so the rename goes the normal way and is refused (target exists).
+							const MAX_NAMES: usize = 100_000;
+							let names: std::collections::HashSet<_> = fs::read_dir(parent)
+								.map(|rd| {
+									rd.filter_map(Result::ok).map(|e| e.file_name()).take(MAX_NAMES + 1).collect()
+								})
+								.unwrap_or_default();
+							if names.len() > MAX_NAMES { [new_name.into()].into() } else { names }
 						})
 						.contains(std::ffi::OsStr::new(new_name))
 				};

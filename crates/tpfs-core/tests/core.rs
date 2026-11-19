@@ -2004,3 +2004,60 @@ fn undoing_rmdir_restores_a_mode_without_read() {
 		fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
 	}
 }
+
+/// Paths deeper than the limit are refused up front (so validation stays quick); at the limit
+/// they are accepted.
+#[test]
+fn very_deep_paths_are_refused() {
+	let s = Sandbox::new();
+	let depth = s.root.components().count();
+	let at = |n: usize| {
+		let mut p = s.root.clone();
+		for _ in depth..n {
+			p.push("a");
+		}
+		Plan::new(vec![Op::Mkdir { path: p }], "")
+	};
+	let started = std::time::Instant::now();
+	let deep = messages(&s.validator(), &at(tpfs_core::MAX_DEPTH + 1));
+	assert!(deep.iter().any(|m| m.contains("folders deep")), "{deep:?}");
+	assert!(started.elapsed().as_secs() < 5);
+	let ok = messages(&s.validator(), &at(tpfs_core::MAX_DEPTH));
+	assert!(!ok.iter().any(|m| m.contains("folders deep")), "{ok:?}");
+}
+
+/// Every character `fold` maps to plain letters, and the invisible ones it drops, still name
+/// tpfs's own work folders and its state.
+#[test]
+fn folded_spellings_of_own_names_and_state_are_recognised() {
+	for n in [
+		".tpf\u{17f}-trash-1000",
+		".tpfs-tra\u{17f}h-1000",
+		".TPFS-TRASH-1000",
+		".tpfs-tra\u{fb06}-1000", // the "st" ligature: ".tpfs-trast-1000", not an own name
+		".tpfs\u{200b}-trash-1000",
+		".tpfs\u{200c}-trash-1000",
+		".tpfs-trash\u{feff}-1000",
+		".tpfs-tra\u{ad}sh-1000",
+		".tpfs-case-0123abcd-0\u{200d}",
+	] {
+		let own = tpfs_core::is_own_name(n.as_ref());
+		assert_eq!(own, !n.contains('\u{fb06}'), "{n:?}");
+	}
+	// Ligatures fold to their letters: a state folder named with them is matched by them.
+	let s = Sandbox::new();
+	let base = s.root.parent().unwrap().to_path_buf();
+	for (name, spelled) in [
+		("stuff", "\u{fb06}uff"),
+		("office", "o\u{fb03}ce"),
+		("kelvin", "\u{212a}elvin"),
+		("fl", "\u{fb02}"),
+		("ff", "\u{fb00}"),
+		("fi", "\u{fb01}"),
+		("ffl", "\u{fb04}"),
+	] {
+		let v = Validator::new([&base]).unwrap().with_protected([base.join(name)]);
+		let plan = Plan::new(vec![Op::Mkdir { path: base.join(spelled).join("x") }], "");
+		assert!(messages(&v, &plan).iter().any(|m| m.contains("tpfs's state")), "{spelled}: {:?}", messages(&v, &plan));
+	}
+}

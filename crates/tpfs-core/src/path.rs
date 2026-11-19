@@ -115,6 +115,23 @@ pub fn private_dir(dir: &Path) -> io::Result<()> {
 				),
 			));
 		}
+		// A folder above that anyone may change (and not sticky, like /tmp) lets another user swap
+		// the whole state folder for one of their own.
+		let abs = std::path::absolute(dir)?;
+		for parent in abs.ancestors().skip(1) {
+			if let Ok(p) = fs::metadata(parent)
+				&& p.permissions().mode() & 0o1002 == 0o002
+			{
+				return Err(io::Error::new(
+					io::ErrorKind::PermissionDenied,
+					format!(
+						"refusing to use {}: any user can replace it, as {} is writable by everyone",
+						dir.display(),
+						parent.display()
+					),
+				));
+			}
+		}
 		Ok(())
 	}
 	#[cfg(not(unix))]

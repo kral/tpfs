@@ -600,26 +600,43 @@ pub(crate) fn remove_part(fs: &Fs, part: &Path) -> io::Result<()> {
 	if !m.is_dir() {
 		return fs.remove_file(part);
 	}
-	make_writable(fs, part)?;
-	// std's remove_dir_all does not follow symlinks inside the tree.
-	std::fs::remove_dir_all(part)
+	// Through the confined operations (a folder above swapped for a symlink is not followed),
+	// and with an explicit stack (no recursion however deep the tree).
+	let mut stack = vec![(part.to_path_buf(), false)];
+	while let Some((path, emptied)) = stack.pop() {
+		if emptied {
+			fs.rmdir(&path)?;
+		} else if std::fs::symlink_metadata(&path)?.is_dir() {
+			make_dir_writable(fs, &path)?;
+			stack.push((path.clone(), true));
+			stack.extend(fs.list(&path)?.into_iter().map(|name| (path.join(name), false)));
+		} else {
+			fs.remove_file(&path)?;
+		}
+	}
+	Ok(())
 }
 
-/// Give every folder of our own tree owner write access (children before nothing else changes).
-fn make_writable(fs: &Fs, dir: &Path) -> io::Result<()> {
-	let m = std::fs::symlink_metadata(dir)?;
-	if !m.is_dir() {
-		return Ok(());
-	}
-	let mut p = m.permissions();
+/// Give a folder of our own owner write access, so what is in it can be removed or moved.
+fn make_dir_writable(fs: &Fs, dir: &Path) -> io::Result<()> {
+	let mut p = std::fs::symlink_metadata(dir)?.permissions();
 	#[cfg(unix)]
 	std::os::unix::fs::PermissionsExt::set_mode(&mut p, 0o700);
 	#[cfg(not(unix))]
 	#[allow(clippy::permissions_set_readonly_false)]
 	p.set_readonly(false);
-	fs.set_dir_mode(dir, p)?;
-	for name in fs.list(dir)? {
-		make_writable(fs, &dir.join(name))?;
+	fs.set_dir_mode(dir, p)
+}
+
+/// Give every folder of our own tree owner write access (an explicit stack: no recursion).
+fn make_writable(fs: &Fs, dir: &Path) -> io::Result<()> {
+	let mut stack = vec![dir.to_path_buf()];
+	while let Some(dir) = stack.pop() {
+		if !std::fs::symlink_metadata(&dir)?.is_dir() {
+			continue;
+		}
+		make_dir_writable(fs, &dir)?;
+		stack.extend(fs.list(&dir)?.into_iter().map(|name| dir.join(name)));
 	}
 	Ok(())
 }

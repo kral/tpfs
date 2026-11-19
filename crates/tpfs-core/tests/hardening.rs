@@ -707,3 +707,19 @@ fn read_only_entries_are_removed_on_windows() {
 	Executor::new(&v, &mut j, s.state.join("trash")).undo_last().unwrap();
 	assert!(g.join("desktop.ini").exists());
 }
+
+/// The state folder is refused when a folder above it can be changed by every user (and is not
+/// sticky like /tmp): another user could swap the whole state folder.
+#[cfg(unix)]
+#[test]
+fn a_state_folder_under_a_world_writable_folder_is_refused() {
+	use std::os::unix::fs::PermissionsExt;
+	let tmp = TempDir::new().unwrap();
+	let shared = tmp.path().join("shared");
+	fs::create_dir(&shared).unwrap();
+	fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+	let err = tpfs_core::private_dir(&shared.join("tpfs")).unwrap_err();
+	assert!(err.to_string().contains("writable by everyone"), "{err}");
+	fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
+	tpfs_core::private_dir(&shared.join("tpfs")).unwrap();
+}
