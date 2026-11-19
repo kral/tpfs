@@ -136,7 +136,11 @@ impl Server {
 	/// The exact command the human runs: with `--home` naming this server's state folder, so it
 	/// finds the plan whatever TPFS_HOME or --home the server was started with.
 	fn approve_command(&self, id: &str) -> String {
-		format!("tpfs approve {id} --home {}", shell_quote(&show(&self.config.state)))
+		// The real path when it is printable as it is; otherwise the sanitised one, which cannot
+		// be pasted as it stands (rare: control characters or invalid Unicode in the path).
+		let raw = self.config.state.to_string_lossy();
+		let home = if show(&self.config.state) == raw { shell_quote(&raw) } else { show(&self.config.state) };
+		format!("tpfs approve {id} --home {home}")
 	}
 
 	fn initialize(&self, params: &Value) -> Value {
@@ -496,10 +500,29 @@ fn show(p: &Path) -> String {
 /// double quotes on Windows (where `"` cannot occur in a path).
 fn shell_quote(s: &str) -> String {
 	if cfg!(windows) {
-		format!("\"{s}\"")
+		// For cmd.exe and PowerShell argument parsing: a trailing backslash would escape the
+		// closing quote, so it is doubled.
+		let tail = s.len() - s.trim_end_matches('\\').len();
+		format!("\"{s}{}\"", "\\".repeat(tail))
 	} else if s.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-+,:@".contains(&b)) {
 		s.to_owned()
 	} else {
 		format!("'{}'", s.replace('\'', "'\\''"))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::shell_quote;
+
+	#[test]
+	fn shell_words_survive_a_paste() {
+		if cfg!(windows) {
+			assert_eq!(shell_quote(r"C:\tpfs state\"), r#""C:\tpfs state\\""#);
+		} else {
+			assert_eq!(shell_quote("/home/u/tpfs"), "/home/u/tpfs");
+			assert_eq!(shell_quote("/x/a b"), "'/x/a b'");
+			assert_eq!(shell_quote("/x/it's $HOME"), r#"'/x/it'\''s $HOME'"#);
+		}
 	}
 }

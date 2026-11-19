@@ -210,7 +210,7 @@ fn trash_stays_on_the_same_file_system_and_planted_trashes_are_refused() {
 	}
 	fs::set_permissions(state_tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
 	// /dev/shm is shared by every test run on this host: one at a time (held until the end).
-	let lock = fs::File::create(std::env::temp_dir().join("tpfs-devshm-test.lock")).unwrap();
+	let lock = fs::File::create(std::env::temp_dir().join(format!("tpfs-devshm-test-{}.lock", rustix_uid()))).unwrap();
 	use std::os::fd::AsRawFd;
 	// SAFETY: flock on a descriptor we own; it is released when `lock` is dropped.
 	assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);

@@ -313,7 +313,23 @@ impl Action {
 /// Entries that do not make a folder "not empty" for the mirror guard: tpfs's own, and the
 /// metadata files Finder and Explorer leave in any folder they open.
 fn ignorable(name: &std::ffi::OsStr) -> bool {
-	crate::validate::is_own_name(name) || matches!(name.to_str(), Some(".DS_Store" | "desktop.ini" | "Thumbs.db"))
+	const OS_METADATA: [&str; 10] = [
+		".ds_store",
+		"desktop.ini",
+		"thumbs.db",
+		".spotlight-v100",
+		".fseventsd",
+		".trashes",
+		".temporaryitems",
+		".localized",
+		"system volume information",
+		"$recycle.bin",
+	];
+	crate::validate::is_own_name(name)
+		|| name.to_str().is_some_and(|n| {
+			let n = n.to_lowercase();
+			n.starts_with("._") || OS_METADATA.contains(&n.as_str())
+		})
 }
 
 /// The action for one item under the given options.

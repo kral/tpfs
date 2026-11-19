@@ -225,6 +225,13 @@ impl App {
 			2 => {
 				let Some(e) = self.panel().current().filter(|e| !e.is_up).cloned() else { return };
 				let path = self.panels[self.active].cwd.join(&e.name);
+				// The box edits text: a name that is not plain text (invalid Unicode, control or
+				// direction characters) cannot be shown and edited as it is, so it is not offered.
+				if e.name.to_str().is_none_or(|n| tpfs_core::sanitize(n.as_ref()) != n) {
+					self.status =
+						"This name has characters the rename box cannot show; rename it with `tpfs apply`.".into();
+					return;
+				}
 				self.dialog = Some(Dialog::Input {
 					title: "Rename",
 					value: e.name.to_string_lossy().into_owned(),
@@ -509,6 +516,7 @@ impl App {
 				vec![Op::Mkdir { path: self.panels[self.active].cwd.join(value) }],
 				format!("Make directory {value}"),
 			),
+			InputKind::Rename(path) if path.file_name().is_some_and(|n| n == value) => return, // unchanged
 			InputKind::Rename(path) => {
 				Plan::new(vec![Op::Rename { path: path.clone(), new_name: value.into() }], format!("Rename to {value}"))
 			}
@@ -526,7 +534,7 @@ impl App {
 		let result = self.journal().and_then(|mut j| {
 			Executor::new(&self.validator(), &mut j, self.state.join("trash"))
 				.execute(plan, Source::Human)
-				.map(|b| format!("Done: {} operation(s). Ctrl+Z to undo.", b.steps))
+				.map(|b| format!("Done: {} step(s). Ctrl+Z to undo.", b.steps))
 				.map_err(|e| one_line(&e))
 		});
 		self.status = result.unwrap_or_else(|e| format!("Failed: {e}"));

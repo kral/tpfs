@@ -411,6 +411,24 @@ fn check_names(path: &Path) -> Result<(), String> {
 /// A folder where another file system is mounted cannot be moved or trashed (the kernel refuses,
 /// and copying it into a trash on its own volume would copy it into itself): refused up front.
 fn refuse_mount_point(path: &Path) -> Result<(), String> {
+	let refuse = || {
+		Err(format!(
+			"{} is a mount point or a separate file system (another disk, a share, a subvolume); work on what is inside it",
+			show(path)
+		))
+	};
+	// Linux: ask the kernel (a bind mount has the same device, a btrfs subvolume a different one
+	// without being a mount point).
+	#[cfg(target_os = "linux")]
+	if let Ok(st) = rustix::fs::statx(
+		rustix::fs::CWD,
+		path,
+		rustix::fs::AtFlags::NO_AUTOMOUNT | rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+		rustix::fs::StatxFlags::empty(),
+	) && st.stx_attributes_mask.contains(rustix::fs::StatxAttributes::MOUNT_ROOT)
+	{
+		return if st.stx_attributes.contains(rustix::fs::StatxAttributes::MOUNT_ROOT) { refuse() } else { Ok(()) };
+	}
 	#[cfg(unix)]
 	if let Some(parent) = path.parent() {
 		use std::os::unix::fs::MetadataExt;
@@ -418,10 +436,7 @@ fn refuse_mount_point(path: &Path) -> Result<(), String> {
 			&& m.is_dir()
 			&& m.dev() != p.dev()
 		{
-			return Err(format!(
-				"{} is a mount point (another disk is mounted there); unmount it, or work on what is inside it",
-				show(path)
-			));
+			return refuse();
 		}
 	}
 	let _ = path;

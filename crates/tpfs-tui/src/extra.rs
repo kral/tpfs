@@ -92,9 +92,9 @@ fn utc(secs: i64) -> (i64, u32, u32, u32, u32) {
 pub(crate) fn view_lines(path: &Path) -> Result<Vec<String>, String> {
 	const LIMIT: u64 = 256 * 1024;
 	let mut buf = Vec::new();
-	// Only regular files, opened without blocking: a FIFO or device named like a text file must
+	// Only regular files (a link to one is fine): a FIFO or device named like a text file must
 	// not hang the commander.
-	if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
+	if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
 		return Err("not a regular file".into());
 	}
 	File::open(path).and_then(|f| f.take(LIMIT).read_to_end(&mut buf)).map_err(|e| e.to_string())?;
