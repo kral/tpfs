@@ -613,7 +613,12 @@ fn plans_cannot_touch_tpfs_state() {
 	// …and so is a spelling with trailing dots, which FAT, exFAT and Windows ignore.
 	let dotted = s.state.with_file_name(format!("{}.", s.state.file_name().unwrap().to_string_lossy()));
 	let plan = Plan::new(vec![Op::Trash { path: dotted }], "");
-	assert!(messages(&v, &plan).iter().any(|m| m.contains("tpfs's state")), "{:?}", messages(&v, &plan));
+	// (Windows refuses such a name before it gets that far.)
+	assert!(
+		messages(&v, &plan).iter().any(|m| m.contains("tpfs's state") || m.contains("cannot use this name")),
+		"{:?}",
+		messages(&v, &plan)
+	);
 
 	let keep = s.dir("keep");
 	let nested = Validator::new([&base]).unwrap().with_protected([keep.join("state")]);
