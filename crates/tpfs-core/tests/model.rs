@@ -296,6 +296,10 @@ fn random_plans_crashed_anywhere_are_recovered_exactly() {
 		let report = Executor::new(&v, &mut j, s.trash()).recover().unwrap();
 		assert!(report.errors.is_empty(), "{report:?}\n{:?}", plan.preview());
 		assert_eq!(s.snapshot(), before, "crash at {at} {phase:?}\n{:?}", plan.preview());
+		// Recovering again does nothing.
+		let again = Executor::new(&v, &mut j, s.trash()).recover().unwrap();
+		assert!(again.errors.is_empty() && again.rolled_back.is_empty(), "{again:?}");
+		assert_eq!(s.snapshot(), before);
 	}
 	panic::set_hook(default_hook);
 	assert!(crashed_cases > 20, "only {crashed_cases} cases");

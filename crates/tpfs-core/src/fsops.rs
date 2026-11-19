@@ -343,6 +343,9 @@ impl Fs {
 			return Err(e);
 		}
 		sync_tree_dirs(part, &copied);
+		// The part's own entry must be durable before "published" is: otherwise a power loss
+		// could keep the record but lose the part, and a foreign file at `to` would look ours.
+		sync_parent(part);
 		// Journal "publishing" *before* the rename: afterwards the part name tells what happened —
 		// still there, the rename did not happen; gone, the copy at `to` is ours. If the rename
 		// fails, the part is left for the caller's clean-up, so that stays true even after a crash.
@@ -385,10 +388,8 @@ impl Fs {
 			for name in self.list(from)?.into_iter().filter(|n| !crate::validate::is_own_name(n)) {
 				// Never into another disk mounted below (like `cp -x`, but refusing: a move would
 				// then empty that disk).
-				#[cfg(unix)]
 				{
-					use std::os::unix::fs::MetadataExt;
-					if fs::symlink_metadata(from.join(&name)).is_ok_and(|m| m.is_dir() && m.dev() != meta.dev()) {
+					if crate::validate::is_mount_point(&from.join(&name)) {
 						return Err(io::Error::new(
 							io::ErrorKind::Unsupported,
 							format!(

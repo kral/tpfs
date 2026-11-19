@@ -1746,3 +1746,54 @@ fn undoing_rmdir_leaves_a_folder_made_since_alone() {
 	assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700, "the user's folder was opened up");
 	assert_eq!(fs::read_to_string(d.join("secret")).unwrap(), "S");
 }
+
+/// Undo of an rmdir interrupted after its mkdir (journaled) and before the mode was set: the
+/// rerun recognises the folder as its own, sets the mode and finishes.
+#[cfg(unix)]
+#[test]
+fn an_interrupted_undo_of_rmdir_finishes_the_mode() {
+	use std::os::unix::fs::PermissionsExt;
+	let s = Sandbox::new();
+	let d = s.root.join("private");
+	fs::create_dir(&d).unwrap();
+	fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
+	let id = run(&s, vec![Op::Rmdir { path: d.clone() }]);
+	fs::create_dir(&d).unwrap(); // the interrupted undo's mkdir (default mode)…
+	fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+	let mut j = s.journal();
+	j.append(&Entry::UndoPublished { batch: id, index: 0 }).unwrap(); // …journaled as ours
+	drop(j);
+	assert_eq!(undo(&s).unwrap().unwrap().steps, 1);
+	assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
+}
+
+/// Linux: a mount point cannot be trashed or moved (it is refused at validation).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_mount_point_is_refused_for_trash_and_move() {
+	use std::os::unix::fs::MetadataExt;
+	let shm = Path::new("/dev/shm");
+	if !shm.is_dir() || fs::metadata(shm).unwrap().dev() == fs::metadata("/dev").unwrap().dev() {
+		return; // no separate file system there
+	}
+	let v = Validator::new(["/dev"]).unwrap();
+	for op in [Op::Trash { path: shm.into() }, Op::Move { from: shm.into(), to: "/dev/shm-moved".into() }] {
+		let issues = v.validate(&Plan::new(vec![op.clone()], ""));
+		assert!(issues.iter().any(|i| i.message.contains("mount point")), "{op}: {issues:?}");
+	}
+}
+
+/// On every OS: undo of an `rmdir` stops when a folder with content is at the name again.
+#[test]
+fn undoing_rmdir_stops_over_a_filled_folder_on_every_os() {
+	let s = Sandbox::new();
+	let d = s.root.join("d");
+	fs::create_dir(&d).unwrap();
+	let id = run(&s, vec![Op::Rmdir { path: d.clone() }]);
+	fs::create_dir(&d).unwrap();
+	fs::write(d.join("secret"), "S").unwrap();
+	assert!(undo(&s).is_err());
+	assert_eq!(fs::read_to_string(d.join("secret")).unwrap(), "S");
+	let mut j = s.journal();
+	assert_eq!(j.batches().unwrap().into_iter().find(|b| b.id == id).unwrap().status, BatchStatus::Committed);
+}

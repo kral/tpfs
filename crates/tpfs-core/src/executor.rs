@@ -425,17 +425,21 @@ impl<'a> Executor<'a> {
 			_ => {}
 		}
 		if let (Op::Mkdir { path }, Some(mode)) = (&step.inverse, step.mode) {
-			// A removed folder comes back with its own permissions: made under a private name, given
-			// its mode there, then renamed into place. A folder found at the real name is never
-			// ours and is left alone.
+			// A removed folder comes back with its own permissions. `mkdir` fails if anything is
+			// there (atomic); once it succeeded the folder is ours, which is journaled before its
+			// mode is set, so a rerun after a crash in between finishes the job.
 			let path = n(path);
-			remove_part(fs, &part_path(&path, &t))?;
+			remove_part(fs, &part_path(&path, &t))?; // left by older versions
 			if !exists(&path) {
-				return mkdir_with_mode(fs, &path, mode, &t);
+				fs.mkdir(&path)?;
+				self.journal.write(&Entry::UndoPublished { batch: batch.to_owned(), index: step.index })?;
+				return set_mode(fs, &path, mode);
 			}
-			// Already there: an earlier attempt of this undo finished (an empty folder with exactly
-			// the recorded permissions), or someone else put something there — then undo stops.
-			return if folder_as_restored(&path, mode) {
+			// Already there: made by an earlier attempt of this undo (journaled, or an empty folder
+			// with exactly the recorded permissions), or by someone else — then undo stops.
+			return if step.undo_published {
+				set_mode(fs, &path, mode)
+			} else if folder_as_restored(&path, mode) {
 				Ok(())
 			} else {
 				Err(io::Error::new(
@@ -444,6 +448,27 @@ impl<'a> Executor<'a> {
 					 yourself, then run undo again",
 				))
 			};
+		}
+		if let Op::Mkdir { path } = &step.inverse {
+			// No mode on record (Windows, older journals): the same rule without the mode — a
+			// folder at the name is accepted only as this undo's own (journaled) or an empty one.
+			let path = n(path);
+			if exists(&path) {
+				let empty = fs::read_dir(&path).is_ok_and(|mut rd| rd.next().is_none());
+				return if step.undo_published || (path.is_dir() && empty) {
+					Ok(())
+				} else {
+					Err(io::Error::new(
+						io::ErrorKind::AlreadyExists,
+						"something is there again, not made by tpfs; it is left as it is. Move or remove it \
+						 yourself, then run undo again",
+					))
+				};
+			}
+			fs.mkdir(&path)?;
+			self.journal.write(&Entry::UndoPublished { batch: batch.to_owned(), index: step.index })?;
+			sync_parent(&path);
+			return Ok(());
 		}
 		if already_applied(&step.inverse) {
 			return Ok(());
@@ -573,16 +598,24 @@ impl<'a> Executor<'a> {
 					continue;
 				}
 				let mut clean_step = true;
-				let label = format!("{}-recover", batch.id);
 				for fix in cleanup(&step.forward, &step.inverse, &tag(&batch.id, step.index), step.published) {
 					// A removed folder comes back with its own mode, through a private name.
 					if let (Fix::Op(Op::Mkdir { path }), Some(mode)) = (&fix, step.mode) {
 						let path = normalize(path).unwrap_or_else(|| path.clone());
-						let t = tag(&label, step.index);
+						let journal = &mut self.journal;
 						let result = self
-							.check_journaled(&Op::Mkdir { path: path.clone() })
+							.validator
+							.check_path(&path)
+							.map(|_| ())
 							.map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))
-							.and_then(|()| mkdir_with_mode(&fs, &path, mode, &t));
+							.and_then(|()| fs.mkdir(&path))
+							.and_then(|()| {
+								// Ours from here on; journaled so a rerun still sets the mode.
+								journal
+									.write(&Entry::UndoPublished { batch: batch.id.clone(), index: step.index })
+									.map_err(|e| io::Error::other(e.to_string()))
+							})
+							.and_then(|()| set_mode(&fs, &path, mode));
 						if let Err(e) = result {
 							errors.push(clean(format!("{fix}: {e}")));
 							clean_step = false;
@@ -600,6 +633,16 @@ impl<'a> Executor<'a> {
 						errors.push(clean(format!("{fix}: {e}")));
 						clean_step = false;
 					}
+				}
+				// A folder an earlier recovery recreated (journaled) before it could set its mode.
+				if clean_step
+					&& let (Op::Rmdir { path }, true, Some(mode)) = (&step.forward, step.undo_published, step.mode)
+					&& let Some(path) = normalize(path)
+					&& path.is_dir()
+					&& let Err(e) = set_mode(&fs, &path, mode)
+				{
+					errors.push(clean(format!("{}: {e}", step.inverse)));
+					clean_step = false;
 				}
 				if !clean_step {
 					break; // older steps wait until this one is cleaned up
@@ -834,24 +877,15 @@ fn folder_as_restored(path: &Path, mode: u32) -> bool {
 	m.is_dir() && same_mode && fs::read_dir(path).is_ok_and(|mut rd| rd.next().is_none())
 }
 
-/// Recreate a removed folder with the permissions it had: made under the private part name, given
-/// its mode there, then renamed into place without replacing anything. An interrupted attempt leaves
-/// only the part, which the next attempt removes first.
-fn mkdir_with_mode(fs: &Fs, path: &Path, mode: u32, tag: &str) -> io::Result<()> {
-	let part = part_path(path, tag);
-	remove_part(fs, &part)?;
-	fs.mkdir(&part)?;
+/// Give a folder tpfs recreated the permissions it had before its `rmdir`.
+fn set_mode(fs: &Fs, path: &Path, mode: u32) -> io::Result<()> {
 	#[cfg(unix)]
 	{
 		use std::os::unix::fs::PermissionsExt;
-		crate::fsops::set_dir_mode_at(fs, &part, fs::Permissions::from_mode(mode))?;
+		crate::fsops::set_dir_mode_at(fs, path, fs::Permissions::from_mode(mode))?;
 	}
 	#[cfg(not(unix))]
-	let _ = mode;
-	if let Err(e) = fs.rename_noreplace(&part, path) {
-		let _ = remove_part(fs, &part);
-		return Err(e);
-	}
+	let _ = (fs, mode);
 	sync_parent(path);
 	Ok(())
 }
@@ -958,16 +992,12 @@ fn apply(
 			fs.move_any(&path, &slot, &part_path(&slot, &tag), publish)
 		}
 		Op::Mkdir { path } => {
-			// Made under the private part name and renamed into place (after `publish` journals
-			// it): a folder found at the name after a crash is provably ours only then.
+			// `mkdir` fails if anything is at the name (atomic, on every file system); once it
+			// succeeded the folder is ours, and `publish` journals that. A crash in between leaves
+			// an empty folder of ours unrecorded — left alone, never someone else's removed.
 			let path = n(path)?;
-			let part = part_path(&path, &tag);
-			remove_part(fs, &part)?;
-			fs.mkdir(&part)?;
+			fs.mkdir(&path)?;
 			publish()?;
-			// On failure the part stays: it is the proof that the name is not ours, and the
-			// clean-up records the step as failed before removing it.
-			fs.rename_noreplace(&part, &path)?;
 			sync_parent(&path);
 			Ok(())
 		}

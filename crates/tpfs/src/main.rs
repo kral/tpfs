@@ -520,9 +520,14 @@ fn run(args: Args) -> Res {
 		"reject" => {
 			let id = plan_id(&args)?;
 			let store = tpfs_mcp::Store::new(&state_dir(&args)?);
-			find_pending(&store, &id)?;
+			// A damaged pending file can be rejected too (only a missing one or a bad id is an error).
+			if let Err(e) = store.get(&id)
+				&& matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidInput)
+			{
+				return Err(usage(format!("{e} (see `tpfs pending`)")));
+			}
 			store.remove(&id).map_err(|e| e.to_string())?;
-			println!("Rejected {id}.");
+			println!("Rejected {}.", tpfs_core::sanitize(id.as_ref()));
 			Ok(ExitCode::SUCCESS)
 		}
 		other => Err(usage(format!("unknown command '{other}' (see `tpfs --help`)"))),

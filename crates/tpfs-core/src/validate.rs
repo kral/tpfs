@@ -413,15 +413,19 @@ fn check_names(path: &Path) -> Result<(), String> {
 /// A folder where another file system is mounted cannot be moved or trashed (the kernel refuses,
 /// and copying it into a trash on its own volume would copy it into itself): refused up front.
 fn refuse_mount_point(path: &Path) -> Result<(), String> {
-	#[cfg_attr(not(unix), allow(unused_variables))]
-	let refuse = || -> Result<(), String> {
-		Err(format!(
+	if is_mount_point(path) {
+		return Err(format!(
 			"{} is a mount point or a separate file system (another disk, a share, a subvolume); work on what is inside it",
 			show(path)
-		))
-	};
-	// Linux: ask the kernel (a bind mount has the same device, a btrfs subvolume a different one
-	// without being a mount point).
+		));
+	}
+	Ok(())
+}
+
+/// Whether a folder is the root of a mount: on Linux as the kernel says (a bind mount has the same
+/// device, a btrfs subvolume a different one without being a mount point), elsewhere by a device
+/// different from its parent's.
+pub(crate) fn is_mount_point(path: &Path) -> bool {
 	#[cfg(target_os = "linux")]
 	if let Ok(st) = rustix::fs::statx(
 		rustix::fs::CWD,
@@ -430,20 +434,17 @@ fn refuse_mount_point(path: &Path) -> Result<(), String> {
 		rustix::fs::StatxFlags::empty(),
 	) && st.stx_attributes_mask.contains(rustix::fs::StatxAttributes::MOUNT_ROOT)
 	{
-		return if st.stx_attributes.contains(rustix::fs::StatxAttributes::MOUNT_ROOT) { refuse() } else { Ok(()) };
+		return st.stx_attributes.contains(rustix::fs::StatxAttributes::MOUNT_ROOT);
 	}
 	#[cfg(unix)]
 	if let Some(parent) = path.parent() {
 		use std::os::unix::fs::MetadataExt;
-		if let (Ok(m), Ok(p)) = (fs::symlink_metadata(path), fs::symlink_metadata(parent))
-			&& m.is_dir()
-			&& m.dev() != p.dev()
-		{
-			return refuse();
+		if let (Ok(m), Ok(p)) = (fs::symlink_metadata(path), fs::symlink_metadata(parent)) {
+			return m.is_dir() && m.dev() != p.dev();
 		}
 	}
 	let _ = path;
-	Ok(())
+	false
 }
 
 /// FIFOs, sockets and device nodes are never copied: reading them can block forever or read a whole disk.
