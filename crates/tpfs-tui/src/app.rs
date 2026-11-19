@@ -21,6 +21,12 @@ pub(crate) enum Dialog {
 		plan: Plan,
 		risk: Risk,
 		issues: Vec<Issue>,
+		/// First visible line of the operation list.
+		offset: usize,
+		/// Set by drawing: the whole dialog (risk, keys) fits the terminal…
+		fits: bool,
+		/// …and every operation line has been on screen at least once.
+		seen_all: bool,
 	},
 	Input {
 		title: &'static str,
@@ -305,7 +311,7 @@ impl App {
 		}
 		let issues = self.validator.validate(&plan);
 		let risk = risk::assess(&plan, Source::Human);
-		self.dialog = Some(Dialog::Confirm { plan, risk, issues });
+		self.dialog = Some(Dialog::Confirm { plan, risk, issues, offset: 0, fits: false, seen_all: false });
 	}
 
 	fn on_dialog_key(&mut self, key: KeyEvent) {
@@ -398,15 +404,25 @@ impl App {
 				};
 				self.dialog = Some(Dialog::Drives { panel, items, cursor });
 			}
-			// High risk needs a deliberate `y`, so a reflexive Enter cannot trash a whole folder.
-			(Some(Dialog::Confirm { plan, risk, issues }), code) => {
-				let high = risk.level == risk::Level::High;
+			// Only Low risk proceeds on Enter. Medium needs a deliberate `y`; High needs `y` after
+			// every operation has been on screen. Nothing proceeds if the dialog does not fit.
+			(Some(Dialog::Confirm { plan, risk, issues, mut offset, fits, seen_all }), code) => {
+				let ok = issues.is_empty() && fits;
+				let level = risk.level;
 				match code {
-					KeyCode::Enter if issues.is_empty() && !high => self.execute(&plan),
-					KeyCode::Char('y' | 'Y') if issues.is_empty() && high => self.execute(&plan),
-					KeyCode::Enter if !issues.is_empty() => {}
-					_ => self.dialog = Some(Dialog::Confirm { plan, risk, issues }),
+					KeyCode::Enter if ok && level == risk::Level::Low => return self.execute(&plan),
+					KeyCode::Char('y' | 'Y') if ok && (level != risk::Level::High || seen_all) => {
+						return self.execute(&plan);
+					}
+					KeyCode::Down => offset += 1,
+					KeyCode::Up => offset = offset.saturating_sub(1),
+					KeyCode::PageDown | KeyCode::Char(' ') => offset += 10,
+					KeyCode::PageUp => offset = offset.saturating_sub(10),
+					KeyCode::Home => offset = 0,
+					KeyCode::End => offset = usize::MAX / 2,
+					_ => {}
 				}
+				self.dialog = Some(Dialog::Confirm { plan, risk, issues, offset, fits, seen_all });
 			}
 			(Some(Dialog::Input { title, mut value, kind }), code) => match code {
 				KeyCode::Enter => self.submit_input(&value, &kind),
@@ -614,11 +630,24 @@ mod tests {
 
 	use super::*;
 
+	/// Draw like the real loop does before each key (the confirmation learns whether it fits).
+	fn render(app: &mut App, width: u16, height: u16) -> String {
+		let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+		t.draw(|f| crate::ui::draw(f, app)).unwrap();
+		let buf = t.backend().buffer();
+		(0..height)
+			.map(|y| (0..width).map(|x| buf[(x, y)].symbol().to_owned()).collect::<String>())
+			.collect::<Vec<_>>()
+			.join("\n")
+	}
+
 	fn key(app: &mut App, code: KeyCode) {
+		render(app, 100, 30);
 		app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
 	}
 
 	fn ctrl(app: &mut App, c: char) {
+		render(app, 100, 30);
 		app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
 	}
 
@@ -827,5 +856,82 @@ mod tests {
 
 		ctrl(&mut app, 'z');
 		assert!(!base.join("r/album").exists());
+	}
+
+	fn confirm_app(ops: Vec<tpfs_core::Op>) -> (tempfile::TempDir, App) {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+		fs::create_dir(base.join("l")).unwrap();
+		let mut app = App::new(base.join("l"), base.join("l"), base.join("state"), false).unwrap();
+		app.propose(Plan::new(ops, "test"));
+		(tmp, app)
+	}
+
+	fn long_moves(n: usize) -> Vec<tpfs_core::Op> {
+		let dir = PathBuf::from("/home/u/Fotky/2024/Dovolená v Chorvatsku/originály");
+		(0..n)
+			.map(|i| tpfs_core::Op::Move {
+				from: dir.join(format!("IMG_{i:04}.jpg")),
+				to: dir.join("vybrané/nejlepší z dovolené").join(format!("IMG_{i:04}.jpg")),
+			})
+			.collect()
+	}
+
+	#[test]
+	fn confirmation_shows_names_risk_and_keys_at_80x24_and_60x16() {
+		for (w, h) in [(80, 24), (60, 16)] {
+			let (_t, mut app) = confirm_app(long_moves(30));
+			let screen = render(&mut app, w, h);
+			assert!(screen.contains("IMG_0000.jpg"), "{w}x{h}:\n{screen}");
+			assert!(screen.contains("→"), "{w}x{h}: destination not shown\n{screen}");
+			assert!(screen.contains("Risk:"), "{w}x{h}: risk not shown\n{screen}");
+			assert!(screen.contains("Esc"), "{w}x{h}: keys not shown\n{screen}");
+		}
+	}
+
+	#[test]
+	fn medium_risk_is_not_approved_by_enter() {
+		let (_t, mut app) = confirm_app(long_moves(60)); // many operations: at least medium
+		assert!(matches!(&app.dialog, Some(Dialog::Confirm { risk, .. }) if risk.level != risk::Level::Low));
+		key(&mut app, KeyCode::Enter);
+		assert!(matches!(app.dialog, Some(Dialog::Confirm { .. })), "Enter applied a medium/high plan");
+	}
+
+	#[test]
+	fn high_risk_needs_the_whole_list_read_and_a_big_enough_terminal() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+		fs::create_dir_all(base.join("l/folder")).unwrap();
+		let mut ops = vec![tpfs_core::Op::Trash { path: base.join("l/folder") }];
+		ops.extend(long_moves(20));
+		let mut app = App::new(base.join("l"), base.join("l"), base.join("state"), false).unwrap();
+		app.propose(Plan::new(ops, ""));
+		assert!(matches!(&app.dialog, Some(Dialog::Confirm { risk, .. }) if risk.level == risk::Level::High));
+
+		// Too small: nothing can be approved.
+		let screen = render(&mut app, 30, 8);
+		assert!(screen.contains("too small") || !screen.contains("Proceed"), "{screen}");
+		app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+		assert!(matches!(app.dialog, Some(Dialog::Confirm { .. })));
+
+		// Normal size, but the list was not read to the end yet.
+		render(&mut app, 80, 24);
+		app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+		assert!(matches!(app.dialog, Some(Dialog::Confirm { .. })), "approved without reading the list");
+
+		// After scrolling to the end, `y` is accepted (here it fails validation-free paths, so the
+		// dialog goes away either way: the plan was handed to the executor).
+		app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+		render(&mut app, 80, 24);
+		app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+		assert!(!matches!(app.dialog, Some(Dialog::Confirm { issues, .. }) if issues.is_empty()));
+	}
+
+	#[test]
+	fn wide_and_combining_names_keep_columns_aligned() {
+		use crate::ui::tests_support::{pad_for_test as pad, width_for_test as width};
+		for name in ["plain.txt", "日本語.txt", "e\u{301}cole.txt"] {
+			assert_eq!(width(&pad(name, 20)), 20, "{name}");
+		}
 	}
 }

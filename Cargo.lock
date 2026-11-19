@@ -974,6 +974,7 @@ dependencies = [
  "ratatui",
  "tempfile",
  "tpfs-core",
+ "unicode-width",
 ]
 
 [[package]]

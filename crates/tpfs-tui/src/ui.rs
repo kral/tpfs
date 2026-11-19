@@ -63,8 +63,16 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
 	f.render_widget(Paragraph::new(status_line).style(Style::new().fg(Color::Gray).bg(Color::Black)), status);
 	draw_fkeys(f, fkeys);
 
+	if let Some(Dialog::Confirm { plan, risk, issues, offset, fits, seen_all }) = &mut app.dialog {
+		let view = draw_confirm(f, plan, risk, issues, *offset);
+		*offset = view.offset;
+		*fits = view.fits;
+		*seen_all |= view.at_end;
+		return;
+	}
 	match &app.dialog {
-		Some(Dialog::Confirm { plan, risk, issues }) => draw_confirm(f, plan, risk, issues),
+		Some(Dialog::Confirm { .. }) => {}
+
 		Some(Dialog::Input { title, value, .. }) => draw_input(f, title, value),
 		Some(Dialog::Help) => draw_help(f),
 		Some(Dialog::Sync { cmp, opts, offset }) => draw_sync(f, app, cmp, *opts, *offset),
@@ -200,21 +208,77 @@ fn draw_fkeys(f: &mut Frame, area: Rect) {
 	f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_confirm(f: &mut Frame, plan: &tpfs_core::Plan, risk: &tpfs_core::risk::Risk, issues: &[tpfs_core::Issue]) {
+pub(crate) struct ConfirmView {
+	pub offset: usize,
+	pub fits: bool,
+	pub at_end: bool,
+}
+
+/// One operation as one or two lines that always show the file names: long paths are shortened
+/// in the middle, never cut off at the end.
+fn op_lines(op: &tpfs_core::Op, width: usize) -> Vec<String> {
+	use tpfs_core::Op;
+	let s = |p: &std::path::Path| tpfs_core::sanitize(p.as_os_str());
+	let line = |verb: &str, text: String| format!("{verb:<7}{}", truncate_middle(&text, width.saturating_sub(7)));
+	match op {
+		Op::Move { from, to } => vec![line("MOVE", s(from)), line("   →", s(to))],
+		Op::Copy { from, to } => vec![line("COPY", s(from)), line("   →", s(to))],
+		Op::Rename { path, new_name } => {
+			vec![line("RENAME", s(path)), line("   →", tpfs_core::sanitize(new_name.as_ref()))]
+		}
+		Op::Trash { path } => vec![line("TRASH", s(path))],
+		Op::Mkdir { path } => vec![line("MKDIR", s(path))],
+		Op::Rmdir { path } => vec![line("RMDIR", s(path))],
+	}
+}
+
+/// Totals per kind of operation, e.g. "3 move · 1 trash".
+fn totals(plan: &tpfs_core::Plan) -> String {
+	use tpfs_core::Op;
+	let mut counts = [0usize; 6];
+	for op in &plan.ops {
+		counts[match op {
+			Op::Move { .. } => 0,
+			Op::Copy { .. } => 1,
+			Op::Rename { .. } => 2,
+			Op::Trash { .. } => 3,
+			Op::Mkdir { .. } => 4,
+			Op::Rmdir { .. } => 5,
+		}] += 1;
+	}
+	let names = ["move", "copy", "rename", "trash", "mkdir", "rmdir"];
+	counts.iter().zip(names).filter(|(n, _)| **n > 0).map(|(n, k)| format!("{n} {k}")).collect::<Vec<_>>().join(" · ")
+}
+
+/// The confirmation before anything changes. The risk, the totals and the keys are always on
+/// screen; the operation list scrolls in the space left. If even that does not fit, nothing can be
+/// approved and the dialog says so.
+fn draw_confirm(
+	f: &mut Frame,
+	plan: &tpfs_core::Plan,
+	risk: &tpfs_core::risk::Risk,
+	issues: &[tpfs_core::Issue],
+	offset: usize,
+) -> ConfirmView {
 	use tpfs_core::risk::Level;
 
-	let preview = plan.preview();
-	let mut lines: Vec<Line> = Vec::new();
+	let area = f.area();
+	let rect = Rect {
+		x: area.x + 1.min(area.width),
+		y: area.y + 1.min(area.height),
+		width: area.width.saturating_sub(2),
+		height: area.height.saturating_sub(2),
+	};
+	let w = rect.width.saturating_sub(4) as usize;
+	let frame = if risk.level == Level::High { Color::Red } else { Color::Black };
+
+	let mut head: Vec<Line> = Vec::new();
 	if !plan.reason.is_empty() {
-		lines.push(Line::styled(tpfs_core::sanitize(plan.reason.as_ref()), DIALOG.add_modifier(Modifier::BOLD)));
-		lines.push(Line::raw(""));
+		head.push(Line::styled(
+			truncate_right(&tpfs_core::sanitize(plan.reason.as_ref()), w),
+			DIALOG.add_modifier(Modifier::BOLD),
+		));
 	}
-	let shown = preview.len().min(12);
-	lines.extend(preview.iter().take(shown).map(|l| Line::raw(l.clone())));
-	if preview.len() > shown {
-		lines.push(Line::raw(format!("… and {} more", preview.len() - shown)));
-	}
-	lines.push(Line::raw(""));
 
 	let (risk_style, risk_text) = match risk.level {
 		Level::Low => (DIALOG, "Risk: low".to_owned()),
@@ -225,27 +289,96 @@ fn draw_confirm(f: &mut Frame, plan: &tpfs_core::Plan, risk: &tpfs_core::risk::R
 			(DIALOG.fg(Color::Red).add_modifier(Modifier::BOLD), format!("Risk: HIGH — {}", risk.reasons.join("; ")))
 		}
 	};
-	lines.push(Line::styled(risk_text, risk_style));
+	let mut foot: Vec<Line> = vec![Line::styled(truncate_right(&format!("Total: {}", totals(plan)), w), DIALOG)];
+	foot.extend(wrap(&risk_text, w).into_iter().map(|l| Line::styled(l, risk_style)));
+	let ops: Vec<String> = plan.ops.iter().flat_map(|op| op_lines(op, w)).collect();
 
-	let buttons = if issues.is_empty() {
-		lines.push(Line::raw("Nothing is overwritten; Ctrl+Z undoes it."));
-		if risk.level == Level::High {
-			"[ Y: Proceed ]   [ Esc: Cancel ]"
-		} else {
-			"[ Enter: Proceed ]   [ Esc: Cancel ]"
-		}
+	// Space for the list after the fixed parts; problems get at most a third of what is left.
+	let free = (rect.height as usize).saturating_sub(2 + head.len() + foot.len() + 3);
+	let shown_issues = issues.len().min(6).min((free / 3).max(1));
+	let rows = free.saturating_sub(shown_issues + usize::from(issues.len() > shown_issues));
+	let fits = w >= 20 && rows >= 2.min(ops.len().max(1));
+	let max_offset = ops.len().saturating_sub(rows.max(1));
+	let offset = offset.min(max_offset);
+	let at_end = fits && offset + rows >= ops.len();
+
+	let buttons = if !issues.is_empty() {
+		"[ Esc: Close ]".to_owned()
+	} else if !fits {
+		"Terminal too small to review this plan — enlarge it.   [ Esc: Cancel ]".to_owned()
 	} else {
-		lines.push(Line::raw(""));
-		for i in issues.iter().take(6) {
-			lines.push(Line::styled(format!("✗ {i}"), DIALOG.fg(Color::Red)));
+		match risk.level {
+			Level::Low => "[ Enter: Proceed ]   [ Esc: Cancel ]".to_owned(),
+			Level::Medium => "[ Y: Proceed ]   [ Esc: Cancel ]".to_owned(),
+			Level::High if at_end => "[ Y: Proceed ]   [ Esc: Cancel ]".to_owned(),
+			Level::High => "↓ PgDn: read the whole list to proceed   [ Esc: Cancel ]".to_owned(),
 		}
-		"[ Esc: Close ]"
 	};
+	if issues.is_empty() {
+		foot.push(Line::raw(truncate_right("Nothing is overwritten; Ctrl+Z undoes it.", w)));
+	} else {
+		for i in issues.iter().take(shown_issues) {
+			foot.push(Line::styled(truncate_middle(&format!("✗ {i}"), w), DIALOG.fg(Color::Red)));
+		}
+		if issues.len() > shown_issues {
+			foot.push(Line::styled(
+				format!("… {} more problem(s)", issues.len() - shown_issues),
+				DIALOG.fg(Color::Red),
+			));
+		}
+	}
+
+	let mut lines = head;
+	if fits {
+		lines.extend(ops.iter().skip(offset).take(rows).map(|l| Line::raw(l.clone())));
+		let shown = rows.min(ops.len());
+		for _ in shown..rows.min(ops.len().max(shown)) {
+			lines.push(Line::raw(""));
+		}
+		if ops.len() > rows {
+			lines.push(Line::styled(
+				format!("lines {}–{} of {} (↑↓ PgUp PgDn)", offset + 1, (offset + rows).min(ops.len()), ops.len()),
+				DIALOG.add_modifier(Modifier::DIM),
+			));
+		} else {
+			lines.push(Line::raw(""));
+		}
+	}
+	lines.extend(foot);
 	lines.push(Line::raw(""));
-	lines.push(Line::raw(buttons).centered());
+	lines.push(Line::raw(truncate_right(&buttons, w)).centered());
 
 	let title = format!(" {} operation(s) ", plan.ops.len());
-	dialog(f, &title, lines, if risk.level == Level::High { Color::Red } else { Color::Black });
+	f.render_widget(Clear, rect);
+	let block = Block::bordered()
+		.border_type(BorderType::Double)
+		.border_style(DIALOG.fg(frame))
+		.style(DIALOG)
+		.title(Line::styled(title, DIALOG.fg(frame).add_modifier(Modifier::BOLD)).centered());
+	let inner = block.inner(rect);
+	f.render_widget(block, rect);
+	f.render_widget(
+		Paragraph::new(lines).style(DIALOG),
+		inner.inner(ratatui::layout::Margin { horizontal: 1, vertical: 0 }),
+	);
+	ConfirmView { offset, fits, at_end }
+}
+
+/// Word-wrap to `width` display columns.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+	let mut out = vec![String::new()];
+	for word in text.split(' ') {
+		let last = out.last_mut().expect("never empty");
+		if !last.is_empty() && width_of(last) + 1 + width_of(word) > width {
+			out.push(String::new());
+		}
+		let last = out.last_mut().expect("never empty");
+		if !last.is_empty() {
+			last.push(' ');
+		}
+		last.push_str(&truncate_middle(word, width));
+	}
+	out
 }
 
 fn draw_input(f: &mut Frame, title: &str, value: &str) {
@@ -423,28 +556,83 @@ fn human(bytes: u64) -> String {
 	}
 }
 
+fn width_of(s: &str) -> usize {
+	unicode_width::UnicodeWidthStr::width(s)
+}
+
+fn char_width(c: char) -> usize {
+	unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// Pad to `width` display columns (wide CJK characters count twice, combining marks not at all).
 fn pad(s: &str, width: usize) -> String {
-	let len = s.chars().count();
+	let len = width_of(s);
 	if len >= width { s.to_owned() } else { format!("{s}{}", " ".repeat(width - len)) }
 }
 
+/// The longest prefix of `s` that fits in `width` columns.
+fn take_width(s: &str, width: usize) -> &str {
+	let mut used = 0;
+	for (i, c) in s.char_indices() {
+		used += char_width(c);
+		if used > width {
+			return &s[..i];
+		}
+	}
+	s
+}
+
+/// The longest suffix of `s` that fits in `width` columns.
+fn take_width_end(s: &str, width: usize) -> &str {
+	let mut used = 0;
+	for (i, c) in s.char_indices().rev() {
+		used += char_width(c);
+		if used > width {
+			return &s[i + c.len_utf8()..];
+		}
+	}
+	s
+}
+
 fn truncate_right(s: &str, width: usize) -> String {
-	if s.chars().count() <= width {
+	if width_of(s) <= width {
 		s.to_owned()
 	} else if width == 0 {
 		String::new()
 	} else {
-		format!("{}…", s.chars().take(width - 1).collect::<String>())
+		format!("{}…", take_width(s, width - 1))
 	}
 }
 
 fn truncate_left(s: &str, width: usize) -> String {
-	let len = s.chars().count();
-	if len <= width {
+	if width_of(s) <= width {
 		s.to_owned()
 	} else if width == 0 {
 		String::new()
 	} else {
-		format!("…{}", s.chars().skip(len - width + 1).collect::<String>())
+		format!("…{}", take_width_end(s, width - 1))
+	}
+}
+
+/// Shorten in the middle, keeping the end (the file name) whole when possible.
+fn truncate_middle(s: &str, width: usize) -> String {
+	if width_of(s) <= width {
+		return s.to_owned();
+	}
+	if width < 5 {
+		return truncate_left(s, width);
+	}
+	let tail = (width * 2 / 3).max(width.saturating_sub(12));
+	let head = width - 1 - tail;
+	format!("{}…{}", take_width(s, head), take_width_end(s, tail))
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+	pub(crate) fn pad_for_test(s: &str, w: usize) -> String {
+		super::pad(s, w)
+	}
+	pub(crate) fn width_for_test(s: &str) -> usize {
+		super::width_of(s)
 	}
 }

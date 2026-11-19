@@ -67,15 +67,14 @@ impl Panel {
 						Entry { display: sanitize(&name), name, is_dir, size, is_up: false, modified }
 					})
 					.collect();
-				list.sort_by(|a, b| {
-					b.is_dir.cmp(&a.is_dir).then_with(|| a.display.to_lowercase().cmp(&b.display.to_lowercase()))
-				});
+				list.sort_by_cached_key(|e| (!e.is_dir, e.display.to_lowercase()));
 				self.entries.extend(list);
 			}
 			Err(e) => self.error = Some(e.to_string()),
 		}
 
-		self.marked.retain(|m| self.entries.iter().any(|e| &e.name == m));
+		let names: std::collections::HashSet<&std::ffi::OsString> = self.entries.iter().map(|e| &e.name).collect();
+		self.marked.retain(|m| names.contains(m));
 		self.cursor = keep
 			.and_then(|k| self.entries.iter().position(|e| e.name == k))
 			.unwrap_or(0)

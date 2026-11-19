@@ -10,6 +10,7 @@ repository.workspace   = true
 [dependencies]
 tpfs-core = { workspace = true }
 ratatui     = { workspace = true }
+unicode-width = { workspace = true }
 
 [target.'cfg(any(unix, windows))'.dependencies]
 libc = { workspace = true }
