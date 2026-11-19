@@ -25,7 +25,7 @@ pub(crate) struct Fs {
 impl Fs {
 	/// Plain path-based operations (no roots). Production code always confines; this is the
 	/// non-Linux implementation of `confined` and a test helper.
-	#[cfg_attr(not(test), allow(dead_code))]
+	#[allow(dead_code)]
 	pub(crate) fn unconfined() -> Self {
 		Self {
 			#[cfg(any(target_os = "linux", target_vendor = "apple"))]
@@ -428,7 +428,8 @@ pub(crate) fn remove_part(part: &Path) -> io::Result<()> {
 	std::fs::remove_dir_all(part)
 }
 
-/// Set a folder's permissions through `fs` (confined on Linux).
+/// Set a folder's permissions through `fs` (confined on Linux and macOS).
+#[cfg(unix)]
 pub(crate) fn set_dir_mode_at(fs: &Fs, dir: &Path, perms: std::fs::Permissions) -> io::Result<()> {
 	fs.set_dir_mode(dir, perms)
 }
@@ -755,7 +756,7 @@ mod confined {
 
 		let (dfd, dname) = side(&dst, to);
 		let create = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-		let dst = openat(dfd, dname, create, Mode::from_raw_mode(meta.permissions().mode() & 0o7777))?;
+		let dst = openat(dfd, dname, create, Mode::from_raw_mode((meta.permissions().mode() & 0o7777) as rustix::fs::RawMode))?;
 
 		Ok(Some((File::from(src), File::from(dst))))
 	}
