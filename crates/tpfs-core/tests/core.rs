@@ -1368,6 +1368,16 @@ fn long_histories_are_read_in_linear_time() {
 			let json = serde_json::to_string(e).unwrap();
 			text.push_str(&format!("{:08x} {json}\n", crc32fast::hash(json.as_bytes())));
 		};
+		// An interrupted batch first: nothing after it may be archived, so the journal is read
+		// in full (compaction would otherwise keep it small).
+		line(&Entry::Begin {
+			batch: "open".into(),
+			at: 0,
+			source: "human".into(),
+			reason: String::new(),
+			digest: String::new(),
+			v: 1,
+		});
 		for i in 0..n {
 			let batch = format!("b{i}");
 			let p = s.root.join(format!("d{i}"));
@@ -1393,7 +1403,7 @@ fn long_histories_are_read_in_linear_time() {
 		(0..5)
 			.map(|_| {
 				let started = std::time::Instant::now();
-				assert_eq!(j.batches().unwrap().len(), n);
+				assert_eq!(j.batches().unwrap().len(), n + 1);
 				started.elapsed()
 			})
 			.min()
@@ -2125,4 +2135,136 @@ fn a_copy_too_deep_for_its_target_is_refused() {
 fn undo_errors_print_batch_ids_safely() {
 	let e = ExecError::Undo { batch: "evil\u{1b}]52;c;x\u{7}".into(), error: "x".into() };
 	assert!(!e.to_string().chars().any(char::is_control), "{e}");
+}
+
+/// Journal text of `n` committed one-step batches named `c<i>` (each a mkdir under `root`).
+fn committed_batches(root: &Path, n: usize) -> String {
+	let mut text = String::new();
+	let mut line = |e: &Entry| {
+		let json = serde_json::to_string(e).unwrap();
+		text.push_str(&format!("{:08x} {json}\n", crc32fast::hash(json.as_bytes())));
+	};
+	for i in 0..n {
+		let batch = format!("c{i}");
+		let p = root.join(format!("d{i}"));
+		line(&Entry::Begin {
+			batch: batch.clone(),
+			at: 0,
+			source: "human".into(),
+			reason: String::new(),
+			digest: String::new(),
+			v: 1,
+		});
+		line(&Entry::Intent {
+			batch: batch.clone(),
+			index: 0,
+			forward: Op::Mkdir { path: p.clone() },
+			inverse: Op::Rmdir { path: p },
+		});
+		line(&Entry::Done { batch: batch.clone(), index: 0, check: None, mode: None });
+		line(&Entry::Commit { batch });
+	}
+	text
+}
+
+/// Finished history moves to the archive: undone and rolled back batches go, committed ones stay
+/// undoable, and `archived()` still shows what went.
+#[test]
+fn compaction_archives_finished_batches_and_keeps_undo_working() {
+	let s = Sandbox::new();
+	let a = run(&s, vec![Op::Mkdir { path: s.root.join("a") }]);
+	let b = run(&s, vec![Op::Mkdir { path: s.root.join("b") }]);
+	undo(&s).unwrap().unwrap(); // b undone
+	let mut j = s.journal();
+	begin(&mut j, "rolled-back");
+	j.append(&Entry::Abort { batch: "rolled-back".into() }).unwrap();
+	let before = fs::metadata(j.path()).unwrap().len();
+	assert_eq!(j.compact().unwrap(), 2);
+	assert!(fs::metadata(j.path()).unwrap().len() < before);
+	let left = j.batches().unwrap();
+	assert_eq!(left.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(), [a.as_str()]);
+	let archived = j.archived().unwrap();
+	assert_eq!(archived.len(), 2);
+	assert!(archived.iter().any(|x| x.id == b && x.status == BatchStatus::Undone));
+	assert_eq!(j.compact().unwrap(), 0, "nothing more to archive");
+	drop(j);
+	assert_eq!(undo(&s).unwrap().unwrap().id, a);
+	assert!(!s.root.join("a").exists());
+	assert!(!s.state.join("journal.jsonl.compact").exists());
+}
+
+/// Only the newest committed batches stay undoable; the older ones are archived.
+#[test]
+fn compaction_keeps_the_newest_committed_batches() {
+	let s = Sandbox::new();
+	drop(s.journal());
+	let n = tpfs_core::KEEP_COMMITTED + 5;
+	fs::write(s.state.join("journal.jsonl"), committed_batches(&s.root, n)).unwrap();
+	let mut j = s.journal();
+	assert_eq!(j.compact().unwrap(), 5);
+	let left = j.batches().unwrap();
+	assert_eq!(left.len(), tpfs_core::KEEP_COMMITTED);
+	assert_eq!(left[0].id, "c5");
+	assert_eq!(left.last().unwrap().id, format!("c{}", n - 1));
+	assert_eq!(j.archived().unwrap().iter().map(|b| b.id.clone()).collect::<Vec<_>>(), ["c0", "c1", "c2", "c3", "c4"]);
+}
+
+/// Nothing at or after an interrupted batch is archived (its recovery looks at what came after
+/// it), and nothing at all while the journal has an unreadable line.
+#[test]
+fn compaction_leaves_interrupted_batches_and_damage_alone() {
+	let s = Sandbox::new();
+	let a = run(&s, vec![Op::Mkdir { path: s.root.join("a") }]);
+	undo(&s).unwrap().unwrap();
+	let mut j = s.journal();
+	begin(&mut j, "open");
+	drop(j);
+	let b = run_unchecked(&s, vec![Op::Mkdir { path: s.root.join("b") }]);
+	let mut j = s.journal();
+	// `b` was refused (a batch is still interrupted), so the journal holds a, open.
+	assert!(b.is_err());
+	assert_eq!(j.compact().unwrap(), 1, "only the undone batch before the interrupted one");
+	assert_eq!(j.archived().unwrap()[0].id, a);
+	assert_eq!(j.batches().unwrap()[0].id, "open");
+
+	let mut raw = fs::OpenOptions::new().append(true).open(j.path()).unwrap();
+	std::io::Write::write_all(&mut raw, b"garbage line\n").unwrap();
+	assert_eq!(j.compact().unwrap(), 0);
+}
+
+fn run_unchecked(s: &Sandbox, ops: Vec<Op>) -> Result<String, ExecError> {
+	let mut j = s.journal();
+	Executor::new(&s.validator(), &mut j, s.trash()).execute(&Plan::new(ops, ""), Source::Human).map(|b| b.id)
+}
+
+/// A big journal is compacted when it is opened, and the archive survives a compaction cut short
+/// (records appended twice are shown once).
+#[test]
+fn a_big_journal_is_compacted_on_open() {
+	let s = Sandbox::new();
+	drop(s.journal());
+	let n = tpfs_core::KEEP_COMMITTED + 20_000;
+	let text = committed_batches(&s.root, n);
+	assert!(text.len() as u64 >= 4 << 20, "{}", text.len());
+	fs::write(s.state.join("journal.jsonl"), &text).unwrap();
+	let mut j = s.journal();
+	assert_eq!(j.batches().unwrap().len(), tpfs_core::KEEP_COMMITTED);
+	let archive = j.archive_path();
+	// A compaction cut short after it appended to the archive: the same records again.
+	let again = fs::read(&archive).unwrap();
+	let mut f = fs::OpenOptions::new().append(true).open(&archive).unwrap();
+	std::io::Write::write_all(&mut f, &again).unwrap();
+	assert_eq!(j.archived().unwrap().len(), 20_000);
+}
+
+/// One engine at a time, also across a compaction (the lock is on its own file).
+#[test]
+fn the_journal_lock_holds_across_compaction() {
+	let s = Sandbox::new();
+	run(&s, vec![Op::Mkdir { path: s.root.join("a") }]);
+	undo(&s).unwrap().unwrap();
+	let mut j = s.journal();
+	assert_eq!(j.compact().unwrap(), 1);
+	let second = Journal::open(s.state.join("journal.jsonl"));
+	assert!(second.is_err_and(|e| e.to_string().contains("in use")));
 }

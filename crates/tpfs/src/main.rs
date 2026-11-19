@@ -33,7 +33,8 @@ USAGE:
                 [--apply]                         confirm and execute (or --approve <digest>)
                 [--json]                          print the plan as JSON (for `tpfs apply -`)
   tpfs undo [--approve <batch>]                 revert the most recent batch
-  tpfs log [<batch>]                            list batches, or every step of one batch and its undo
+  tpfs log [--all] [<batch>]                    list batches (--all: with the archived history), or
+                                                every step of one batch and its undo
   tpfs recover                                  roll back batches interrupted by a crash
                 [--abandon <batch>]               give up on one recovery cannot handle (damaged, or
                                                   older than newer changes): records it as abandoned
@@ -117,7 +118,7 @@ fn allowed(command: &str) -> Option<(&'static [&'static str], usize)> {
 		"apply" => (&["root", "approve", "source", "max-ops", "home"], 1),
 		"sync" => (&["both", "mirror", "apply", "approve", "json", "home"], 2),
 		"undo" => (&["approve", "home"], 0),
-		"log" => (&["home"], 1),
+		"log" => (&["home", "all"], 1),
 		"pending" => (&["home"], 0),
 		"recover" => (&["home", "abandon"], 0),
 		"mcp" => (&["root", "approval", "home"], 0),
@@ -137,6 +138,8 @@ struct Args {
 	home: Option<PathBuf>,
 	icons: bool,
 	both: bool,
+	/// `tpfs log --all`: the archived history too.
+	all: bool,
 	mirror: bool,
 	do_apply: bool,
 	json: bool,
@@ -188,6 +191,7 @@ fn parse_args() -> Result<Args, Fail> {
 		home: None,
 		icons: false,
 		both: false,
+		all: false,
 		mirror: false,
 		do_apply: false,
 		json: false,
@@ -201,8 +205,9 @@ fn parse_args() -> Result<Args, Fail> {
 	let e = |e: lexopt::Error| usage(e.to_string());
 	while let Some(arg) = parser.next().map_err(e)? {
 		if let Long(name) = &arg {
-			const FLAGS: [&str; 11] = [
+			const FLAGS: [&str; 12] = [
 				"root", "approve", "approval", "icons", "both", "mirror", "apply", "json", "max-ops", "home", "source",
+				"all",
 			];
 			if let Some(f) = FLAGS.iter().find(|f| **f == *name) {
 				args.given.push(f);
@@ -233,6 +238,7 @@ fn parse_args() -> Result<Args, Fail> {
 			}
 			Long("icons") => args.icons = true,
 			Long("both") => args.both = true,
+			Long("all") => args.all = true,
 			Long("mirror") => args.mirror = true,
 			Long("apply") => args.do_apply = true,
 			Long("json") => args.json = true,
@@ -392,7 +398,15 @@ fn run(args: Args) -> Res {
 		"log" => {
 			let (mut journal, _) = open_state(&args)?;
 			eprintln!("State: {}", tpfs_core::sanitize(state_dir(&args)?.as_os_str()));
-			let batches = journal.batches().map_err(|e| e.to_string())?;
+			let mut batches = journal.batches().map_err(|e| e.to_string())?;
+			// Older history, moved out of the journal once it grew (see `Journal::compact`).
+			let archived = if args.all || args.plan.is_some() {
+				journal.archived().map_err(|e| e.to_string())?
+			} else {
+				Vec::new()
+			};
+			let in_archive = fs::metadata(journal.archive_path()).is_ok_and(|m| m.len() > 0);
+			batches.splice(0..0, archived);
 			// `tpfs log <batch>`: every step of one batch, what it did and how it is undone.
 			if let Some(raw) = args.plan.as_deref() {
 				let id = raw
@@ -452,6 +466,9 @@ fn run(args: Args) -> Res {
 			}
 			if journal.corrupt_lines() > 0 {
 				eprintln!("warning: {} unreadable journal line(s) skipped", journal.corrupt_lines());
+			}
+			if in_archive && !args.all {
+				eprintln!("Older, finished batches are archived: `tpfs log --all` lists them too.");
 			}
 			Ok(ExitCode::SUCCESS)
 		}

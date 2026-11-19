@@ -337,6 +337,37 @@ fn log_lists_the_steps_of_one_batch() {
 	assert_eq!(code(&tpfs(&home, &["log", "nope"])), 2);
 }
 
+/// Archived history: `tpfs log` says it is there, `--all` lists it, and one of its batches can
+/// still be shown.
+#[test]
+fn log_shows_archived_history_on_request() {
+	let tmp = tempfile::TempDir::new().unwrap();
+	let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+	let (root, home) = (base.join("root"), base.join("home"));
+	fs::create_dir(&root).unwrap();
+	let id = {
+		let _quiet = journal_lock();
+		let v = tpfs_core::Validator::new([&root]).unwrap();
+		let mut j = tpfs_core::Journal::open(home.join("journal.jsonl")).unwrap();
+		let plan = tpfs_core::Plan::new(vec![tpfs_core::Op::Mkdir { path: root.join("a") }], "made and undone");
+		let id = tpfs_core::Executor::new(&v, &mut j, home.join("trash"))
+			.execute(&plan, tpfs_core::Source::Human)
+			.unwrap()
+			.id;
+		tpfs_core::Executor::new(&v, &mut j, home.join("trash")).undo_last().unwrap();
+		assert_eq!(j.compact().unwrap(), 1);
+		id
+	};
+	let o = tpfs(&home, &["log"]);
+	assert!(String::from_utf8_lossy(&o.stdout).contains("No batches"));
+	assert!(String::from_utf8_lossy(&o.stderr).contains("--all"), "{}", String::from_utf8_lossy(&o.stderr));
+	let o = tpfs(&home, &["log", "--all"]);
+	let out = String::from_utf8_lossy(&o.stdout);
+	assert!(out.contains(&id) && out.contains("undone"), "{out}");
+	let o = tpfs(&home, &["log", &id]);
+	assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+}
+
 /// Held while a journal is opened in this process or a child is spawned (see `tpfs`).
 fn journal_lock() -> std::sync::MutexGuard<'static, ()> {
 	static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
