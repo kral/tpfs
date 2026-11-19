@@ -2225,9 +2225,13 @@ fn compaction_leaves_interrupted_batches_and_damage_alone() {
 	assert_eq!(j.archived().unwrap()[0].id, a);
 	assert_eq!(j.batches().unwrap()[0].id, "open");
 
-	let mut raw = fs::OpenOptions::new().append(true).open(j.path()).unwrap();
+	// Written while no engine has the journal open (Windows locks it against other handles).
+	let path = j.path().to_path_buf();
+	drop(j);
+	let mut raw = fs::OpenOptions::new().append(true).open(&path).unwrap();
 	std::io::Write::write_all(&mut raw, b"garbage line\n").unwrap();
-	assert_eq!(j.compact().unwrap(), 0);
+	drop(raw);
+	assert_eq!(s.journal().compact().unwrap(), 0);
 }
 
 fn run_unchecked(s: &Sandbox, ops: Vec<Op>) -> Result<String, ExecError> {
