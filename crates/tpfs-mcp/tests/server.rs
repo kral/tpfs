@@ -346,6 +346,21 @@ fn listing_hides_only_tpfs_work_entries() {
 	assert!(!err, "{v}");
 	let names: Vec<&str> = v["entries"].as_array().unwrap().iter().map(|e| e["name"].as_str().unwrap()).collect();
 	assert_eq!(names, [".tpfs-notes.txt"], "{v}");
+
+	// Other spellings of tpfs's own names (case, `ſ`, trailing dot) are its own too: neither
+	// listed nor reachable by a plan.
+	for name in [".TPFS-TRASH-1000", ".tpf\u{17f}-trash-1000", ".tpfs-trash-1000."] {
+		if cfg!(windows) && name.ends_with('.') {
+			continue; // not a name Windows can create
+		}
+		fs::create_dir(f.root.join(name)).unwrap();
+		let (v, err) = f.tool("list_directory", json!({ "path": f.root }));
+		assert!(!err && !v.to_string().contains("trash-1000"), "{name}: {v}");
+		let (v, err) =
+			f.tool("propose_plan", json!({ "plan": { "ops": [{ "op": "trash", "path": f.root.join(name) }] } }));
+		assert!(err && v.to_string().contains("own working data"), "{name}: {v}");
+		fs::remove_dir(f.root.join(name)).unwrap();
+	}
 }
 
 #[test]

@@ -679,7 +679,9 @@ fn read_only_entries_are_removed_on_windows() {
 	let root = tpfs_core::canonicalize(other.path()).unwrap();
 	let drive = |p: &std::path::Path| p.components().next().map(|c| c.as_os_str().to_ascii_lowercase());
 	if drive(&root) == drive(&s.state) {
-		eprintln!("skipped cross-volume: the target folder and the state are on one drive");
+		// CI's runners have two drives: there the cross-volume path must really be exercised.
+		assert!(std::env::var_os("CI").is_none(), "the target folder and the state are on one drive");
+		eprintln!("cross-volume part runs on one drive here");
 	}
 	let f = root.join("ro.txt");
 	fs::write(&f, "R").unwrap();

@@ -343,6 +343,7 @@ fn run(args: Args) -> Res {
 						steps.len(),
 						tpfs_core::sanitize(b.reason.as_ref())
 					);
+					eprintln!("These changes will be reversed:");
 					for s in steps.iter().take(20) {
 						eprintln!("  {}", s.forward.normalized());
 					}
@@ -359,7 +360,19 @@ fn run(args: Args) -> Res {
 					)));
 				}
 			}
-			match Executor::new(&validator, &mut journal, trash).undo_last() {
+			let mut executor = Executor::new(&validator, &mut journal, trash);
+			// Exactly the batch shown and approved: another process may have committed one since.
+			let result = match &last {
+				Some(b) => executor.undo_batch(&b.id),
+				None => executor.undo_last(),
+			};
+			match result {
+				Err(ExecError::Undo { error, .. }) if error.contains("no longer the newest batch") => {
+					return Err(cancelled(format!(
+						"the history changed meanwhile: {}; run `tpfs undo` again",
+						tpfs_core::sanitize(error.as_ref())
+					)));
+				}
 				Ok(Some(b)) => {
 					println!("Undone batch {} ({} step(s)):", tpfs_core::sanitize(b.id.as_ref()), b.steps);
 					for s in last.iter().flat_map(|l| l.steps.iter().filter(|s| s.done && !s.undone)) {
@@ -501,6 +514,8 @@ fn run(args: Args) -> Res {
 				state: std::path::absolute(state_dir(&args)?).map_err(|e| e.to_string())?,
 				approval: args.approval,
 			};
+			// Checked now, not after the human approved a plan that could then not be applied.
+			tpfs_core::private_dir(&config.state).map_err(|e| e.to_string())?;
 			let mut server = tpfs_mcp::Server::new(config).map_err(|e| format!("invalid root: {e}"))?;
 			eprintln!("tpfs mcp: serving on stdio");
 			server.run(io::stdin().lock(), io::stdout().lock()).map_err(|e| e.to_string())?;
@@ -508,7 +523,7 @@ fn run(args: Args) -> Res {
 		}
 		"pending" => {
 			let store = tpfs_mcp::Store::new(&state_dir(&args)?);
-			let (pending, damaged) = store.scan();
+			let (pending, damaged) = store.scan().map_err(|e| e.to_string())?;
 			if pending.is_empty() && damaged.is_empty() {
 				println!("No pending plans.");
 			}

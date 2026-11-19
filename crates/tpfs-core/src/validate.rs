@@ -20,6 +20,8 @@ pub const MAX_REASON: usize = 10_000;
 
 /// Longest path accepted, in bytes (PATH_MAX on Linux; Windows long paths fit too).
 pub const MAX_PATH: usize = 4096;
+/// Most folders a path in a plan may go through.
+pub const MAX_DEPTH: usize = 256;
 
 /// A problem found in a plan. `index` points at the offending operation (0-based), if any.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,10 +73,31 @@ pub fn is_own_name(name: &std::ffi::OsStr) -> bool {
 	})
 }
 
-/// A name as a case-insensitive volume compares it: lower case, with the letters that fold to
-/// plain ASCII (`ſ` → `s`, Kelvin sign → `k`) folded too, so no spelling slips past a check.
+/// A name the way the lenient volumes compare it, for checks that must not be dodged by another
+/// spelling of tpfs's own names: lower case; the letters whose case folding is plain ASCII (`ſ`,
+/// the Kelvin sign, the `ﬀ`…`ﬆ` ligatures) folded; and trailing dots and spaces dropped, which
+/// Windows and the FAT/exFAT drivers ignore. Not full Unicode folding or normalisation: the
+/// protected names themselves are ASCII, apart from a user's own folder names.
 fn fold(name: &str) -> String {
-	name.to_lowercase().replace('\u{17f}', "s")
+	let mut out = String::with_capacity(name.len());
+	for c in name.chars().flat_map(char::to_lowercase) {
+		match c {
+			'\u{17f}' => out.push('s'),
+			'\u{fb00}' => out.push_str("ff"),
+			'\u{fb01}' => out.push_str("fi"),
+			'\u{fb02}' => out.push_str("fl"),
+			'\u{fb03}' => out.push_str("ffi"),
+			'\u{fb04}' => out.push_str("ffl"),
+			'\u{fb05}' | '\u{fb06}' => out.push_str("st"),
+			c => out.push(c),
+		}
+	}
+	let kept = out.trim_end_matches(['.', ' ']).len();
+	// "." and ".." stay what they are.
+	if kept > 0 && !matches!(out.as_str(), "." | "..") {
+		out.truncate(kept);
+	}
+	out
 }
 
 /// Whether `path` is `base` or inside it, letter case ignored: on a volume that ignores case,
@@ -233,8 +256,8 @@ impl Validator {
 						})
 						.contains(std::ffi::OsStr::new(new_name))
 				};
-				let old_name = source.file_name().map(|n| n.to_string_lossy().to_lowercase());
-				let case_only = target != source && old_name == Some(new_name.to_lowercase());
+				let old_name = source.file_name().map(|n| fold(&n.to_string_lossy()));
+				let case_only = target != source && old_name == Some(fold(new_name));
 				// Cheap checks first; the folder is read only for an entry with several names.
 				let alias = case_only && same_file(&source, &target) && !sim.state.contains_key(&sim_key(&target));
 				let fold = alias && (crate::fsops::link_count(&source) == Some(1) || !own_entry());
@@ -288,6 +311,10 @@ impl Validator {
 				}
 				if !sim.is_empty_dir(&path) {
 					return Err(format!("Directory is not empty: {}", show(&path)));
+				}
+				// An empty mounted disk is not an empty folder (its undo could not mount it back).
+				if on_disk {
+					refuse_mount_point(&path)?;
 				}
 				sim.set(path, false);
 				Ok(())
@@ -349,6 +376,11 @@ impl Validator {
 		let path = normalize(path).ok_or_else(|| format!("Path must be absolute: {}", show(path)))?;
 		if path.as_os_str().len() > MAX_PATH {
 			return Err(format!("Path is longer than {MAX_PATH} bytes."));
+		}
+		// Each check below looks at every folder on the path: a bound on their number keeps a plan
+		// of very deep paths from taking minutes to validate.
+		if path.components().count() > MAX_DEPTH {
+			return Err(format!("Path is more than {MAX_DEPTH} folders deep."));
 		}
 		if path.to_str().is_none() {
 			// The plan, its digest and the journal store paths as JSON strings.
@@ -669,18 +701,56 @@ fn human(bytes: u64) -> String {
 mod tests {
 	use super::*;
 
-	/// A tree wider than the plan's budget is not measured: `None`, with no more pending paths
-	/// held than the budget allowed.
+	/// A tree with more entries than the plan's budget is not measured: `None`. A deep, narrow
+	/// chain never holds more than one pending path, so only the entry budget can stop it.
 	#[test]
 	fn tree_size_stops_at_the_budget() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let mut deep = tmp.path().join("chain");
+		for _ in 0..30 {
+			deep = deep.join("d");
+		}
+		fs::create_dir_all(&deep).unwrap();
+		let chain = tmp.path().join("chain");
+		assert_eq!(tree_size(&chain, &mut 10), None);
+		let mut budget = 100;
+		assert_eq!(tree_size(&chain, &mut budget), Some(0));
+		assert_eq!(budget, 69);
+	}
+
+	/// A wide folder stops as soon as the pending paths would outgrow what the budget can still
+	/// measure, before reading the rest.
+	#[test]
+	fn tree_size_holds_no_more_than_the_budget() {
 		let tmp = tempfile::TempDir::new().unwrap();
 		for i in 0..50 {
 			fs::write(tmp.path().join(format!("f{i}")), "x").unwrap();
 		}
 		let mut budget = 10;
 		assert_eq!(tree_size(tmp.path(), &mut budget), None);
+		assert_eq!(budget, 9, "stopped while listing, before measuring any file");
 		let mut budget = 100;
 		assert_eq!(tree_size(tmp.path(), &mut budget), Some(50));
 		assert_eq!(budget, 49);
+	}
+
+	/// A disk mounted at a plan's path cannot be trashed, moved or removed (on every OS, with a
+	/// mount simulated).
+	#[test]
+	fn a_mount_point_is_refused_on_every_os() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let root = crate::path::canonicalize(tmp.path()).unwrap();
+		let m = root.join("m");
+		fs::create_dir(&m).unwrap();
+		FAKE_MOUNT.with(|f| *f.borrow_mut() = Some(m.clone()));
+		let v = Validator::new([&root]).unwrap();
+		for op in [
+			Op::Trash { path: m.clone() },
+			Op::Move { from: m.clone(), to: root.join("x") },
+			Op::Rmdir { path: m.clone() },
+		] {
+			let issues = v.validate(&crate::Plan::new(vec![op.clone()], ""));
+			assert!(issues.iter().any(|i| i.message.contains("mount point")), "{op}: {issues:?}");
+		}
 	}
 }

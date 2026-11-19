@@ -297,6 +297,16 @@ impl<'a> Executor<'a> {
 	/// the user's data — when a copy was changed after it was made. Every journaled path must still
 	/// be reachable without symlinks below the validator's roots, or in the trash.
 	pub fn undo_last(&mut self) -> Result<Option<BatchReport>, ExecError> {
+		self.undo_newest(None)
+	}
+
+	/// Undo the newest committed batch only if it is `expected`, the one the user was shown: a
+	/// batch committed since (by another process) is never undone in its place.
+	pub fn undo_batch(&mut self, expected: &str) -> Result<Option<BatchReport>, ExecError> {
+		self.undo_newest(Some(expected))
+	}
+
+	fn undo_newest(&mut self, expected: Option<&str>) -> Result<Option<BatchReport>, ExecError> {
 		let batches = self.journal.batches()?;
 		if let Some(b) = batches
 			.iter()
@@ -319,6 +329,15 @@ impl<'a> Executor<'a> {
 		let Some(batch) = batches.into_iter().rev().find(|b| b.status == BatchStatus::Committed) else {
 			return Ok(None);
 		};
+		if let Some(expected) = expected.filter(|e| *e != batch.id) {
+			return Err(ExecError::Undo {
+				batch: expected.to_owned(),
+				error: format!(
+					"it is no longer the newest batch ({} was committed since); nothing was changed",
+					batch.id
+				),
+			});
+		}
 
 		if batch.damaged {
 			return Err(ExecError::Undo {
@@ -360,8 +379,13 @@ impl<'a> Executor<'a> {
 		Plan { ops, reason: plan.reason.clone() }
 	}
 
-	/// A copy changed since its batch finished is the user's now: undo and recovery keep it.
+	/// A copy changed since its batch finished is the user's now: undo and recovery keep it. Not
+	/// once an earlier attempt published its trash copy (`undo_published`): what is left is that
+	/// attempt's half-removed original, and `replay` checks it is all in the trash copy.
 	fn copy_unchanged(&self, step: &crate::journal::Step) -> Result<(), String> {
+		if step.undo_published {
+			return Ok(());
+		}
 		if let (Op::Copy { to, .. }, Some(check)) = (&step.forward, &step.check)
 			&& let Some(to) = normalize(to)
 			&& exists(&to)
@@ -424,52 +448,8 @@ impl<'a> Executor<'a> {
 			}
 			_ => {}
 		}
-		if let (Op::Mkdir { path }, Some(mode)) = (&step.inverse, step.mode) {
-			// A removed folder comes back with its own permissions. `mkdir` fails if anything is
-			// there (atomic); once it succeeded the folder is ours, which is journaled before its
-			// mode is set, so a rerun after a crash in between finishes the job.
-			let path = n(path);
-			remove_part(fs, &part_path(&path, &t))?; // left by older versions
-			if !exists(&path) {
-				// Journaled *before* it is made, and made no wider than its owner bits: a rerun after
-				// a crash anywhere here finds the record and a private, empty folder (see
-				// `folder_as_restored`); without the record, a folder there is never taken over.
-				self.journal.write(&Entry::UndoPublished { batch: batch.to_owned(), index: step.index })?;
-				fs.mkdir_mode(&path, mode & 0o700)?;
-				return set_mode(fs, &path, mode);
-			}
-			// Already there: made by an earlier attempt of this undo (journaled, or an empty folder
-			// with exactly the recorded permissions), or by someone else — then undo stops.
-			return if folder_as_restored(&path, mode, step.undo_published) {
-				set_mode(fs, &path, mode)
-			} else {
-				Err(io::Error::new(
-					io::ErrorKind::AlreadyExists,
-					"something is there again, not made by tpfs; it is left as it is. Move or remove it \
-					 yourself, then run undo again",
-				))
-			};
-		}
 		if let Op::Mkdir { path } = &step.inverse {
-			// No mode on record (Windows, older journals): the same rule without the mode — a
-			// folder at the name is accepted only as this undo's own (journaled) or an empty one.
-			let path = n(path);
-			if exists(&path) {
-				let empty = fs::read_dir(&path).is_ok_and(|mut rd| rd.next().is_none());
-				return if step.undo_published || (path.is_dir() && empty) {
-					Ok(())
-				} else {
-					Err(io::Error::new(
-						io::ErrorKind::AlreadyExists,
-						"something is there again, not made by tpfs; it is left as it is. Move or remove it \
-						 yourself, then run undo again",
-					))
-				};
-			}
-			fs.mkdir(&path)?;
-			self.journal.write(&Entry::UndoPublished { batch: batch.to_owned(), index: step.index })?;
-			sync_parent(&path);
-			return Ok(());
+			return restore_dir(fs, self.journal, batch, step, &n(path), &t);
 		}
 		if already_applied(&step.inverse) {
 			return Ok(());
@@ -599,24 +579,19 @@ impl<'a> Executor<'a> {
 					continue;
 				}
 				let mut clean_step = true;
+				let recover_tag = tag(&format!("{}-recover", batch.id), step.index);
 				for fix in cleanup(&step.forward, &step.inverse, &tag(&batch.id, step.index), step.published) {
 					// A removed folder comes back with its own mode, through a private name.
-					if let (Fix::Op(Op::Mkdir { path }), Some(mode)) = (&fix, step.mode) {
+					if let Fix::Op(Op::Mkdir { path }) = &fix
+						&& matches!(step.forward, Op::Rmdir { .. })
+					{
 						let path = normalize(path).unwrap_or_else(|| path.clone());
-						let journal = &mut self.journal;
 						let result = self
 							.validator
 							.check_path(&path)
 							.map(|_| ())
 							.map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))
-							.and_then(|()| {
-								// Journaled before it is made (see the undo path).
-								journal
-									.write(&Entry::UndoPublished { batch: batch.id.clone(), index: step.index })
-									.map_err(|e| io::Error::other(e.to_string()))
-							})
-							.and_then(|()| fs.mkdir_mode(&path, mode & 0o700))
-							.and_then(|()| set_mode(&fs, &path, mode));
+							.and_then(|()| restore_dir(&fs, self.journal, &batch.id, step, &path, &recover_tag));
 						if let Err(e) = result {
 							errors.push(clean(format!("{fix}: {e}")));
 							clean_step = false;
@@ -635,14 +610,13 @@ impl<'a> Executor<'a> {
 						clean_step = false;
 					}
 				}
-				// A folder an earlier recovery recreated (journaled, or recognisable as our own
-				// creation) before it could set its mode.
+				// A folder an earlier recovery started to restore (journaled): finish it.
 				if clean_step
-					&& let (Op::Rmdir { path }, Some(mode)) = (&step.forward, step.mode)
+					&& step.undo_published
+					&& let Op::Rmdir { path } = &step.forward
 					&& let Some(path) = normalize(path)
-					&& path.is_dir()
-					&& folder_as_restored(&path, mode, step.undo_published)
-					&& let Err(e) = set_mode(&fs, &path, mode)
+					&& exists(&path)
+					&& let Err(e) = restore_dir(&fs, self.journal, &batch.id, step, &path, &recover_tag)
 				{
 					errors.push(clean(format!("{}: {e}", step.inverse)));
 					clean_step = false;
@@ -864,27 +838,97 @@ fn both_exist(old: &Path, new: &Path) -> io::Error {
 	)
 }
 
-/// Whether `path` is an empty folder an interrupted undo or recovery of an `rmdir` left: with the
-/// recorded `mode`, or — only when that attempt was journaled (`ours`) — with no more than its
-/// owner bits, before the mode was set (see `Fs::mkdir_mode`).
-fn folder_as_restored(path: &Path, mode: u32, ours: bool) -> bool {
+/// Bring back a folder an `rmdir` removed, with its recorded mode. It is made owner-only at a
+/// private name, journaled, then renamed into place without replacing anything: a folder at the
+/// name is ours only with the record and no private name left (the rename happened), so a rerun
+/// after a crash at any point finishes the job, and a folder someone else made is never taken over.
+fn restore_dir(
+	fs: &Fs,
+	journal: &mut Journal,
+	batch: &str,
+	step: &crate::journal::Step,
+	path: &Path,
+	tag: &str,
+) -> io::Result<()> {
+	let part = part_path(path, tag);
+	let something_there = || {
+		io::Error::new(
+			io::ErrorKind::AlreadyExists,
+			"something is there again, not made by tpfs; it is left as it is. Move or remove it yourself, \
+			 then run undo again",
+		)
+	};
+	if exists(&part) && !step.undo_published {
+		remove_part(fs, &part)?; // made, but not journaled: start again
+	}
+	if !exists(&part) {
+		if exists(path) {
+			return if step.undo_published || same_empty_folder(path, step.mode) {
+				finish_dir(fs, path, step.mode)
+			} else {
+				Err(something_there())
+			};
+		}
+		// Private while it is made; its own mode is set while it can still be opened (a mode
+		// without the owner's read bit would not let it be opened again).
+		fs.mkdir_mode(&part, 0o700)?;
+		crash_point("made")?;
+		finish_dir(fs, &part, step.mode)?;
+		sync_parent(&part);
+		journal.write(&Entry::UndoPublished { batch: batch.to_owned(), index: step.index })?;
+		crash_point("journaled")?;
+	}
+	match fs.rename_noreplace(&part, path) {
+		Err(_) if exists(path) => return Err(something_there()),
+		r => r?,
+	}
+	crash_point("renamed")?;
+	sync_parent(path);
+	finish_dir(fs, path, step.mode)
+}
+
+#[cfg(test)]
+thread_local! {
+	/// Where the tests stop a folder restore, as a crash would.
+	static CRASH_AT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+fn crash_point(_at: &'static str) -> io::Result<()> {
+	#[cfg(test)]
+	if CRASH_AT.with(|c| c.get() == Some(_at)) {
+		return Err(io::Error::other(format!("simulated crash after: {_at}")));
+	}
+	Ok(())
+}
+
+/// An empty folder with exactly the recorded mode: as good as restored (Unix only; without modes
+/// nothing tells it apart from someone else's).
+fn same_empty_folder(path: &Path, mode: Option<u32>) -> bool {
 	let Ok(m) = fs::symlink_metadata(path) else { return false };
-	// The recorded mode, or what our creation left before the mode was set (owner bits only,
-	// narrowed by the umask).
 	#[cfg(unix)]
-	let same_mode = {
+	let same = {
 		use std::os::unix::fs::PermissionsExt;
-		// Set-group-ID is inherited from a shared parent folder: it says nothing about who made it.
-		let now = m.permissions().mode() & 0o7777;
-		let base = now & 0o777;
-		now == mode || (ours && base & !(mode & 0o700) == 0)
+		mode == Some(m.permissions().mode() & 0o7777)
 	};
 	#[cfg(not(unix))]
-	let same_mode = {
-		let _ = (mode, ours);
-		true
+	let same = {
+		let _ = mode;
+		false
 	};
-	m.is_dir() && same_mode && fs::read_dir(path).is_ok_and(|mut rd| rd.next().is_none())
+	m.is_dir() && same && fs::read_dir(path).is_ok_and(|mut rd| rd.next().is_none())
+}
+
+/// Give a restored folder its recorded mode, unless it already has it.
+fn finish_dir(fs: &Fs, path: &Path, mode: Option<u32>) -> io::Result<()> {
+	#[cfg(unix)]
+	if let Some(mode) = mode {
+		use std::os::unix::fs::PermissionsExt;
+		if fs::symlink_metadata(path)?.permissions().mode() & 0o7777 != mode {
+			return set_mode(fs, path, mode);
+		}
+	}
+	let _ = (fs, path, mode);
+	Ok(())
 }
 
 /// Give a folder tpfs recreated the permissions it had before its `rmdir`.
@@ -896,9 +940,7 @@ fn set_mode(fs: &Fs, path: &Path, mode: u32) -> io::Result<()> {
 	}
 	#[cfg(not(unix))]
 	let _ = (fs, mode);
-	// The folder's own inode too: a file system that logs fsync per inode could otherwise keep
-	// the step's record but lose the mode.
-	crate::fsops::sync_dir(path);
+	// The folder itself was synced through the handle that changed its mode.
 	sync_parent(path);
 	Ok(())
 }
@@ -1236,5 +1278,187 @@ mod tests {
 		assert!(!dst.exists());
 		assert!(fs::read_dir(&root).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().starts_with(".tpfs-")));
 		assert_eq!(fs::read_to_string(inner.join("file")).unwrap(), "F");
+	}
+
+	/// An undo of a copy whose trash went through a copy (another volume) and stopped while
+	/// removing the original resumes: the rest is not mistaken for a change by the user.
+	#[test]
+	fn an_interrupted_undo_of_a_copy_resumes() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let base = crate::path::canonicalize(tmp.path()).unwrap();
+		let root = base.join("root");
+		fs::create_dir_all(root.join("src")).unwrap();
+		fs::write(root.join("src").join("a"), "A").unwrap();
+		fs::write(root.join("src").join("b"), "B").unwrap();
+		let v = Validator::new([&root]).unwrap();
+		let trash = base.join("state").join("trash");
+		let mut j = Journal::open(base.join("state").join("journal.jsonl")).unwrap();
+		let dst = root.join("dst");
+		let id = Executor::new(&v, &mut j, &trash)
+			.execute(&Plan::new(vec![Op::Copy { from: root.join("src"), to: dst.clone() }], ""), Source::Human)
+			.unwrap()
+			.id;
+		// The interrupted undo: a full copy published in its trash slot, the original half removed.
+		let slot = trash_slot(&trash, &format!("{id}-undo"), 0, &dst);
+		fs::create_dir_all(&slot).unwrap();
+		fs::write(slot.join("a"), "A").unwrap();
+		fs::write(slot.join("b"), "B").unwrap();
+		fs::remove_file(dst.join("b")).unwrap();
+		j.append(&Entry::UndoPublished { batch: id.clone(), index: 0 }).unwrap();
+		let done = Executor::new(&v, &mut j, &trash).undo_last().unwrap().unwrap();
+		assert_eq!(done.id, id);
+		assert!(!dst.exists());
+		assert_eq!(fs::read_to_string(slot.join("b")).unwrap(), "B");
+	}
+
+	fn rmdir_batch(base: &Path) -> (Validator, Journal, PathBuf, PathBuf, String) {
+		let root = base.join("root");
+		let d = root.join("shared");
+		fs::create_dir_all(&d).unwrap();
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+		}
+		let v = Validator::new([&root]).unwrap();
+		let trash = base.join("state").join("trash");
+		let mut j = Journal::open(base.join("state").join("journal.jsonl")).unwrap();
+		let id = Executor::new(&v, &mut j, &trash)
+			.execute(&Plan::new(vec![Op::Rmdir { path: d.clone() }], ""), Source::Human)
+			.unwrap()
+			.id;
+		(v, j, trash, d, id)
+	}
+
+	/// An undo that made its private folder and journaled it, but lost the rename to a folder
+	/// someone else made at the name, never takes that folder over, however often it is rerun.
+	#[test]
+	fn a_restored_folder_never_replaces_one_made_meanwhile() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let base = crate::path::canonicalize(tmp.path()).unwrap();
+		let (v, mut j, trash, d, id) = rmdir_batch(&base);
+		let part = part_path(&d, &tag(&format!("{id}-undo"), 0));
+		fs::create_dir(&part).unwrap();
+		j.append(&Entry::UndoPublished { batch: id.clone(), index: 0 }).unwrap();
+		fs::create_dir(&d).unwrap(); // someone else's, private and empty
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
+		}
+		for _ in 0..2 {
+			let err = Executor::new(&v, &mut j, &trash).undo_last().unwrap_err();
+			assert!(err.to_string().contains("something is there again"), "{err}");
+		}
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
+		}
+		// Once the user moves theirs away, the undo finishes with the original mode.
+		fs::remove_dir(&d).unwrap();
+		Executor::new(&v, &mut j, &trash).undo_last().unwrap().unwrap();
+		assert!(d.is_dir() && !part.exists());
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o755);
+		}
+	}
+
+	/// A crash at every point of a folder restore, in undo and in recovery: each rerun (twice)
+	/// finishes it with the recorded mode, and nothing is left at a private name.
+	#[test]
+	fn a_crash_anywhere_in_a_folder_restore_is_finished() {
+		for at in ["made", "journaled", "renamed"] {
+			// Undo.
+			let tmp = tempfile::TempDir::new().unwrap();
+			let base = crate::path::canonicalize(tmp.path()).unwrap();
+			let (v, mut j, trash, d, _) = rmdir_batch(&base);
+			CRASH_AT.with(|c| c.set(Some(at)));
+			let err = Executor::new(&v, &mut j, &trash).undo_last().unwrap_err();
+			CRASH_AT.with(|c| c.set(None));
+			assert!(err.to_string().contains("simulated crash"), "{at}: {err}");
+			#[cfg(unix)]
+			if let Ok(m) = fs::symlink_metadata(&d) {
+				use std::os::unix::fs::PermissionsExt;
+				// Never wider than the recorded mode while in place.
+				assert_eq!(m.permissions().mode() & 0o777 & !0o755, 0, "{at}");
+			}
+			Executor::new(&v, &mut j, &trash).undo_last().unwrap().unwrap();
+			assert!(Executor::new(&v, &mut j, &trash).undo_last().unwrap().is_none(), "{at}");
+			assert!(d.is_dir(), "{at}");
+			assert_no_parts(&base.join("root"));
+			#[cfg(unix)]
+			{
+				use std::os::unix::fs::PermissionsExt;
+				assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o755, "{at}");
+			}
+
+			// Recovery of a batch interrupted after its rmdir ran.
+			let tmp = tempfile::TempDir::new().unwrap();
+			let base = crate::path::canonicalize(tmp.path()).unwrap();
+			let root = base.join("root");
+			let d = root.join("shared");
+			fs::create_dir_all(&root).unwrap();
+			let v = Validator::new([&root]).unwrap();
+			let trash = base.join("state").join("trash");
+			let mut j = Journal::open(base.join("state").join("journal.jsonl")).unwrap();
+			for e in [
+				Entry::Begin {
+					batch: "b".into(),
+					at: 0,
+					source: "human".into(),
+					reason: String::new(),
+					digest: String::new(),
+					v: 1,
+				},
+				Entry::Intent {
+					batch: "b".into(),
+					index: 0,
+					forward: Op::Rmdir { path: d.clone() },
+					inverse: Op::Mkdir { path: d.clone() },
+				},
+				Entry::Mode { batch: "b".into(), index: 0, mode: 0o755 },
+			] {
+				j.append(&e).unwrap();
+			}
+			CRASH_AT.with(|c| c.set(Some(at)));
+			let report = Executor::new(&v, &mut j, &trash).recover().unwrap();
+			CRASH_AT.with(|c| c.set(None));
+			assert!(!report.errors.is_empty(), "{at}: {report:?}");
+			let report = Executor::new(&v, &mut j, &trash).recover().unwrap();
+			assert!(report.errors.is_empty(), "{at}: {report:?}");
+			let again = Executor::new(&v, &mut j, &trash).recover().unwrap();
+			assert!(again.errors.is_empty() && again.rolled_back.is_empty(), "{at}: {again:?}");
+			assert!(d.is_dir(), "{at}");
+			assert_no_parts(&root);
+			#[cfg(unix)]
+			{
+				use std::os::unix::fs::PermissionsExt;
+				assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o755, "{at}");
+			}
+		}
+	}
+
+	fn assert_no_parts(dir: &Path) {
+		assert!(
+			fs::read_dir(dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().starts_with(".tpfs-part-")),
+			"a private name was left in {}",
+			dir.display()
+		);
+	}
+
+	/// A private folder an undo made but never journaled (a crash in between) is dropped and the
+	/// restore starts again.
+	#[test]
+	fn an_unjournaled_private_folder_is_made_again() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let base = crate::path::canonicalize(tmp.path()).unwrap();
+		let (v, mut j, trash, d, id) = rmdir_batch(&base);
+		let part = part_path(&d, &tag(&format!("{id}-undo"), 0));
+		fs::create_dir(&part).unwrap();
+		Executor::new(&v, &mut j, &trash).undo_last().unwrap().unwrap();
+		assert!(d.is_dir() && !part.exists());
 	}
 }

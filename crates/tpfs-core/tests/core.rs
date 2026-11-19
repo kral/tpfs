@@ -599,13 +599,27 @@ fn plans_cannot_touch_tpfs_state() {
 		let plan = Plan::new(vec![op], "");
 		assert!(messages(&v, &plan).iter().any(|m| m.contains("tpfs's state")), "{:?}", messages(&v, &plan));
 	}
-	for n in [".tpf\u{17f}-trash-1000", ".TPF\u{17f}-PART-0123abcd-0"] {
+	for n in [
+		".tpf\u{17f}-trash-1000",
+		".TPF\u{17f}-PART-0123abcd-0",
+		".tpfs-trash-1000.",
+		".tpfs-trash-1000. .",
+		".tpfs-trash-1000 ",
+		".tpfs-case-0123abcd-0..",
+	] {
 		assert!(tpfs_core::is_own_name(n.as_ref()), "{n}");
 	}
+
+	// …and so is a spelling with trailing dots, which FAT, exFAT and Windows ignore.
+	let dotted = s.state.with_file_name(format!("{}.", s.state.file_name().unwrap().to_string_lossy()));
+	let plan = Plan::new(vec![Op::Trash { path: dotted }], "");
+	assert!(messages(&v, &plan).iter().any(|m| m.contains("tpfs's state")), "{:?}", messages(&v, &plan));
 
 	let keep = s.dir("keep");
 	let nested = Validator::new([&base]).unwrap().with_protected([keep.join("state")]);
 	let plan = Plan::new(vec![Op::Trash { path: keep.clone() }], "");
+	assert!(messages(&nested, &plan)[0].contains("contains tpfs's state"), "{:?}", messages(&nested, &plan));
+	let plan = Plan::new(vec![Op::Trash { path: keep.with_file_name("KEEP") }], "");
 	assert!(messages(&nested, &plan)[0].contains("contains tpfs's state"), "{:?}", messages(&nested, &plan));
 
 	// The executor protects its own state even when the caller's validator does not.
@@ -1315,8 +1329,7 @@ fn undo_never_trusts_a_look_alike_at_the_old_place() {
 
 #[test]
 fn long_histories_are_read_in_linear_time() {
-	// Timed at two sizes in one process: linear reading takes about 4× as long for 4× the
-	// batches, quadratic about 16×. No absolute limit, so a loaded machine does not fail it.
+	// Timed at two sizes in one process (the best of 5 reads each); no absolute limit.
 	fn time(n: usize) -> std::time::Duration {
 		let s = Sandbox::new();
 		let _ = s.journal();
@@ -1347,7 +1360,7 @@ fn long_histories_are_read_in_linear_time() {
 		}
 		fs::write(s.state.join("journal.jsonl"), text).unwrap();
 		let mut j = s.journal();
-		(0..2)
+		(0..5)
 			.map(|_| {
 				let started = std::time::Instant::now();
 				assert_eq!(j.batches().unwrap().len(), n);
@@ -1356,8 +1369,10 @@ fn long_histories_are_read_in_linear_time() {
 			.min()
 			.unwrap()
 	}
-	let (small, large) = (time(5_000), time(20_000));
-	assert!(large < small * 10, "5k batches: {small:?}, 20k: {large:?}");
+	// 16× the batches: about 16× the time if linear, 256× if quadratic; 64× leaves room for a
+	// loaded machine either way.
+	let (small, large) = (time(2_000), time(32_000));
+	assert!(large < small * 64, "2k batches: {small:?}, 32k: {large:?}");
 }
 
 #[test]
@@ -1936,4 +1951,54 @@ fn undoing_rmdir_restores_a_wide_mode() {
 	run(&s, vec![Op::Rmdir { path: d.clone() }]);
 	assert_eq!(undo(&s).unwrap().unwrap().steps, 1);
 	assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o755);
+}
+
+/// Undo of a named batch never undoes another one committed since it was shown.
+#[test]
+fn undo_batch_refuses_when_a_newer_batch_was_committed() {
+	let s = Sandbox::new();
+	let a = run(&s, vec![Op::Mkdir { path: s.root.join("a") }]);
+	let b = run(&s, vec![Op::Mkdir { path: s.root.join("b") }]);
+	let mut j = s.journal();
+	let err = Executor::new(&s.validator(), &mut j, s.trash()).undo_batch(&a).unwrap_err();
+	assert!(err.to_string().contains("no longer the newest batch"), "{err}");
+	assert!(s.root.join("a").exists() && s.root.join("b").exists());
+	let done = Executor::new(&s.validator(), &mut j, s.trash()).undo_batch(&b).unwrap().unwrap();
+	assert_eq!(done.id, b);
+	assert!(!s.root.join("b").exists() && s.root.join("a").exists());
+}
+
+/// Undo of an `rmdir` brings back a folder whose mode does not let its owner read it.
+#[cfg(unix)]
+#[test]
+fn undoing_rmdir_restores_a_mode_without_read() {
+	use std::os::unix::fs::PermissionsExt;
+	let s = Sandbox::new();
+	for mode in [0o300, 0o000] {
+		let d = s.root.join(format!("m{mode:o}"));
+		fs::create_dir(&d).unwrap();
+		fs::set_permissions(&d, fs::Permissions::from_mode(mode)).unwrap();
+		run(&s, vec![Op::Rmdir { path: d.clone() }]);
+		assert_eq!(undo(&s).unwrap().unwrap().steps, 1);
+		assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, mode);
+		fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
+	}
+}
+
+/// Paths deeper than the limit are refused up front, so validation stays quick.
+#[test]
+fn very_deep_paths_are_refused() {
+	let s = Sandbox::new();
+	let mut deep = s.root.clone();
+	for _ in 0..tpfs_core::MAX_DEPTH {
+		deep.push("a");
+	}
+	let plan = Plan::new(vec![Op::Mkdir { path: deep }], "");
+	let started = std::time::Instant::now();
+	assert!(
+		messages(&s.validator(), &plan).iter().any(|m| m.contains("folders deep")),
+		"{:?}",
+		messages(&s.validator(), &plan)
+	);
+	assert!(started.elapsed().as_secs() < 5);
 }

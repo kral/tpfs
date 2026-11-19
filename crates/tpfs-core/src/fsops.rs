@@ -201,15 +201,8 @@ impl Fs {
 			return result;
 		}
 		#[cfg(windows)]
-		if let Ok(m) = fs::symlink_metadata(path)
-			&& m.permissions().readonly()
-		{
-			// Windows refuses to delete a read-only file; the copy already carries the attribute.
-			let mut p = m.permissions();
-			#[allow(clippy::permissions_set_readonly_false)]
-			p.set_readonly(false);
-			fs::set_permissions(path, p)?;
-		}
+		return remove_writable(path, fs::remove_file);
+		#[cfg(not(windows))]
 		fs::remove_file(path)
 	}
 
@@ -444,24 +437,35 @@ impl Fs {
 		if let Some(result) = confined::rmdir(&self.anchors, path) {
 			return result;
 		}
-		// Windows refuses to remove a read-only folder (the private trash holds copies that kept
-		// the attribute): clear it first, and put it back if the removal still fails.
 		#[cfg(windows)]
-		if let Ok(m) = fs::symlink_metadata(path)
-			&& m.permissions().readonly()
-		{
-			let original = m.permissions();
-			let mut p = original.clone();
-			#[allow(clippy::permissions_set_readonly_false)]
-			p.set_readonly(false);
-			fs::set_permissions(path, p)?;
-			let result = fs::remove_dir(path);
-			if result.is_err() {
-				let _ = fs::set_permissions(path, original);
-			}
-			return result;
-		}
+		return remove_writable(path, fs::remove_dir);
+		#[cfg(not(windows))]
 		fs::remove_dir(path)
+	}
+}
+
+/// Remove `path` with `remove`, clearing a read-only attribute first: Windows refuses to delete
+/// read-only files and folders (the private trash holds copies that kept it). If the removal still
+/// fails, the attribute is put back, and a failure to do so is reported with the error.
+#[cfg(windows)]
+fn remove_writable(path: &Path, remove: fn(&Path) -> io::Result<()>) -> io::Result<()> {
+	let Some(original) = fs::symlink_metadata(path).ok().map(|m| m.permissions()).filter(fs::Permissions::readonly)
+	else {
+		return remove(path);
+	};
+	let mut p = original.clone();
+	#[allow(clippy::permissions_set_readonly_false)]
+	p.set_readonly(false);
+	fs::set_permissions(path, p)?;
+	match remove(path) {
+		Err(e) => match fs::set_permissions(path, original) {
+			Ok(()) => Err(e),
+			Err(r) => Err(io::Error::new(
+				e.kind(),
+				format!("{e}; its read-only attribute was cleared and could not be put back: {r}"),
+			)),
+		},
+		ok => ok,
 	}
 }
 
@@ -637,7 +641,9 @@ fn set_dir_mode(dir: &Path, perms: std::fs::Permissions) -> io::Result<()> {
 			OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
 			Mode::empty(),
 		)?;
-		File::from(fd).set_permissions(perms)
+		let dir = File::from(fd);
+		dir.set_permissions(perms)?;
+		dir.sync_all()
 	}
 	#[cfg(not(unix))]
 	{
@@ -713,7 +719,7 @@ pub(crate) fn sync_parent(path: &Path) {
 }
 
 /// fsync a directory so entries created in it survive a power loss (Unix; NTFS journals metadata).
-pub(crate) fn sync_dir(dir: &Path) {
+fn sync_dir(dir: &Path) {
 	// Not following a link, and never blocking (a FIFO swapped in for the folder must not hang a
 	// batch that holds the journal lock).
 	#[cfg(unix)]
@@ -968,7 +974,10 @@ mod confined {
 	pub(super) fn set_dir_mode(anchors: &[Anchor], dir: &Path, perms: std::fs::Permissions) -> Option<io::Result<()>> {
 		Some(locate(anchors, dir)?.and_then(|(fd, name)| {
 			let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-			File::from(openat(&fd, name, flags, Mode::empty())?).set_permissions(perms)
+			let dir = File::from(openat(&fd, name, flags, Mode::empty())?);
+			dir.set_permissions(perms)?;
+			// Through the same handle: the new mode may not let the folder be opened again.
+			dir.sync_all()
 		}))
 	}
 

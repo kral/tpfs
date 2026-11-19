@@ -34,9 +34,11 @@ impl Store {
 
 	pub fn put(&self, plan: &Plan, roots: &[PathBuf]) -> io::Result<Pending> {
 		create_private_dir(&self.dir)?;
+		// Only what `tpfs pending` shows (and can reject) counts against the limit.
 		let waiting = fs::read_dir(&self.dir)?
 			.filter_map(Result::ok)
 			.filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+			.filter(|e| e.path().file_stem().and_then(|s| s.to_str()).is_some_and(|id| check_id(id).is_ok()))
 			.count();
 		if waiting >= MAX_PENDING {
 			return Err(io::Error::other(format!(
@@ -72,20 +74,22 @@ impl Store {
 		})
 	}
 
-	/// Ids of pending files that cannot be read as plans (for `tpfs pending`, so they can be rejected).
-	/// Ids of pending plans that cannot be read or parsed (listed so they can be rejected).
-	pub fn damaged(&self) -> Vec<String> {
-		self.scan().1
-	}
-
+	/// Every pending plan, oldest first.
 	pub fn list(&self) -> io::Result<Vec<Pending>> {
-		Ok(self.scan().0)
+		Ok(self.scan()?.0)
 	}
 
-	/// Every pending plan, oldest first, and the ids of the damaged ones, in one read.
-	pub fn scan(&self) -> (Vec<Pending>, Vec<String>) {
+	/// Every pending plan, oldest first, and the ids of the ones that cannot be read or parsed
+	/// (listed so they can be rejected), in one read. No pending folder means none waiting.
+	pub fn scan(&self) -> io::Result<(Vec<Pending>, Vec<String>)> {
 		let (mut plans, mut damaged) = (Vec::new(), Vec::new());
-		let Ok(entries) = fs::read_dir(&self.dir) else { return (plans, damaged) };
+		let entries = match fs::read_dir(&self.dir) {
+			Ok(entries) => entries,
+			Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((plans, damaged)),
+			Err(e) => {
+				return Err(io::Error::new(e.kind(), format!("cannot read {}: {e}", self.dir.display())));
+			}
+		};
 		for e in entries.filter_map(Result::ok) {
 			let path = e.path();
 			if path.extension().is_none_or(|x| x != "json") {
@@ -102,7 +106,7 @@ impl Store {
 		}
 		plans.sort_by_key(|p| p.created);
 		damaged.sort();
-		(plans, damaged)
+		Ok((plans, damaged))
 	}
 
 	/// Record a human approval of exactly this pending plan (by digest).

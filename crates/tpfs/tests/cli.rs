@@ -355,3 +355,20 @@ fn a_damaged_pending_plan_is_listed_and_can_be_rejected() {
 	assert_eq!(code(&tpfs(&home, &["reject", "abcd1234"])), 0);
 	assert!(!file.exists());
 }
+
+/// `tpfs mcp` refuses a state folder others can write to before any plan is proposed, not
+/// after a human approved one that could then not be applied.
+#[cfg(unix)]
+#[test]
+fn mcp_refuses_a_shared_state_folder_at_start() {
+	use std::os::unix::fs::PermissionsExt;
+	let tmp = tempfile::TempDir::new().unwrap();
+	let home = tmp.path().join("home");
+	fs::create_dir(&home).unwrap();
+	fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+	let o = tpfs(&home, &["mcp", "--root", tmp.path().to_str().unwrap()]);
+	assert_ne!(code(&o), 0);
+	let err = String::from_utf8_lossy(&o.stderr);
+	assert!(err.contains("chmod 700") && !err.contains("serving"), "{err}");
+	assert!(o.stdout.is_empty());
+}

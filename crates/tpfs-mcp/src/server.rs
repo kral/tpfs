@@ -343,7 +343,9 @@ impl Server {
 			.execute(&pending.plan, Source::Agent);
 		// An approval is for one execution: the plan is used up either way.
 		let removed = self.store.remove(id);
-		let batch = result.map_err(|e| format!("{e}. The plan was used up; propose a corrected plan if needed."))?;
+		let batch = result.map_err(|e| {
+			format!("{}\nThe plan was used up; propose a corrected plan if needed.", e.to_string().trim_end())
+		})?;
 		removed.map_err(|e| {
 			format!("applied, but the approved plan could not be removed ({e}); reject it with `tpfs reject {id}`")
 		})?;

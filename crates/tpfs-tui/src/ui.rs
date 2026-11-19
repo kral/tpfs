@@ -6,7 +6,7 @@ use ratatui::{
 	layout::{Constraint, Layout, Rect},
 	style::{Color, Modifier, Style},
 	text::{Line, Span},
-	widgets::{Block, BorderType, Clear, Paragraph},
+	widgets::{Block, BorderType, Clear, Paragraph, Wrap},
 };
 
 use crate::{
@@ -60,7 +60,22 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
 			None => Line::raw(format!(" {}", app.status)),
 		},
 	};
-	f.render_widget(Paragraph::new(status_line).style(Style::new().fg(Color::Gray).bg(Color::Black)), status);
+	// A message wider than the screen (a failure with what to do next at its end) grows upwards
+	// over the panels, up to 4 rows, instead of losing its end.
+	let long = app.command.is_none() && app.quick.is_none() && status_line.width() > status.width as usize;
+	let status = if long {
+		let rows = status_line.width().div_ceil(status.width.max(1) as usize).min(4) as u16;
+		let rows = rows.min(status.y.saturating_sub(main.y) + 1);
+		let r = Rect { y: status.y + 1 - rows, height: rows, ..status };
+		f.render_widget(Clear, r);
+		r
+	} else {
+		status
+	};
+	f.render_widget(
+		Paragraph::new(status_line).wrap(Wrap { trim: false }).style(Style::new().fg(Color::Gray).bg(Color::Black)),
+		status,
+	);
 	draw_fkeys(f, fkeys);
 
 	if let Some(Dialog::Confirm { plan, risk, issues, offset, fits, seen_all, summary }) = &mut app.dialog {
@@ -85,9 +100,8 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
 					body.push(Line::raw(format!("… and {} more line(s)", lines.len() - i)));
 					break;
 				}
-				let style =
-					if l.starts_with("TRASH") || l.starts_with("RMDIR") { DIALOG.fg(Color::Red) } else { DIALOG };
-				body.push(Line::styled(truncate_middle(l, w), style));
+				// What will be reversed, not what will happen: no warning colour here.
+				body.push(Line::styled(truncate_middle(l, w), DIALOG));
 			}
 			body.push(Line::raw(""));
 			body.push(Line::raw("[ Y: Undo ]   [ Esc: Cancel ]").centered());
@@ -449,7 +463,8 @@ fn draw_sync(
 		Direction::Both => "↔",
 	};
 	let width = (f.area().width as usize).saturating_sub(10).clamp(40, 100);
-	let shown = (f.area().height as usize).saturating_sub(14).clamp(3, 14);
+	// The direction and key lines always fit: the list gets what is left.
+	let shown = (f.area().height as usize).saturating_sub(16).clamp(1, 14);
 
 	let mut lines = vec![
 		Line::styled(truncate_left(&format!("{l}  {arrow}  {r}"), width), DIALOG.add_modifier(Modifier::BOLD)),
@@ -481,7 +496,7 @@ fn draw_sync(
 	lines.push(Line::raw(""));
 	let mirror = match (opts.direction, opts.mirror) {
 		(Direction::Both, _) => "mirror: n/a",
-		(_, true) => "mirror: ON (target-only items go to the trash)",
+		(_, true) => "mirror: ON — extras in target → trash",
 		(_, false) => "mirror: off",
 	};
 	lines.push(Line::raw(format!("←/→ direction · B both ways · M {mirror}")));
@@ -518,23 +533,24 @@ fn draw_help(f: &mut Frame) {
 		("Backspace / ←", "parent directory (drive list at the top)"),
 		("Alt+F1 / Alt+F2", "drive for the left / right panel"),
 		("Shift+F2", "compare & sync the two folders"),
-		("Ins / Space / right click", "mark"),
+		("Ins / Space", "mark (also right click)"),
 		("F2", "rename"),
 		("F3 / Enter on a file", "view"),
 		("F4", "edit in $EDITOR"),
-		(":", "command line (runs in this folder, not journaled)"),
-		("letters", "quick search: jump to a name"),
+		(":", "command line (not journaled)"),
+		("letters", "quick search (Esc leaves it)"),
+		("Ctrl+R", "reload both panels"),
 		("F5 / F6", "copy / move to the other panel"),
 		("F7", "make directory"),
 		("F8 / Del", "move to trash"),
 		("F9 / Ctrl+Z", "undo the last change"),
-		("F10 / Ctrl+Q", "quit"),
+		("F10 / Ctrl+Q / C", "quit"),
 		("Mouse", "click, double click, wheel, F-key bar"),
 	];
 	let mut lines: Vec<Line> = rows
 		.iter()
 		.map(|(k, d)| {
-			Line::from(vec![Span::styled(format!(" {k:<26}"), DIALOG.add_modifier(Modifier::BOLD)), Span::raw(*d)])
+			Line::from(vec![Span::styled(format!(" {k:<18}"), DIALOG.add_modifier(Modifier::BOLD)), Span::raw(*d)])
 		})
 		.collect();
 	lines.push(Line::raw(""));

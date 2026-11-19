@@ -590,6 +590,7 @@ impl App {
 					String::new(),
 				];
 				let steps: Vec<_> = b.steps.iter().filter(|s| s.done && !s.undone).collect();
+				lines.push("These changes will be reversed:".into());
 				lines.extend(steps.iter().take(12).map(|s| s.forward.normalized().to_string()));
 				if steps.len() > 12 {
 					lines.push(format!("… and {} more", steps.len() - 12));
@@ -608,7 +609,7 @@ impl App {
 				return Err("the history changed meanwhile; press Undo again to see what it would revert".into());
 			}
 			Executor::new(&self.validator(), &mut j, self.state.join("trash"))
-				.undo_last()
+				.undo_batch(expected)
 				.map(|b| match b {
 					Some(b) => format!("Undone batch {}: {} step(s).", tpfs_core::sanitize(b.id.as_ref()), b.steps),
 					None => "Nothing to undo.".into(),
