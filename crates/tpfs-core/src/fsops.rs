@@ -1,10 +1,12 @@
 //! File operations that never overwrite anything.
 //!
-//! On Linux, paths inside the allowed roots are not resolved by path: the parent directory is opened
-//! from the root's directory descriptor with `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`, and the
-//! operation runs relative to it (`renameat2`, `mkdirat`, `unlinkat`, `openat`). A symlink swapped into
-//! the path after validation therefore makes the operation fail instead of redirecting it. Paths outside
-//! the roots (the trash) and other platforms use plain path-based calls.
+//! On Linux and macOS, paths inside the allowed roots are not resolved by plain path: the parent
+//! directory is opened without following any symlink (`openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`
+//! from the root's descriptor on Linux, `O_NOFOLLOW_ANY` on macOS 11+), and the operation runs relative
+//! to it (`renameat2`/`renameatx_np`, `mkdirat`, `unlinkat`, `openat`). A symlink swapped into the path
+//! after validation therefore makes the operation fail instead of redirecting it. On Windows each
+//! operation re-checks the path for links (symlinks, junctions) right before it runs — a much smaller
+//! window, but not zero. Paths outside the roots (the private trash) use plain path-based calls.
 
 use std::{
 	fs::{self, File, OpenOptions},
@@ -13,32 +15,51 @@ use std::{
 };
 
 pub(crate) struct Fs {
-	#[cfg(target_os = "linux")]
-	anchors: Vec<linux::Anchor>,
+	#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+	anchors: Vec<confined::Anchor>,
+	/// Elsewhere (Windows): roots whose paths are re-checked for links right before each operation.
+	#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+	roots: Vec<PathBuf>,
 }
 
 impl Fs {
 	/// Plain path-based operations (no roots). Production code always confines; this is the
 	/// non-Linux implementation of `confined` and a test helper.
-	#[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
+	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn unconfined() -> Self {
 		Self {
-			#[cfg(target_os = "linux")]
+			#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 			anchors: Vec::new(),
+			#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+			roots: Vec::new(),
 		}
 	}
 
 	/// Operations under any of `roots` are confined to it; roots are expected to be canonical.
 	pub(crate) fn confined(roots: &[PathBuf]) -> Self {
-		#[cfg(target_os = "linux")]
+		#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 		{
-			Self { anchors: roots.iter().filter_map(|r| linux::Anchor::open(r)).collect() }
+			Self { anchors: roots.iter().filter_map(|r| confined::Anchor::open(r)).collect() }
 		}
-		#[cfg(not(target_os = "linux"))]
+		#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 		{
-			let _ = roots;
-			Self::unconfined()
+			Self { roots: roots.to_vec() }
 		}
+	}
+
+	/// Windows: refuse a path that now goes through a symlink or junction below its root. Run right
+	/// before each operation, it leaves only a tiny window instead of the whole plan.
+	#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+	fn guard(&self, path: &Path) -> io::Result<()> {
+		for root in self.roots.iter().filter(|r| path.starts_with(r)) {
+			if let Ok(Some(link)) = crate::path::symlink_in_between(path, root) {
+				return Err(io::Error::new(
+					io::ErrorKind::PermissionDenied,
+					format!("refused: {} goes through a link ({})", path.display(), link.display()),
+				));
+			}
+		}
+		Ok(())
 	}
 
 	/// Rename that fails with `AlreadyExists` instead of replacing the target, atomically where the
@@ -46,8 +67,13 @@ impl Fs {
 	/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows. Only a file system without such
 	/// support (some network and FUSE file systems) falls back to check-then-rename.
 	pub(crate) fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
-		#[cfg(target_os = "linux")]
-		if let Some(result) = linux::rename(&self.anchors, from, to) {
+		#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+		{
+			self.guard(from)?;
+			self.guard(to)?;
+		}
+		#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+		if let Some(result) = confined::rename(&self.anchors, from, to) {
 			return result;
 		}
 
@@ -79,8 +105,10 @@ impl Fs {
 
 	/// Remove a file or symlink (never a directory), confined like the other operations.
 	pub(crate) fn remove_file(&self, path: &Path) -> io::Result<()> {
-		#[cfg(target_os = "linux")]
-		if let Some(result) = linux::unlink(&self.anchors, path) {
+		#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+		self.guard(path)?;
+		#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+		if let Some(result) = confined::unlink(&self.anchors, path) {
 			return result;
 		}
 		#[cfg(windows)]
@@ -99,8 +127,10 @@ impl Fs {
 	/// Names in a directory, read through a confined descriptor where possible, so a directory
 	/// swapped for a symlink is not followed out of the root.
 	fn list(&self, dir: &Path) -> io::Result<Vec<std::ffi::OsString>> {
-		#[cfg(target_os = "linux")]
-		if let Some(result) = linux::list(&self.anchors, dir) {
+		#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+		self.guard(dir)?;
+		#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+		if let Some(result) = confined::list(&self.anchors, dir) {
 			return result;
 		}
 		fs::read_dir(dir)?.map(|e| e.map(|e| e.file_name())).collect()
@@ -108,16 +138,20 @@ impl Fs {
 
 	/// Permissions of a directory just created by a copy, set through a confined descriptor.
 	fn set_dir_mode(&self, dir: &Path, perms: std::fs::Permissions) -> io::Result<()> {
-		#[cfg(target_os = "linux")]
-		if let Some(result) = linux::set_dir_mode(&self.anchors, dir, perms.clone()) {
+		#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+		self.guard(dir)?;
+		#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+		if let Some(result) = confined::set_dir_mode(&self.anchors, dir, perms.clone()) {
 			return result;
 		}
 		set_dir_mode(dir, perms)
 	}
 
 	fn symlink(&self, target: &Path, path: &Path) -> io::Result<()> {
-		#[cfg(target_os = "linux")]
-		if let Some(result) = linux::symlink(&self.anchors, target, path) {
+		#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+		self.guard(path)?;
+		#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+		if let Some(result) = confined::symlink(&self.anchors, target, path) {
 			return result;
 		}
 		make_symlink(target, path)
@@ -209,12 +243,17 @@ impl Fs {
 		let ft = meta.file_type();
 
 		if ft.is_file() {
-			#[cfg(target_os = "linux")]
-			if let Some((src, dst)) = linux::open_copy_pair(&self.anchors, from, to, &meta)? {
+			#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+			if let Some((src, dst)) = confined::open_copy_pair(&self.anchors, from, to, &meta)? {
 				check_regular(&src, from)?;
 				copy_stream(src, dst, from, &meta)?;
 				copied.push(Copied::of(rel, &meta));
 				return Ok(());
+			}
+			#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+			{
+				self.guard(from)?;
+				self.guard(to)?;
 			}
 			let src = open_regular(from)?;
 			let dst = OpenOptions::new().write(true).create_new(true).open(to)?;
@@ -236,16 +275,20 @@ impl Fs {
 	}
 
 	pub(crate) fn mkdir(&self, path: &Path) -> io::Result<()> {
-		#[cfg(target_os = "linux")]
-		if let Some(result) = linux::mkdir(&self.anchors, path) {
+		#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+		self.guard(path)?;
+		#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+		if let Some(result) = confined::mkdir(&self.anchors, path) {
 			return result;
 		}
 		fs::create_dir(path)
 	}
 
 	pub(crate) fn rmdir(&self, path: &Path) -> io::Result<()> {
-		#[cfg(target_os = "linux")]
-		if let Some(result) = linux::rmdir(&self.anchors, path) {
+		#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+		self.guard(path)?;
+		#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+		if let Some(result) = confined::rmdir(&self.anchors, path) {
 			return result;
 		}
 		fs::remove_dir(path)
@@ -505,8 +548,8 @@ pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
 	}
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+mod confined {
 	use std::{
 		ffi::OsStr,
 		fs::{File, Metadata},
@@ -518,10 +561,10 @@ mod linux {
 		path::{Path, PathBuf},
 	};
 
+	#[cfg(target_os = "linux")]
+	use rustix::fs::{ResolveFlags, openat2};
 	use rustix::{
-		fs::{
-			AtFlags, CWD, Mode, OFlags, RenameFlags, ResolveFlags, mkdirat, openat, openat2, renameat_with, unlinkat,
-		},
+		fs::{AtFlags, CWD, Mode, OFlags, RenameFlags, mkdirat, openat, renameat_with, unlinkat},
 		io::Errno,
 	};
 
@@ -532,8 +575,33 @@ mod linux {
 
 	impl Anchor {
 		pub(super) fn open(root: &Path) -> Option<Self> {
-			let fd = rustix::fs::open(root, OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).ok()?;
+			let fd = rustix::fs::open(root, DIR | OFlags::CLOEXEC, Mode::empty()).ok()?;
 			Some(Self { root: root.to_path_buf(), fd })
+		}
+	}
+
+	/// Flags for a directory opened only to act relative to it.
+	#[cfg(target_os = "linux")]
+	const DIR: OFlags = OFlags::PATH.union(OFlags::DIRECTORY);
+	#[cfg(target_vendor = "apple")]
+	const DIR: OFlags = OFlags::RDONLY.union(OFlags::DIRECTORY);
+
+	/// `O_NOFOLLOW_ANY` (macOS 11+): fail if any component of the path is a symlink.
+	#[cfg(target_vendor = "apple")]
+	const NOFOLLOW_ANY: OFlags = OFlags::from_bits_retain(0x2000_0000);
+
+	/// Open `rel` below the anchor without following any symlink and without leaving the root:
+	/// `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` on Linux, `O_NOFOLLOW_ANY` on macOS (the path
+	/// is already confined lexically; refusing every symlink keeps it there).
+	fn open_beneath(anchor: &Anchor, rel: &Path, flags: OFlags) -> Result<OwnedFd, Errno> {
+		#[cfg(target_os = "linux")]
+		{
+			openat2(&anchor.fd, rel, flags, Mode::empty(), RESOLVE)
+		}
+		#[cfg(target_vendor = "apple")]
+		{
+			let _ = &anchor.fd;
+			rustix::fs::open(anchor.root.join(rel), flags | NOFOLLOW_ANY, Mode::empty())
 		}
 	}
 
@@ -552,6 +620,7 @@ mod linux {
 		)
 	}
 
+	#[cfg(target_os = "linux")]
 	const RESOLVE: ResolveFlags =
 		ResolveFlags::BENEATH.union(ResolveFlags::NO_SYMLINKS).union(ResolveFlags::NO_MAGICLINKS);
 
@@ -563,7 +632,7 @@ mod linux {
 		let name = rel.file_name()?;
 		let parent = rel.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
 
-		match openat2(&anchor.fd, parent, OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty(), RESOLVE) {
+		match open_beneath(anchor, parent, DIR | OFlags::CLOEXEC) {
 			Ok(fd) => Some(Ok((fd, name))),
 			Err(Errno::NOSYS) if unconfined_ok() => None,
 			Err(Errno::NOSYS) => Some(Err(no_openat2())),
@@ -633,7 +702,7 @@ mod linux {
 		let rel = dir.strip_prefix(&anchor.root).ok()?;
 		let rel = if rel.as_os_str().is_empty() { Path::new(".") } else { rel };
 		let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-		let fd = match openat2(&anchor.fd, rel, flags, Mode::empty(), RESOLVE) {
+		let fd = match open_beneath(anchor, rel, flags) {
 			Ok(fd) => fd,
 			Err(Errno::NOSYS) if unconfined_ok() => return None,
 			Err(Errno::NOSYS) => return Some(Err(no_openat2())),

@@ -991,3 +991,54 @@ fn undoing_a_folder_removal_restores_its_permissions() {
 	undo(&s).unwrap().unwrap();
 	assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
 }
+
+#[test]
+#[cfg(unix)]
+fn undo_works_with_a_symlinked_state_folder() {
+	use std::os::unix::fs::PermissionsExt;
+	let s = Sandbox::new();
+	let base = s.root.parent().unwrap();
+	let real = base.join("real-state");
+	fs::create_dir(&real).unwrap();
+	fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+	let parent_link = base.join("link-parent");
+	std::os::unix::fs::symlink(base, &parent_link).unwrap();
+	// The state folder is reached through a symlinked parent, like /home -> /var/home.
+	let state = parent_link.join("real-state");
+	let f = s.file("f.txt", "F");
+	let v = Validator::new(tpfs_core::system_roots()).unwrap();
+	let mut j = Journal::open(state.join("journal.jsonl")).unwrap();
+	Executor::new(&v, &mut j, state.join("trash"))
+		.execute(&Plan::new(vec![Op::Trash { path: f.clone() }], ""), Source::Human)
+		.unwrap();
+	Executor::new(&v, &mut j, state.join("trash")).undo_last().unwrap().unwrap();
+	assert_eq!(fs::read_to_string(&f).unwrap(), "F");
+}
+
+#[test]
+fn a_journaled_path_that_only_looks_like_a_trash_is_still_checked() {
+	let s = Sandbox::new();
+	let outside = s.root.parent().unwrap().join("outside");
+	fs::create_dir_all(outside.join(".tpfs-trash-x")).unwrap();
+	let mut j = s.journal();
+	j.append(&Entry::Begin {
+		batch: "x".into(),
+		at: 0,
+		source: "agent".into(),
+		reason: String::new(),
+		digest: String::new(),
+		v: 1,
+	})
+	.unwrap();
+	let target = outside.join(".tpfs-trash-x").join("planted");
+	j.append(&Entry::Intent {
+		batch: "x".into(),
+		index: 0,
+		forward: Op::Mkdir { path: target.clone() },
+		inverse: Op::Mkdir { path: target.clone() },
+	})
+	.unwrap();
+	j.append(&Entry::Done { batch: "x".into(), index: 0, check: None, mode: None }).unwrap();
+	let report = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
+	assert!(!report.errors.is_empty() && !target.exists(), "{report:?}");
+}

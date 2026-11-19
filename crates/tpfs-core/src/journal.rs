@@ -144,9 +144,15 @@ pub struct Journal {
 impl Journal {
 	pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
 		let path = path.as_ref().to_path_buf();
-		if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+		let path = std::path::absolute(&path)?;
+		if let Some(dir) = path.parent() {
 			crate::path::private_dir(dir)?;
 		}
+		// The journal's own spelling, without symlinks on the way.
+		let path = match (path.parent().map(crate::path::canonicalize), path.file_name()) {
+			(Some(Ok(dir)), Some(name)) => dir.join(name),
+			_ => path,
+		};
 		crate::path::check_private_file(&path)?;
 
 		let mut options = OpenOptions::new();

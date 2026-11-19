@@ -109,7 +109,9 @@ pub enum Phase {
 
 impl<'a> Executor<'a> {
 	pub fn new(validator: &'a Validator, journal: &'a mut Journal, trash: impl Into<PathBuf>) -> Self {
-		let trash = trash.into();
+		// One spelling of the trash for every run: absolute and with no symlink on the way (a relative
+		// or symlinked state folder must not make journaled trash paths unusable for undo).
+		let trash = absolute_real(&trash.into());
 		let state = journal.path().parent().map(Path::to_path_buf);
 		let validator = validator.clone().with_protected(state.into_iter().chain([trash.clone()]));
 		Self { validator, journal, trash, hook: None }
@@ -166,9 +168,12 @@ impl<'a> Executor<'a> {
 			v: 1,
 		})?;
 
+		// Act on the paths as validated: spelled the way the file system spells them, under a root,
+		// with no symlink on the way (the confined calls refuse any other spelling).
+		let resolved = self.resolve_plan(plan);
 		let fs = Fs::confined(self.validator.roots());
 		let mut applied: Vec<Op> = Vec::new();
-		for (i, op) in plan.ops.iter().enumerate() {
+		for (i, op) in resolved.ops.iter().enumerate() {
 			// Re-check this step against the disk as it is right now: earlier steps are already
 			// applied, and the world may have changed since the plan was validated.
 			let recheck = self.validator.validate(&Plan::new(vec![op.clone()], ""));
@@ -289,6 +294,25 @@ impl<'a> Executor<'a> {
 		Ok(Some(BatchReport { id: batch.id, steps: reverted }))
 	}
 
+	/// The plan with every path replaced by its validated form (it passed validation, so each one
+	/// resolves; a path that no longer does is kept and fails its per-step re-check).
+	fn resolve_plan(&self, plan: &Plan) -> Plan {
+		let r = |p: &PathBuf| self.validator.check_path(p).unwrap_or_else(|_| p.clone());
+		let ops = plan
+			.ops
+			.iter()
+			.map(|op| match op {
+				Op::Move { from, to } => Op::Move { from: r(from), to: r(to) },
+				Op::Copy { from, to } => Op::Copy { from: r(from), to: r(to) },
+				Op::Rename { path, new_name } => Op::Rename { path: r(path), new_name: new_name.clone() },
+				Op::Trash { path } => Op::Trash { path: r(path) },
+				Op::Mkdir { path } => Op::Mkdir { path: r(path) },
+				Op::Rmdir { path } => Op::Rmdir { path: r(path) },
+			})
+			.collect();
+		Plan { ops, reason: plan.reason.clone() }
+	}
+
 	/// A copy changed since its batch finished is the user's now: undo and recovery keep it.
 	fn copy_unchanged(&self, step: &crate::journal::Step) -> Result<(), String> {
 		if let (Op::Copy { to, .. }, Some(check)) = (&step.forward, &step.check)
@@ -356,8 +380,7 @@ impl<'a> Executor<'a> {
 	fn check_journaled(&self, op: &Op) -> Result<(), String> {
 		for p in op.paths() {
 			let Some(p) = normalize(p) else { return Err(format!("journaled path is not absolute: {}", op)) };
-			let in_trash =
-				p.starts_with(&self.trash) || p.components().any(|c| crate::validate::is_trash_name(c.as_os_str()));
+			let in_trash = p.starts_with(&self.trash) || in_local_trash(&p);
 			let checked = if in_trash { Ok(p) } else { self.validator.check_path(&p) };
 			checked?;
 		}
@@ -475,6 +498,49 @@ impl<'a> Executor<'a> {
 			Op::Mkdir { path } => Op::Rmdir { path: n(path) },
 			Op::Rmdir { path } => Op::Mkdir { path: n(path) },
 		}
+	}
+}
+
+/// An absolute spelling of `path` without symlinks: its existing part canonicalised.
+fn absolute_real(path: &Path) -> PathBuf {
+	let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+	let mut rest = Vec::new();
+	let mut base = abs.as_path();
+	loop {
+		if let Ok(c) = crate::path::canonicalize(base) {
+			let mut out = c;
+			out.extend(rest.iter().rev());
+			return out;
+		}
+		match (base.parent(), base.file_name()) {
+			(Some(p), Some(n)) => {
+				rest.push(n);
+				base = p;
+			}
+			_ => return abs,
+		}
+	}
+}
+
+/// Whether `path` lies in a genuine per-file-system trash of this user: a `.tpfs-trash-<uid>`
+/// folder that is a real directory owned by the user and private. A path that merely contains such
+/// a name (a forged journal entry) does not count.
+fn in_local_trash(path: &Path) -> bool {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::{MetadataExt, PermissionsExt};
+		let uid = rustix::process::getuid().as_raw();
+		let name = format!(".tpfs-trash-{uid}");
+		path.ancestors().any(|a| {
+			a.file_name().is_some_and(|n| n == name.as_str())
+				&& fs::symlink_metadata(a)
+					.is_ok_and(|m| m.is_dir() && m.uid() == uid && m.permissions().mode() & 0o077 == 0)
+		})
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = path;
+		false
 	}
 }
 

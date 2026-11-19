@@ -53,11 +53,6 @@ pub struct Validator {
 /// Names tpfs uses for its own work inside user folders: local trash, partial copies, case renames.
 const OWN_PREFIXES: [&str; 3] = [".tpfs-trash-", ".tpfs-part-", ".tpfs-case-"];
 
-/// Whether a path name is a local trash folder of tpfs.
-pub(crate) fn is_trash_name(name: &std::ffi::OsStr) -> bool {
-	name.to_str().is_some_and(|n| n.starts_with(OWN_PREFIXES[0]))
-}
-
 /// Whether a path name is one of tpfs's own work names.
 pub(crate) fn is_own_name(name: &std::ffi::OsStr) -> bool {
 	name.to_str().is_some_and(|n| OWN_PREFIXES.iter().any(|p| n.starts_with(p)))
