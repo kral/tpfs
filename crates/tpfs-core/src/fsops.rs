@@ -872,7 +872,10 @@ mod tests {
 
 	#[test]
 	fn cross_device_copy_never_shows_a_partial_target() {
-		let Some((a, b)) = two_devices() else { return };
+		let Some((a, b)) = two_devices() else {
+			assert!(std::env::var_os("CI").is_none(), "CI must provide /dev/shm on its own file system");
+			return;
+		};
 		let from = a.path().join("dir");
 		fs::create_dir(&from).unwrap();
 		fs::write(from.join("x"), "x").unwrap();

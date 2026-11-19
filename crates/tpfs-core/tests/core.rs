@@ -647,7 +647,6 @@ fn undo_keeps_a_copy_that_was_changed_since() {
 	let a = s.file("report.txt", "v1");
 	let b = s.root.join("backup.txt");
 	run(&s, vec![Op::Copy { from: a, to: b.clone() }]);
-	std::thread::sleep(std::time::Duration::from_millis(20));
 	fs::write(&b, "edited by the user").unwrap();
 
 	let err = undo(&s).unwrap_err();
@@ -1065,4 +1064,157 @@ fn windows_long_paths_and_shares() {
 	assert!(moved.exists());
 	undo(&s).unwrap().unwrap();
 	assert!(f.exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn recover_does_not_follow_a_planted_symlink() {
+	let s = Sandbox::new();
+	let outside = s.root.parent().unwrap().join("outside");
+	fs::create_dir_all(&outside).unwrap();
+	fs::write(outside.join("x"), "not tpfs's").unwrap();
+	std::os::unix::fs::symlink(&outside, s.root.join("link")).unwrap();
+	let a = s.root.join("a");
+	let mut j = s.journal();
+	j.append(&Entry::Begin {
+		batch: "x".into(),
+		at: 0,
+		source: "agent".into(),
+		reason: String::new(),
+		digest: String::new(),
+		v: 1,
+	})
+	.unwrap();
+	j.append(&Entry::Intent {
+		batch: "x".into(),
+		index: 0,
+		forward: Op::Move { from: a.clone(), to: s.root.join("link/x") },
+		inverse: Op::Move { from: s.root.join("link/x"), to: a.clone() },
+	})
+	.unwrap();
+	j.append(&Entry::Done { batch: "x".into(), index: 0, check: None, mode: None }).unwrap();
+	let report = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
+	assert!(!report.errors.is_empty() && report.rolled_back.is_empty(), "{report:?}");
+	assert_eq!(fs::read_to_string(outside.join("x")).unwrap(), "not tpfs's");
+	assert!(!a.exists());
+	assert_eq!(j.batches().unwrap()[0].status, BatchStatus::Incomplete);
+}
+
+#[test]
+fn recover_merges_back_a_cross_device_move_that_stopped_while_removing_the_source() {
+	// The state after a crash: the copy was published at the target, the source is half removed
+	// and got a new file meanwhile.
+	let s = Sandbox::new();
+	let (src, dst) = (s.root.join("src"), s.root.join("dst"));
+	fs::create_dir_all(dst.join("sub")).unwrap();
+	fs::write(dst.join("a"), "A").unwrap();
+	fs::write(dst.join("sub/b"), "B").unwrap();
+	fs::create_dir_all(&src).unwrap();
+	fs::write(src.join("a"), "A").unwrap(); // not removed yet
+	fs::write(src.join("late"), "appeared during the move").unwrap();
+	let mut j = s.journal();
+	j.append(&Entry::Begin {
+		batch: "x".into(),
+		at: 0,
+		source: "human".into(),
+		reason: String::new(),
+		digest: String::new(),
+		v: 1,
+	})
+	.unwrap();
+	j.append(&Entry::Intent {
+		batch: "x".into(),
+		index: 0,
+		forward: Op::Move { from: src.clone(), to: dst.clone() },
+		inverse: Op::Move { from: dst.clone(), to: src.clone() },
+	})
+	.unwrap();
+	j.append(&Entry::Published { batch: "x".into(), index: 0 }).unwrap();
+
+	let report = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
+	assert!(report.errors.is_empty(), "{report:?}");
+	assert_eq!(fs::read_to_string(src.join("sub/b")).unwrap(), "B");
+	assert_eq!(fs::read_to_string(src.join("late")).unwrap(), "appeared during the move");
+	assert!(!dst.exists(), "the duplicate went to the trash");
+	assert_eq!(j.batches().unwrap()[0].status, BatchStatus::Aborted);
+}
+
+#[test]
+fn recover_resumes_after_it_was_interrupted_itself() {
+	let s = Sandbox::new();
+	let (a, b) = (s.file("a.txt", "A"), s.file("b.txt", "B"));
+	let (a2, b2) = (s.root.join("a2.txt"), s.root.join("b2.txt"));
+	let mut j = s.journal();
+	j.append(&Entry::Begin {
+		batch: "x".into(),
+		at: 0,
+		source: "human".into(),
+		reason: String::new(),
+		digest: String::new(),
+		v: 1,
+	})
+	.unwrap();
+	for (i, (from, to)) in [(&a, &a2), (&b, &b2)].into_iter().enumerate() {
+		j.append(&Entry::Intent {
+			batch: "x".into(),
+			index: i,
+			forward: Op::Move { from: from.clone(), to: to.clone() },
+			inverse: Op::Move { from: to.clone(), to: from.clone() },
+		})
+		.unwrap();
+		fs::rename(from, to).unwrap();
+		j.append(&Entry::Done { batch: "x".into(), index: i, check: None, mode: None }).unwrap();
+	}
+	// A first recovery reverted step 2 and then died.
+	fs::rename(&b2, &b).unwrap();
+	let report = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
+	assert!(report.errors.is_empty(), "{report:?}");
+	assert!(a.exists() && b.exists() && !a2.exists() && !b2.exists());
+}
+
+#[test]
+fn a_source_that_vanishes_before_its_step_fails_cleanly() {
+	let s = Sandbox::new();
+	let before_files = (s.file("a.txt", "A"), s.file("b.txt", "B"));
+	let before = s.snapshot();
+	let plan = Plan::new(
+		vec![
+			Op::Mkdir { path: s.root.join("t") },
+			Op::Move { from: before_files.1.clone(), to: s.root.join("t/b.txt") },
+		],
+		"",
+	);
+	let v = s.validator();
+	let mut j = s.journal();
+	let gone = before_files.1.clone();
+	let err = Executor::new(&v, &mut j, s.trash())
+		.before_apply(move |step| {
+			if step == 0 {
+				fs::remove_file(&gone).unwrap();
+			}
+		})
+		.execute(&plan, Source::Human)
+		.unwrap_err();
+	assert!(matches!(err, ExecError::Failed { step: 1, .. }), "{err}");
+	let mut expected = before;
+	expected.retain(|l| !l.starts_with("b.txt"));
+	assert_eq!(s.snapshot(), expected, "step 1 was rolled back");
+}
+
+#[test]
+fn each_kind_of_invalid_step_is_named() {
+	let s = Sandbox::new();
+	let full = s.dir("full");
+	s.file("full/x", "x");
+	let f = s.file("f.txt", "f");
+	for (op, expect) in [
+		(Op::Rmdir { path: full.clone() }, "not empty"),
+		(Op::Rmdir { path: f.clone() }, "not an existing directory"),
+		(Op::Mkdir { path: s.root.join("missing/new") }, "does not exist"),
+		(Op::Move { from: s.root.join("nope"), to: s.root.join("x") }, "does not exist"),
+	] {
+		let m = messages(&s.validator(), &Plan::new(vec![op.clone()], ""));
+		assert!(m.len() == 1 && m[0].to_lowercase().contains(expect), "{op}: {m:?}");
+	}
+	assert!(messages(&s.validator(), &Plan::new(vec![], ""))[0].contains("empty"));
 }

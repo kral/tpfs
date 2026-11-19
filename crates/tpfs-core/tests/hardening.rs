@@ -193,11 +193,12 @@ fn refuses_a_copy_that_does_not_fit() {
 	assert!(issues.len() == 1 && issues[0].message.contains("Not enough space"), "{issues:?}");
 }
 
-/// Trashing on another file system than the global trash goes to a trash on that file system (a rename).
+/// The per-file-system trash on /dev/shm, in one test (they share one folder name): planted ones
+/// (readable by others, a symlink) are never used; the genuine one is used, and undo works.
 #[cfg(target_os = "linux")]
 #[test]
-fn trash_stays_on_the_same_file_system() {
-	use std::os::unix::fs::MetadataExt;
+fn trash_stays_on_the_same_file_system_and_planted_trashes_are_refused() {
+	use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 	let shm = Path::new("/dev/shm");
 	let state_tmp = TempDir::new().unwrap();
@@ -207,64 +208,59 @@ fn trash_stays_on_the_same_file_system() {
 		eprintln!("skipped: no second file system available");
 		return;
 	}
-
-	let s = Sandbox::new_in(Some(shm));
-	let file = s.root.join("note.txt");
-	fs::write(&file, "N").unwrap();
+	let uid = rustix_uid();
+	let local = shm.join(format!(".tpfs-trash-{uid}"));
+	// Keep whatever is there out of the way, and put it back at the end.
+	let aside = shm.join(format!(".tpfs-trash-{uid}.aside-{}", std::process::id()));
+	let had = fs::symlink_metadata(&local).is_ok();
+	if had {
+		fs::rename(&local, &aside).unwrap();
+	}
 	let trash = state_tmp.path().join("trash");
+	let trash_one = |name: &str| {
+		let s = Sandbox::new_in(Some(shm));
+		let file = s.root.join(name);
+		fs::write(&file, "N").unwrap();
+		let mut j = Journal::open(state_tmp.path().join("journal.jsonl")).unwrap();
+		let b = Executor::new(&s.validator(), &mut j, &trash)
+			.execute(&Plan::new(vec![Op::Trash { path: file.clone() }], ""), Source::Human)
+			.unwrap();
+		(s, file, b.id, j)
+	};
 
-	let v = s.validator();
-	let mut j = Journal::open(state_tmp.path().join("journal.jsonl")).unwrap();
-	let batch = Executor::new(&v, &mut j, &trash)
-		.execute(&Plan::new(vec![Op::Trash { path: file.clone() }], ""), Source::Human)
-		.unwrap();
+	// Readable by others: refused.
+	fs::create_dir(&local).unwrap();
+	fs::set_permissions(&local, fs::Permissions::from_mode(0o755)).unwrap();
+	let (_s, _f, id, _) = trash_one("a.txt");
+	assert!(!local.join(&id).exists() && trash.join(&id).exists(), "used a trash readable by others");
+	fs::remove_dir(&local).unwrap();
 
-	let uid = fs::metadata(&s.root).unwrap().uid();
-	let local = shm.join(format!(".tpfs-trash-{uid}")).join(&batch.id);
-	assert!(local.is_dir(), "the file was not trashed on its own file system");
-	assert!(!trash.join(&batch.id).exists());
+	// A symlink to a folder the attacker controls: refused.
+	let bait = TempDir::new_in(shm).unwrap();
+	fs::set_permissions(bait.path(), fs::Permissions::from_mode(0o700)).unwrap();
+	std::os::unix::fs::symlink(bait.path(), &local).unwrap();
+	let (_s, _f, id, _) = trash_one("b.txt");
+	assert!(fs::read_dir(bait.path()).unwrap().next().is_none(), "trashed into a planted symlink: {id}");
+	fs::remove_file(&local).unwrap();
 
+	// The genuine one: created private, used, and undo brings the file back.
+	let (s, file, id, mut j) = trash_one("c.txt");
+	assert_eq!(fs::metadata(&s.root).unwrap().uid(), uid);
+	assert!(local.join(&id).is_dir(), "the file was not trashed on its own file system");
+	assert!(!trash.join(&id).exists());
 	Executor::new(&Validator::new(tpfs_core::system_roots()).unwrap(), &mut j, &trash).undo_last().unwrap().unwrap();
 	assert_eq!(fs::read_to_string(&file).unwrap(), "N");
-	// Leave the shared /dev/shm as we found it.
-	let _ = fs::remove_dir(&local);
+
+	fs::remove_dir_all(&local).unwrap();
+	if had {
+		fs::rename(&aside, &local).unwrap();
+	}
 }
 
-/// A trash folder someone else prepared on that file system is never used.
 #[cfg(target_os = "linux")]
-#[test]
-fn a_planted_local_trash_is_not_used() {
-	use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-	let shm = Path::new("/dev/shm");
-	let state_tmp = TempDir::new().unwrap();
-	if !shm.is_dir() || fs::metadata(shm).unwrap().dev() == fs::metadata(state_tmp.path()).unwrap().dev() {
-		assert!(std::env::var_os("CI").is_none(), "CI needs /dev/shm on its own file system");
-		return;
-	}
-	// A private mount point of our own: a folder on tmpfs with its own planted trash names.
-	let s = Sandbox::new_in(Some(shm));
-	let uid = fs::metadata(&s.root).unwrap().uid();
-	let planted = shm.join(format!(".tpfs-trash-{uid}"));
-	let existed = planted.exists();
-	if !existed {
-		// Readable by others: must be refused (and so must a symlink or a foreign owner).
-		fs::create_dir(&planted).unwrap();
-		fs::set_permissions(&planted, fs::Permissions::from_mode(0o755)).unwrap();
-	}
-	let file = s.root.join("n.txt");
-	fs::write(&file, "N").unwrap();
-	let trash = state_tmp.path().join("trash");
-	let v = s.validator();
-	let mut j = Journal::open(state_tmp.path().join("journal.jsonl")).unwrap();
-	let batch = Executor::new(&v, &mut j, &trash)
-		.execute(&Plan::new(vec![Op::Trash { path: file.clone() }], ""), Source::Human)
-		.unwrap();
-	if !existed {
-		assert!(!planted.join(&batch.id).exists(), "used a trash readable by others");
-		assert!(trash.join(&batch.id).exists());
-		fs::remove_dir(&planted).unwrap();
-	}
+fn rustix_uid() -> u32 {
+	// SAFETY: getuid has no preconditions and cannot fail.
+	unsafe { libc::getuid() }
 }
 
 #[cfg(unix)]
@@ -369,4 +365,59 @@ fn errors_never_contain_raw_escape_sequences() {
 		.unwrap_err()
 		.to_string();
 	assert!(!err.contains('\u{1b}') && !err.contains('\u{7}'), "{err:?}");
+}
+
+/// macOS and Windows: a folder swapped for a link right before a step runs is not followed.
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn a_link_swapped_in_before_a_step_is_not_followed() {
+	let s = Sandbox::new();
+	let sub = s.root.join("sub");
+	fs::create_dir(&sub).unwrap();
+	fs::write(s.root.join("f.txt"), "F").unwrap();
+	let outside = s.base.join("outside");
+	fs::create_dir(&outside).unwrap();
+	let plan = Plan::new(vec![Op::Copy { from: s.root.join("f.txt"), to: sub.join("f.txt") }], "");
+	let (sub2, out2) = (sub.clone(), outside.clone());
+	let v = s.validator();
+	let mut j = s.journal();
+	let result = Executor::new(&v, &mut j, s.state.join("trash"))
+		.before_apply(move |_| {
+			fs::remove_dir(&sub2).unwrap();
+			link_dir(&out2, &sub2);
+		})
+		.execute(&plan, Source::Human);
+	assert!(result.is_err(), "the copy went through the link");
+	assert!(!outside.join("f.txt").exists());
+}
+
+#[cfg(target_os = "macos")]
+fn link_dir(target: &Path, link: &Path) {
+	std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+/// A junction: no privilege needed, unlike a symlink.
+#[cfg(windows)]
+fn link_dir(target: &Path, link: &Path) {
+	let ok = std::process::Command::new("cmd")
+		.args(["/C", "mklink", "/J"])
+		.arg(link)
+		.arg(target)
+		.stdout(std::process::Stdio::null())
+		.status()
+		.unwrap()
+		.success();
+	assert!(ok, "mklink /J failed");
+}
+
+#[cfg(windows)]
+#[test]
+fn copying_a_junction_is_refused_up_front() {
+	let s = Sandbox::new();
+	let target = s.root.join("target");
+	fs::create_dir(&target).unwrap();
+	let j = s.root.join("junction");
+	link_dir(&target, &j);
+	let issues = s.validator().validate(&Plan::new(vec![Op::Copy { from: j, to: s.root.join("copy") }], ""));
+	assert!(issues.len() == 1 && issues[0].message.contains("not supported on Windows"), "{issues:?}");
 }

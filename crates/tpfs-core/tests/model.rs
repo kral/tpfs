@@ -247,3 +247,86 @@ fn journal_survives_random_damage() {
 		assert!(batches.iter().all(|b| b.status == BatchStatus::Committed && !b.damaged), "case {case}");
 	}
 }
+
+/// Random plans with a crash injected at a random step: recovery always restores the tree.
+#[test]
+fn random_plans_crashed_anywhere_are_recovered_exactly() {
+	use std::panic::{self, AssertUnwindSafe};
+	use tpfs_core::Phase;
+	let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+	let names = ["a.txt", "b.txt", "d", "e", "d/x.txt", "e/a.txt", "n", "c.txt", "d2"];
+	let mut crashed_cases = 0;
+	let default_hook = panic::take_hook();
+	panic::set_hook(Box::new(|_| {}));
+	for _ in 0..800 {
+		let s = Sandbox::new();
+		s.tree();
+		let before = s.snapshot();
+		let p = |rng: &mut Rng| s.root.join(rng.pick(&names));
+		let ops: Vec<Op> = (0..1 + rng.next() % 3)
+			.map(|_| match rng.next() % 5 {
+				0 => Op::Move { from: p(&mut rng), to: p(&mut rng) },
+				1 => Op::Copy { from: p(&mut rng), to: p(&mut rng) },
+				2 => Op::Trash { path: p(&mut rng) },
+				3 => Op::Mkdir { path: p(&mut rng) },
+				_ => Op::Rename { path: p(&mut rng), new_name: "r.txt".into() },
+			})
+			.collect();
+		let plan = Plan::new(ops, "");
+		let v = s.validator();
+		if !v.validate(&plan).is_empty() {
+			continue;
+		}
+		let at = (rng.next() % plan.ops.len() as u64) as usize;
+		let phase = if rng.next().is_multiple_of(2) { Phase::BeforeApply } else { Phase::AfterApply };
+		let result = panic::catch_unwind(AssertUnwindSafe(|| {
+			let mut j = s.journal();
+			let _ = Executor::new(&v, &mut j, s.trash())
+				.hook(move |i, ph| {
+					if i == at && ph == phase {
+						panic!("crash");
+					}
+				})
+				.execute(&plan, Source::Human);
+		}));
+		assert!(result.is_err());
+		crashed_cases += 1;
+		let mut j = s.journal();
+		let report = Executor::new(&v, &mut j, s.trash()).recover().unwrap();
+		assert!(report.errors.is_empty(), "{report:?}\n{:?}", plan.preview());
+		assert_eq!(s.snapshot(), before, "crash at {at} {phase:?}\n{:?}", plan.preview());
+	}
+	panic::set_hook(default_hook);
+	assert!(crashed_cases > 20, "only {crashed_cases} cases");
+}
+
+/// Damage inside the journal (not only at its end): a batch is read intact, reported damaged,
+/// or not at all — never with different steps.
+#[test]
+fn journal_damage_anywhere_is_never_misread() {
+	let mut rng = Rng(7);
+	for case in 0..100 {
+		let s = Sandbox::new();
+		s.tree();
+		let v = s.validator();
+		let mut j = s.journal();
+		Executor::new(&v, &mut j, s.trash())
+			.execute(&Plan::new(vec![Op::Mkdir { path: s.root.join("one") }], ""), Source::Human)
+			.unwrap();
+		drop(j);
+		let path = s.state.join("journal.jsonl");
+		let mut bytes = fs::read(&path).unwrap();
+		for _ in 0..1 + rng.next() % 3 {
+			let i = (rng.next() % bytes.len() as u64) as usize;
+			bytes[i] ^= 1 << (rng.next() % 8);
+		}
+		fs::write(&path, &bytes).unwrap();
+		let mut j = s.journal();
+		for b in j.batches().unwrap() {
+			if !b.damaged && b.status == BatchStatus::Committed {
+				assert_eq!(b.steps.len(), 1, "case {case}");
+				assert_eq!(b.steps[0].forward, Op::Mkdir { path: s.root.join("one") }, "case {case}");
+			}
+		}
+	}
+}

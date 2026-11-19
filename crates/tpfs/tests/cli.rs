@@ -80,3 +80,97 @@ fn log_does_not_pass_escape_sequences_to_the_terminal() {
 	let log = tpfs(&home, &["log"]).stdout;
 	assert!(!log.contains(&0x1b) && !log.contains(&0x07), "{}", String::from_utf8_lossy(&log));
 }
+
+#[test]
+fn agent_plans_are_approved_only_in_a_terminal_and_can_be_rejected() {
+	let tmp = tempfile::TempDir::new().unwrap();
+	let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+	let (root, home) = (base.join("root"), base.join("home"));
+	fs::create_dir(&root).unwrap();
+	let mut server = tpfs_mcp::Server::new(tpfs_mcp::Config {
+		roots: vec![root.clone()],
+		state: home.clone(),
+		approval: tpfs_mcp::Approval::Terminal,
+	})
+	.unwrap();
+	let msg = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "propose_plan",
+		"arguments": { "plan": { "ops": [{ "op": "mkdir", "path": root.join("d") }] } } } });
+	let r = server.handle(&msg.to_string()).unwrap();
+	let v: serde_json::Value = serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+	let id = v["planId"].as_str().unwrap().to_owned();
+
+	assert!(String::from_utf8(tpfs(&home, &["pending"]).stdout).unwrap().contains(&id));
+	assert_eq!(code(&tpfs(&home, &["approve", &id])), 4, "no terminal, no approval");
+	assert!(!server.store().is_approved(&server.store().get(&id).unwrap()));
+	assert_eq!(code(&tpfs(&home, &["reject", &id])), 0);
+	assert!(server.store().get(&id).is_err());
+	assert_eq!(code(&tpfs(&home, &["reject", "deadbeef"])), 1);
+}
+
+#[test]
+fn recover_reports_success_and_refusal_by_exit_code() {
+	let tmp = tempfile::TempDir::new().unwrap();
+	let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+	let (root, home) = (base.join("root"), base.join("home"));
+	fs::create_dir(&root).unwrap();
+	assert_eq!(code(&tpfs(&home, &["recover"])), 0, "nothing to recover");
+
+	// An interrupted batch whose rollback is blocked by a file in the way.
+	let a = root.join("a.txt");
+	let b = root.join("b.txt");
+	fs::write(&b, "moved").unwrap();
+	fs::write(&a, "in the way").unwrap();
+	{
+		use tpfs_core::{Entry, Journal, Op};
+		let mut j = Journal::open(home.join("journal.jsonl")).unwrap();
+		j.append(&Entry::Begin {
+			batch: "x".into(),
+			at: 0,
+			source: "human".into(),
+			reason: String::new(),
+			digest: String::new(),
+			v: 1,
+		})
+		.unwrap();
+		j.append(&Entry::Intent {
+			batch: "x".into(),
+			index: 0,
+			forward: Op::Move { from: a.clone(), to: b.clone() },
+			inverse: Op::Move { from: b.clone(), to: a.clone() },
+		})
+		.unwrap();
+		j.append(&Entry::Done { batch: "x".into(), index: 0, check: None, mode: None }).unwrap();
+	}
+	assert_eq!(code(&tpfs(&home, &["recover"])), 1);
+	fs::remove_file(&a).unwrap();
+	assert_eq!(code(&tpfs(&home, &["recover"])), 0);
+	assert_eq!(fs::read_to_string(&a).unwrap(), "moved");
+}
+
+#[test]
+fn two_way_sync_by_digest_is_idempotent_and_undoable() {
+	let tmp = tempfile::TempDir::new().unwrap();
+	let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+	let (l, r, home) = (base.join("l"), base.join("r"), base.join("home"));
+	fs::create_dir_all(&l).unwrap();
+	fs::create_dir_all(&r).unwrap();
+	fs::write(l.join("only-l.txt"), "L").unwrap();
+	fs::write(r.join("only-r.txt"), "R").unwrap();
+	let (ls, rs) = (l.to_str().unwrap(), r.to_str().unwrap());
+	for mode in [&["--both"][..], &["--mirror"][..]] {
+		let mut args = vec!["sync", ls, rs];
+		args.extend_from_slice(mode);
+		let out = String::from_utf8(tpfs(&home, &args).stdout).unwrap();
+		if let Some(digest) = out.lines().find_map(|l| l.strip_prefix("Digest: ")) {
+			let mut apply = args.clone();
+			apply.extend_from_slice(&["--approve", digest]);
+			assert_eq!(code(&tpfs(&home, &apply)), 0, "{out}");
+		}
+		let again = String::from_utf8(tpfs(&home, &args).stdout).unwrap();
+		assert!(again.contains("Nothing to sync"), "{mode:?} is not idempotent:\n{again}");
+	}
+	assert_eq!(code(&tpfs(&home, &["undo"])), 0);
+	assert_eq!(code(&tpfs(&home, &["undo"])), 0);
+	assert!(l.join("only-l.txt").exists() && !l.join("only-r.txt").exists());
+	assert!(r.join("only-r.txt").exists() && !r.join("only-l.txt").exists());
+}
