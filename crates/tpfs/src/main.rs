@@ -42,13 +42,79 @@ USAGE:
   tpfs reject <planId>                          discard an agent's plan
 
 OPTIONS:
-  --home <dir>    state directory (journal, trash). Default: $TPFS_HOME,
-                  $XDG_STATE_HOME/tpfs or ~/.local/state/tpfs
-  -h, --help      show this help
+  --home <dir>    state directory (journal, trash). Default: $TPFS_HOME, else
+                  $XDG_STATE_HOME/tpfs or ~/.local/state/tpfs (Unix), %LOCALAPPDATA%\\tpfs (Windows)
+  -h, --help      show this help (`tpfs <command> --help` for one command)
   -V, --version   print the version
 
+EXIT CODES:
+  0  done (also when there was nothing to do)    3  plan rejected by validation
+  1  failed                                      4  cancelled or not approved; nothing changed
+  2  usage error
+
 Nothing is ever deleted permanently: `trash` moves into <home>/trash and can be undone.
+With --approval client, the MCP client's own confirmation is the only approval: a client set to
+\"always allow\" means no human approval at all.
 ";
+
+/// Failure with its exit code (see EXIT CODES in the usage).
+struct Fail(u8, String);
+
+impl From<String> for Fail {
+	fn from(s: String) -> Self {
+		Fail(1, s)
+	}
+}
+
+impl From<&str> for Fail {
+	fn from(s: &str) -> Self {
+		Fail(1, s.to_owned())
+	}
+}
+
+fn usage(msg: impl Into<String>) -> Fail {
+	Fail(2, msg.into())
+}
+
+fn cancelled(msg: impl Into<String>) -> Fail {
+	Fail(4, msg.into())
+}
+
+type Res = Result<ExitCode, Fail>;
+
+/// The part of the usage about one command.
+fn command_help(command: &str) -> Option<String> {
+	let start = format!("  tpfs {command}");
+	let mut out = String::new();
+	let mut inside = false;
+	for line in USAGE.lines() {
+		if line.starts_with("  tpfs ") {
+			inside = line.starts_with(&start) && line[start.len()..].chars().next().is_none_or(|c| c == ' ');
+		} else if !line.starts_with("    ") {
+			inside = false;
+		}
+		if inside {
+			out.push_str(line);
+			out.push('\n');
+		}
+	}
+	(!out.is_empty()).then(|| format!("USAGE:\n{out}\nSee `tpfs --help` for options and exit codes.\n"))
+}
+
+/// Flags each command accepts, and how many positional arguments.
+fn allowed(command: &str) -> Option<(&'static [&'static str], usize)> {
+	Some(match command {
+		"ui" => (&["icons", "home"], 2),
+		"schema" => (&[], 0),
+		"check" => (&["root", "source", "max-ops", "home"], 1),
+		"apply" => (&["root", "approve", "source", "max-ops", "home"], 1),
+		"sync" => (&["both", "mirror", "apply", "approve", "json", "home"], 2),
+		"undo" | "log" | "recover" | "pending" => (&["home"], 0),
+		"mcp" => (&["root", "approval", "home"], 0),
+		"approve" | "reject" => (&["home"], 1),
+		_ => return None,
+	})
+}
 
 struct Args {
 	command: String,
@@ -65,19 +131,31 @@ struct Args {
 	do_apply: bool,
 	json: bool,
 	max_ops: Option<usize>,
+	/// Flags given, to reject ones the command does not use.
+	given: Vec<&'static str>,
+	positional: usize,
+	help: bool,
 }
 
 fn main() -> ExitCode {
-	match parse_args().and_then(run) {
-		Ok(code) => code,
-		Err(e) => {
+	let args = match parse_args() {
+		Ok(a) => a,
+		Err(Fail(code, e)) => {
 			eprintln!("tpfs: {e}");
-			ExitCode::from(1)
+			return ExitCode::from(code);
+		}
+	};
+	let command = args.command.clone();
+	match run(args) {
+		Ok(code) => code,
+		Err(Fail(code, e)) => {
+			eprintln!("tpfs {command}: {e}");
+			ExitCode::from(code)
 		}
 	}
 }
 
-fn parse_args() -> Result<Args, String> {
+fn parse_args() -> Result<Args, Fail> {
 	use lexopt::prelude::*;
 
 	let mut parser = lexopt::Parser::from_env();
@@ -96,14 +174,26 @@ fn parse_args() -> Result<Args, String> {
 		do_apply: false,
 		json: false,
 		max_ops: None,
+		given: vec![],
+		positional: 0,
+		help: false,
 	};
 
-	while let Some(arg) = parser.next().map_err(|e| e.to_string())? {
-		match arg {
-			Short('h') | Long("help") => {
-				print!("{USAGE}");
-				std::process::exit(0);
+	let e = |e: lexopt::Error| usage(e.to_string());
+	while let Some(arg) = parser.next().map_err(e)? {
+		if let Long(name) = &arg {
+			const FLAGS: [&str; 11] = [
+				"root", "approve", "approval", "icons", "both", "mirror", "apply", "json", "max-ops", "home", "source",
+			];
+			if let Some(f) = FLAGS.iter().find(|f| **f == *name) {
+				args.given.push(f);
 			}
+		}
+		if matches!(arg, Value(_)) && !args.command.is_empty() {
+			args.positional += 1;
+		}
+		match arg {
+			Short('h') | Long("help") => args.help = true,
 			Short('V') | Long("version") => {
 				println!("tpfs {}", env!("CARGO_PKG_VERSION"));
 				std::process::exit(0);
@@ -117,7 +207,7 @@ fn parse_args() -> Result<Args, String> {
 					match parser.value().map_err(|e| e.to_string())?.string().map_err(|e| e.to_string())?.as_str() {
 						"terminal" => tpfs_mcp::Approval::Terminal,
 						"client" => tpfs_mcp::Approval::Client,
-						other => return Err(format!("unknown approval mode '{other}' (terminal|client)")),
+						other => return Err(usage(format!("unknown approval mode '{other}' (terminal|client)"))),
 					}
 			}
 			Long("icons") => args.icons = true,
@@ -127,7 +217,7 @@ fn parse_args() -> Result<Args, String> {
 			Long("json") => args.json = true,
 			Long("max-ops") => {
 				let v = parser.value().map_err(|e| e.to_string())?.string().map_err(|e| e.to_string())?;
-				args.max_ops = Some(v.parse().map_err(|_| format!("--max-ops needs a number, got '{v}'"))?);
+				args.max_ops = Some(v.parse().map_err(|_| usage(format!("--max-ops needs a number, got '{v}'")))?);
 			}
 			Long("home") => args.home = Some(parser.value().map_err(|e| e.to_string())?.into()),
 			Long("source") => {
@@ -135,13 +225,13 @@ fn parse_args() -> Result<Args, String> {
 					match parser.value().map_err(|e| e.to_string())?.string().map_err(|e| e.to_string())?.as_str() {
 						"human" => Source::Human,
 						"agent" => Source::Agent,
-						other => return Err(format!("unknown source '{other}' (human|agent)")),
+						other => return Err(usage(format!("unknown source '{other}' (human|agent)"))),
 					}
 			}
 			Value(v) if args.command.is_empty() => args.command = v.string().map_err(|e| e.to_string())?,
 			Value(v) if args.plan.is_none() => args.plan = Some(v),
 			Value(v) if args.extra.is_none() => args.extra = Some(v),
-			other => return Err(other.unexpected().to_string()),
+			other => return Err(usage(other.unexpected().to_string())),
 		}
 	}
 
@@ -153,17 +243,33 @@ fn parse_args() -> Result<Args, String> {
 		args.plan = Some(std::mem::take(&mut args.command).into());
 		args.command = "ui".into();
 	}
+	if args.help {
+		match command_help(&args.command) {
+			Some(h) if !args.command.is_empty() => print!("{h}"),
+			_ => print!("{USAGE}"),
+		}
+		std::process::exit(0);
+	}
 	if args.command.is_empty() {
 		if io::stdin().is_terminal() && io::stdout().is_terminal() {
 			args.command = "ui".into();
 		} else {
-			return Err(format!("missing command\n\n{USAGE}"));
+			return Err(usage("missing command (see `tpfs --help`)"));
 		}
+	}
+	let Some((flags, max_positional)) = allowed(&args.command) else {
+		return Err(usage(format!("'{}' is neither a command nor a folder (see `tpfs --help`)", args.command)));
+	};
+	if let Some(f) = args.given.iter().find(|f| !flags.contains(f)) {
+		return Err(usage(format!("{}: --{f} does not apply here (see `tpfs {} --help`)", args.command, args.command)));
+	}
+	if args.positional > max_positional {
+		return Err(usage(format!("{}: too many arguments (see `tpfs {} --help`)", args.command, args.command)));
 	}
 	Ok(args)
 }
 
-fn run(args: Args) -> Result<ExitCode, String> {
+fn run(args: Args) -> Res {
 	match args.command.as_str() {
 		"schema" => {
 			println!("{}", serde_json::to_string_pretty(&Plan::schema()).map_err(|e| e.to_string())?);
@@ -174,16 +280,41 @@ fn run(args: Args) -> Result<ExitCode, String> {
 		"sync" => sync(&args),
 		"undo" => {
 			let (mut journal, trash) = open_state(&args)?;
-			let validator = any_validator()?;
+			let validator = any_validator(&args)?;
+			let last = journal
+				.batches()
+				.map_err(|e| e.to_string())?
+				.into_iter()
+				.rev()
+				.find(|b| b.status == BatchStatus::Committed);
+			if let Some(b) = &last
+				&& io::stdin().is_terminal()
+				&& io::stderr().is_terminal()
+			{
+				eprintln!(
+					"Undo batch {} by {} — {} step(s): {}",
+					tpfs_core::sanitize(b.id.as_ref()),
+					tpfs_core::sanitize(b.source.as_ref()),
+					b.steps.len(),
+					tpfs_core::sanitize(b.reason.as_ref())
+				);
+				for s in b.steps.iter().filter(|s| s.done && !s.undone).take(20) {
+					eprintln!("  {}", s.forward);
+				}
+				if !ask("Undo it? [y/N] ")?.eq_ignore_ascii_case("y") {
+					return Err(cancelled("cancelled; nothing was changed"));
+				}
+			}
 			match Executor::new(&validator, &mut journal, trash).undo_last() {
 				Ok(Some(b)) => println!("Undone batch {} ({} step(s)).", b.id, b.steps),
 				Ok(None) => println!("Nothing to undo."),
-				Err(e) => return Err(e.to_string()),
+				Err(e) => return Err(e.to_string().into()),
 			}
 			Ok(ExitCode::SUCCESS)
 		}
 		"log" => {
 			let (mut journal, _) = open_state(&args)?;
+			eprintln!("State: {}", tpfs_core::sanitize(state_dir(&args)?.as_os_str()));
 			let batches = journal.batches().map_err(|e| e.to_string())?;
 			if batches.is_empty() {
 				println!("No batches recorded.");
@@ -211,7 +342,7 @@ fn run(args: Args) -> Result<ExitCode, String> {
 		}
 		"recover" => {
 			let (mut journal, trash) = open_state(&args)?;
-			let validator = any_validator()?;
+			let validator = any_validator(&args)?;
 			let report = Executor::new(&validator, &mut journal, trash).recover().map_err(|e| e.to_string())?;
 			println!("Rolled back {} interrupted batch(es).", report.rolled_back.len());
 			for e in &report.errors {
@@ -229,7 +360,7 @@ fn run(args: Args) -> Result<ExitCode, String> {
 		}
 		"mcp" => {
 			if args.roots.is_empty() {
-				return Err("at least one --root <dir> is required".into());
+				return Err(usage("at least one --root <dir> is required"));
 			}
 			let config =
 				tpfs_mcp::Config { roots: args.roots.clone(), state: state_dir(&args)?, approval: args.approval };
@@ -265,21 +396,21 @@ fn run(args: Args) -> Result<ExitCode, String> {
 			println!("Rejected {id}.");
 			Ok(ExitCode::SUCCESS)
 		}
-		other => Err(format!("unknown command '{other}'\n\n{USAGE}")),
+		other => Err(usage(format!("unknown command '{other}' (see `tpfs --help`)"))),
 	}
 }
 
-fn check(args: &Args, apply: bool) -> Result<ExitCode, String> {
-	let plan = read_plan(args.plan.as_deref().ok_or("missing plan file (use - for stdin)")?)?;
+fn check(args: &Args, apply: bool) -> Res {
+	let plan = read_plan(args.plan.as_deref().ok_or_else(|| usage("missing plan file (use - for stdin)"))?)?;
 	if args.roots.is_empty() {
-		return Err("at least one --root <dir> is required".into());
+		return Err(usage("at least one --root <dir> is required"));
 	}
 	let mut validator =
-		Validator::new(&args.roots).map_err(|e| format!("invalid root: {e}"))?.with_protected([state_dir(args)?]);
+		Validator::new(&args.roots).map_err(|e| root_error(&args.roots, e))?.with_protected([state_dir(args)?]);
 	if let Some(n) = args.max_ops {
 		// A big plan you made on purpose (a photo clean-up); agents keep the default limit.
 		if args.source == Source::Agent {
-			return Err("--max-ops is for human plans only".into());
+			return Err(usage("--max-ops is for human plans only"));
 		}
 		validator = validator.with_max_ops(n);
 	}
@@ -305,6 +436,7 @@ fn present(validator: &Validator, plan: &Plan, source: Source) -> Option<(String
 	for line in plan.preview() {
 		println!("  {line}");
 	}
+	println!("Total: {} operation(s): {}", plan.ops.len(), totals(plan));
 	println!(
 		"Risk: {:?}{}",
 		risk.level,
@@ -322,7 +454,33 @@ fn present(validator: &Validator, plan: &Plan, source: Source) -> Option<(String
 	Some((digest, risk.level))
 }
 
-fn execute(args: &Args, validator: &Validator, plan: &Plan) -> Result<ExitCode, String> {
+/// Counts per kind of operation, e.g. "3 move, 1 trash".
+fn totals(plan: &Plan) -> String {
+	let mut counts: Vec<(&str, usize)> = Vec::new();
+	for op in &plan.ops {
+		let k = op.to_string().split_whitespace().next().unwrap_or("").to_lowercase();
+		let k: &str = match k.as_str() {
+			"move" => "move",
+			"copy" => "copy",
+			"rename" => "rename",
+			"trash" => "trash",
+			"mkdir" => "mkdir",
+			_ => "rmdir",
+		};
+		match counts.iter_mut().find(|(n, _)| *n == k) {
+			Some((_, c)) => *c += 1,
+			None => counts.push((k, 1)),
+		}
+	}
+	counts.iter().map(|(k, c)| format!("{c} {k}")).collect::<Vec<_>>().join(", ")
+}
+
+fn root_error(roots: &[PathBuf], e: io::Error) -> Fail {
+	let shown: Vec<String> = roots.iter().map(|r| tpfs_core::sanitize(r.as_os_str())).collect();
+	usage(format!("--root {}: {e}", shown.join(", ")))
+}
+
+fn execute(args: &Args, validator: &Validator, plan: &Plan) -> Res {
 	let (mut journal, trash) = open_state(args)?;
 	match Executor::new(validator, &mut journal, trash).execute(plan, args.source) {
 		Ok(b) => {
@@ -335,31 +493,32 @@ fn execute(args: &Args, validator: &Validator, plan: &Plan) -> Result<ExitCode, 
 			}
 			Ok(ExitCode::from(3))
 		}
-		Err(e) => Err(e.to_string()),
+		Err(e) => Err(e.to_string().into()),
 	}
 }
 
 /// `tpfs sync <source> <target>`: compare, build a plan of copy/trash, show it; apply only with
 /// `--apply` after confirmation (or `--approve <digest>` from a previous dry run).
-fn sync(args: &Args) -> Result<ExitCode, String> {
+fn sync(args: &Args) -> Res {
 	use tpfs_core::sync::{Direction, SyncOptions, compare, sync_plan};
 
-	let dir = |v: &Option<OsString>, what: &str| -> Result<PathBuf, String> {
-		let v = v.as_deref().ok_or(format!("missing {what} folder: tpfs sync <source> <target>"))?;
-		let p = tpfs_core::canonicalize(Path::new(v)).map_err(|e| format!("{}: {e}", Path::new(v).display()))?;
-		if p.is_dir() { Ok(p) } else { Err(format!("not a folder: {}", p.display())) }
+	let dir = |v: &Option<OsString>, what: &str| -> Result<PathBuf, Fail> {
+		let v = v.as_deref().ok_or_else(|| usage(format!("missing {what} folder: tpfs sync <source> <target>")))?;
+		let shown = tpfs_core::sanitize(v);
+		let p = tpfs_core::canonicalize(Path::new(v)).map_err(|e| usage(format!("{shown}: {e}")))?;
+		if p.is_dir() { Ok(p) } else { Err(usage(format!("not a folder: {shown}"))) }
 	};
 	let (source, target) = (dir(&args.plan, "source")?, dir(&args.extra, "target")?);
 	if source.starts_with(&target) || target.starts_with(&source) {
-		return Err("source and target must be separate folders (one is inside the other)".into());
+		return Err(usage("source and target must be separate folders (one is inside the other)"));
 	}
 	if args.both && args.mirror {
-		return Err("--mirror only works one way; drop --both or --mirror".into());
+		return Err(usage("--mirror only works one way; drop --both or --mirror"));
 	}
 
 	let cmp = compare(&source, &target, true).map_err(|e| e.to_string())?;
 	if cmp.truncated {
-		return Err(format!("too many files to compare (limit {})", tpfs_core::sync::MAX_ENTRIES));
+		return Err(format!("too many files to compare (limit {})", tpfs_core::sync::MAX_ENTRIES).into());
 	}
 	let direction = if args.both { Direction::Both } else { Direction::LeftToRight };
 	let sp = sync_plan(&source, &target, &cmp, SyncOptions { direction, mirror: args.mirror });
@@ -391,34 +550,42 @@ fn sync(args: &Args) -> Result<ExitCode, String> {
 
 /// An approval is bound to the exact plan: either the digest is passed explicitly,
 /// or a human types `yes` on a terminal. Agents never get a `--yes`.
-fn confirm(args: &Args, digest: &str, level: Level) -> Result<(), String> {
+fn confirm(args: &Args, digest: &str, level: Level) -> Result<(), Fail> {
 	if let Some(approved) = &args.approve {
 		return if approved == digest {
 			Ok(())
 		} else {
-			Err("--approve does not match this plan's digest; nothing was changed".into())
+			Err(cancelled("--approve does not match this plan's digest; nothing was changed"))
 		};
 	}
 	if args.source == Source::Agent {
-		return Err("plans from agents need a human approval: --approve <digest>".into());
+		return Err(cancelled("plans from agents need a human approval: --approve <digest>"));
 	}
-	if !io::stdin().is_terminal() || args.plan.as_deref() == Some("-".as_ref()) {
-		return Err("not interactive: pass --approve <digest> to apply exactly this plan".into());
+	if !io::stdin().is_terminal() || !io::stderr().is_terminal() || args.plan.as_deref() == Some("-".as_ref()) {
+		return Err(cancelled("not interactive: pass --approve <digest> to apply exactly this plan"));
 	}
 
 	let prompt = if level == Level::High { "Type 'yes' to apply this HIGH-risk plan: " } else { "Apply? [y/N] " };
-	print!("{prompt}");
-	io::stdout().flush().ok();
+	let answer = ask(prompt)?;
+	let ok = if level == Level::High { answer == "yes" } else { matches!(answer.as_str(), "y" | "Y" | "yes") };
+	if ok { Ok(()) } else { Err(cancelled("cancelled; nothing was changed")) }
+}
+
+/// Ask on the terminal: the prompt goes to stderr, so it is seen even when stdout is redirected.
+fn ask(prompt: &str) -> Result<String, Fail> {
+	eprint!("{prompt}");
+	io::stderr().flush().ok();
 	let mut answer = String::new();
-	io::stdin().lock().read_line(&mut answer).map_err(|e| e.to_string())?;
-	let answer = answer.trim();
-	let ok = if level == Level::High { answer == "yes" } else { matches!(answer, "y" | "Y" | "yes") };
-	if ok { Ok(()) } else { Err("cancelled; nothing was changed".into()) }
+	let n = io::stdin().lock().read_line(&mut answer).map_err(|e| e.to_string())?;
+	if n == 0 {
+		return Err(cancelled("no answer (end of input); nothing was changed"));
+	}
+	Ok(answer.trim().to_owned())
 }
 
 /// A human reviews an agent's plan in their own terminal and approves exactly that plan.
 /// Deliberately interactive only: there is no flag an agent could pass to approve its own plan.
-fn approve(args: &Args) -> Result<ExitCode, String> {
+fn approve(args: &Args) -> Res {
 	let id = plan_id(args)?;
 	let store = tpfs_mcp::Store::new(&state_dir(args)?);
 	let pending = store.get(&id).map_err(|e| e.to_string())?;
@@ -427,7 +594,7 @@ fn approve(args: &Args) -> Result<ExitCode, String> {
 	}
 
 	let validator =
-		Validator::new(&pending.roots).map_err(|e| format!("invalid root: {e}"))?.with_protected([state_dir(args)?]);
+		Validator::new(&pending.roots).map_err(|e| root_error(&pending.roots, e))?.with_protected([state_dir(args)?]);
 	let issues = validator.validate(&pending.plan);
 	let risk = risk::assess(&pending.plan, Source::Agent);
 
@@ -451,23 +618,19 @@ fn approve(args: &Args) -> Result<ExitCode, String> {
 		return Ok(ExitCode::from(3));
 	}
 
-	if !io::stdin().is_terminal() {
-		return Err("approval must be given interactively in a terminal".into());
+	if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+		return Err(cancelled("approval must be given interactively in a terminal"));
 	}
-	print!("Type 'yes' to let the agent apply exactly this plan: ");
-	io::stdout().flush().ok();
-	let mut answer = String::new();
-	io::stdin().lock().read_line(&mut answer).map_err(|e| e.to_string())?;
-	if answer.trim() != "yes" {
-		return Err("not approved".into());
+	if ask("Type 'yes' to let the agent apply exactly this plan: ")? != "yes" {
+		return Err(cancelled("not approved"));
 	}
 	store.approve(&pending).map_err(|e| e.to_string())?;
 	println!("Approved. The agent can now call apply_plan for {id}.");
 	Ok(ExitCode::SUCCESS)
 }
 
-fn plan_id(args: &Args) -> Result<String, String> {
-	args.plan.as_ref().and_then(|p| p.to_str()).map(str::to_owned).ok_or_else(|| "missing <planId>".to_owned())
+fn plan_id(args: &Args) -> Result<String, Fail> {
+	args.plan.as_ref().and_then(|p| p.to_str()).map(str::to_owned).ok_or_else(|| usage("missing <planId>"))
 }
 
 fn read_plan(source: &std::ffi::OsStr) -> Result<Plan, String> {
@@ -488,6 +651,11 @@ fn state_dir(args: &Args) -> Result<PathBuf, String> {
 	if let Some(h) = std::env::var_os("TPFS_HOME") {
 		return Ok(h.into());
 	}
+	if cfg!(windows)
+		&& let Some(x) = std::env::var_os("LOCALAPPDATA").filter(|x| !x.is_empty())
+	{
+		return Ok(PathBuf::from(x).join("tpfs"));
+	}
 	if let Some(x) = std::env::var_os("XDG_STATE_HOME").filter(|x| !x.is_empty()) {
 		return Ok(PathBuf::from(x).join("tpfs"));
 	}
@@ -503,7 +671,8 @@ fn open_state(args: &Args) -> Result<(Journal, PathBuf), String> {
 	Ok((journal, dir.join("trash")))
 }
 
-/// Undo and recovery replay inverses recorded in the journal; they are not confined to roots.
-fn any_validator() -> Result<Validator, String> {
-	Validator::new(tpfs_core::system_roots()).map_err(|e| e.to_string())
+/// Undo and recovery replay what the journal recorded anywhere the user works; below every
+/// system root they still refuse symlinks, and tpfs's own state stays protected.
+fn any_validator(args: &Args) -> Result<Validator, String> {
+	Ok(Validator::new(tpfs_core::system_roots()).map_err(|e| e.to_string())?.with_protected([state_dir(args)?]))
 }
