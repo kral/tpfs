@@ -208,6 +208,7 @@ fn trash_stays_on_the_same_file_system_and_planted_trashes_are_refused() {
 		eprintln!("skipped: no second file system available");
 		return;
 	}
+	fs::set_permissions(state_tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
 	let uid = rustix_uid();
 	let local = shm.join(format!(".tpfs-trash-{uid}"));
 	// Keep whatever is there out of the way, and put it back at the end.
@@ -216,6 +217,28 @@ fn trash_stays_on_the_same_file_system_and_planted_trashes_are_refused() {
 	if had {
 		fs::rename(&local, &aside).unwrap();
 	}
+	// Put things back however the test ends (a failed assertion included).
+	struct Restore {
+		local: PathBuf,
+		aside: Option<PathBuf>,
+	}
+	impl Drop for Restore {
+		fn drop(&mut self) {
+			match fs::symlink_metadata(&self.local) {
+				Ok(m) if m.is_dir() => {
+					let _ = fs::remove_dir_all(&self.local);
+				}
+				Ok(_) => {
+					let _ = fs::remove_file(&self.local);
+				}
+				Err(_) => {}
+			}
+			if let Some(a) = &self.aside {
+				let _ = fs::rename(a, &self.local);
+			}
+		}
+	}
+	let _restore = Restore { local: local.clone(), aside: had.then(|| aside.clone()) };
 	let trash = state_tmp.path().join("trash");
 	let trash_one = |name: &str| {
 		let s = Sandbox::new_in(Some(shm));
@@ -244,17 +267,15 @@ fn trash_stays_on_the_same_file_system_and_planted_trashes_are_refused() {
 	fs::remove_file(&local).unwrap();
 
 	// The genuine one: created private, used, and undo brings the file back.
-	let (s, file, id, mut j) = trash_one("c.txt");
-	assert_eq!(fs::metadata(&s.root).unwrap().uid(), uid);
+	let (_s, file, id, mut j) = trash_one("c.txt");
 	assert!(local.join(&id).is_dir(), "the file was not trashed on its own file system");
 	assert!(!trash.join(&id).exists());
 	Executor::new(&Validator::new(tpfs_core::system_roots()).unwrap(), &mut j, &trash).undo_last().unwrap().unwrap();
 	assert_eq!(fs::read_to_string(&file).unwrap(), "N");
 
-	fs::remove_dir_all(&local).unwrap();
-	if had {
-		fs::rename(&aside, &local).unwrap();
-	}
+	// The genuine trash is a private folder owned by us.
+	let m = fs::symlink_metadata(&local).unwrap();
+	assert!(m.is_dir() && m.uid() == uid && m.permissions().mode() & 0o777 == 0o700);
 }
 
 #[cfg(target_os = "linux")]

@@ -14,8 +14,9 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 /// Protocol versions this server implements; a client asking for another gets [`PROTOCOL_VERSION`].
 const SUPPORTED_VERSIONS: [&str; 3] = [PROTOCOL_VERSION, "2025-03-26", "2024-11-05"];
 
-/// Longest plan reason accepted from an agent.
-const MAX_REASON: usize = 2_000;
+/// Longest plan reason accepted from an agent: stricter than the core limit, as the reason is
+/// shown to the human approving it and should stay readable.
+const AGENT_MAX_REASON: usize = 2_000;
 
 /// Longest JSON-RPC message accepted on stdin.
 pub const MAX_MESSAGE: usize = 4 << 20;
@@ -169,7 +170,11 @@ impl Server {
 			return Ok(tool_result(&json!({ "error": "'arguments' must be an object" }), true));
 		};
 		if let Some(extra) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
-			let msg = format!("unknown argument '{extra}' for {name} (it has: {})", allowed.join(", "));
+			let msg = if allowed.is_empty() {
+				format!("unknown argument '{extra}': {name} takes no arguments")
+			} else {
+				format!("unknown argument '{extra}' for {name} (it takes: {})", allowed.join(", "))
+			};
 			return Ok(tool_result(&json!({ "error": msg }), true));
 		}
 		let outcome = match name {
@@ -241,8 +246,8 @@ impl Server {
 	fn propose_plan(&mut self, args: &Value) -> Result<Value, String> {
 		let plan: Plan = serde_json::from_value(args.get("plan").cloned().ok_or("'plan' is required")?)
 			.map_err(|e| format!("not a valid plan: {e}"))?;
-		if plan.reason.chars().count() > MAX_REASON {
-			return Err(format!("the reason is too long (limit {MAX_REASON} characters)"));
+		if plan.reason.chars().count() > AGENT_MAX_REASON {
+			return Err(format!("the reason is too long (limit {AGENT_MAX_REASON} characters)"));
 		}
 
 		let issues = self.validator.validate(&plan);
@@ -251,10 +256,13 @@ impl Server {
 		if !issues.is_empty() {
 			// An error result, so clients surface it; the preview is cut short to spare context.
 			let shown: Vec<&String> = preview.iter().take(20).collect();
+			let all = issues.len();
 			let issues: Vec<String> = issues.iter().take(50).map(ToString::to_string).collect();
 			return Ok(json!({
 				"valid": false,
 				"issues": issues,
+				"issuesTruncated": all > 50,
+				"issueCount": all,
 				"preview": shown,
 				"previewTruncated": preview.len() > 20,
 			}));
@@ -415,7 +423,7 @@ fn tools() -> Value {
 		},
 		{
 			"name": "history",
-			"description": "Your recent batches (agent batches only): id, time (Unix seconds), status (committed, rolled back, undone, interrupted), number of steps, reason.",
+			"description": "Your recent batches (agent batches only): id, time (Unix seconds), status (committed, rolled back, undone, interrupted = ask the user to run `tpfs recover`, damaged = its journal records are unreadable; ask the user to check `tpfs log`), number of steps, reason.",
 			"inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
 			"annotations": { "readOnlyHint": true, "openWorldHint": false }
 		}

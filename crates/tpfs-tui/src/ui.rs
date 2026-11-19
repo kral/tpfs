@@ -77,7 +77,18 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
 		Some(Dialog::Help) => draw_help(f),
 		Some(Dialog::Undo { lines, .. }) => {
 			let w = f.area().width.saturating_sub(10) as usize;
-			let mut body: Vec<Line> = lines.iter().map(|l| Line::raw(truncate_middle(l, w))).collect();
+			// Borders, blank and key line are fixed; the list gets what is left, keys always show.
+			let room = (f.area().height as usize).saturating_sub(2 + 2 + 2).max(1);
+			let mut body: Vec<Line> = Vec::new();
+			for (i, l) in lines.iter().enumerate() {
+				if i + 1 == room && lines.len() > room {
+					body.push(Line::raw(format!("… and {} more line(s)", lines.len() - i)));
+					break;
+				}
+				let style =
+					if l.starts_with("TRASH") || l.starts_with("RMDIR") { DIALOG.fg(Color::Red) } else { DIALOG };
+				body.push(Line::styled(truncate_middle(l, w), style));
+			}
 			body.push(Line::raw(""));
 			body.push(Line::raw("[ Y: Undo ]   [ Esc: Cancel ]").centered());
 			dialog(f, " Undo ", body, Color::Black);

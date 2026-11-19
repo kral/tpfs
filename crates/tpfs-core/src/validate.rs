@@ -139,14 +139,6 @@ impl Validator {
 	}
 
 	pub fn validate(&self, plan: &Plan) -> Vec<Issue> {
-		if plan.ops.is_empty() {
-			let message = if plan.reason.trim().is_empty() {
-				"The plan is empty.".to_owned()
-			} else {
-				format!("The plan is empty: {}", plan.reason)
-			};
-			return vec![Issue { index: None, message }];
-		}
 		if plan.reason.chars().count() > MAX_REASON {
 			return vec![Issue {
 				index: None,
@@ -155,6 +147,14 @@ impl Validator {
 					plan.reason.chars().count()
 				),
 			}];
+		}
+		if plan.ops.is_empty() {
+			let message = if plan.reason.trim().is_empty() {
+				"The plan is empty.".to_owned()
+			} else {
+				format!("The plan is empty: {}", sanitize(plan.reason.as_ref()))
+			};
+			return vec![Issue { index: None, message }];
 		}
 		if plan.ops.len() > self.max_ops {
 			return vec![Issue {

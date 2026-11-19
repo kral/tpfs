@@ -86,7 +86,10 @@ impl Store {
 	}
 
 	pub fn remove(&self, id: &str) -> io::Result<()> {
-		let _ = fs::remove_file(self.approval(id)?);
+		match fs::remove_file(self.approval(id)?) {
+			Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+			_ => {}
+		}
 		match fs::remove_file(self.file(id)?) {
 			Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
 			_ => Ok(()),

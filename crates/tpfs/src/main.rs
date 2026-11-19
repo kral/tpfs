@@ -33,6 +33,9 @@ USAGE:
   tpfs undo                                     revert the most recent batch
   tpfs log                                      list recorded batches
   tpfs recover                                  roll back batches interrupted by a crash
+                [--abandon <batch>]               give up on one recovery cannot handle (damaged, or
+                                                  older than newer changes): marks it rolled back and
+                                                  changes nothing on disk; see `tpfs log` first
 
   tpfs mcp --root <dir>... [--approval terminal|client]
                                                   MCP server on stdio for AI agents (agents propose,
@@ -109,7 +112,8 @@ fn allowed(command: &str) -> Option<(&'static [&'static str], usize)> {
 		"check" => (&["root", "source", "max-ops", "home"], 1),
 		"apply" => (&["root", "approve", "source", "max-ops", "home"], 1),
 		"sync" => (&["both", "mirror", "apply", "approve", "json", "home"], 2),
-		"undo" | "log" | "recover" | "pending" => (&["home"], 0),
+		"undo" | "log" | "pending" => (&["home"], 0),
+		"recover" => (&["home", "abandon"], 0),
 		"mcp" => (&["root", "approval", "home"], 0),
 		"approve" | "reject" => (&["home"], 1),
 		_ => return None,
@@ -135,6 +139,7 @@ struct Args {
 	given: Vec<&'static str>,
 	positional: usize,
 	help: bool,
+	abandon: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -184,6 +189,7 @@ fn parse_args() -> Result<Args, Fail> {
 		given: vec![],
 		positional: 0,
 		help: false,
+		abandon: None,
 	};
 
 	let e = |e: lexopt::Error| usage(e.to_string());
@@ -216,6 +222,9 @@ fn parse_args() -> Result<Args, Fail> {
 						"client" => tpfs_mcp::Approval::Client,
 						other => return Err(usage(format!("unknown approval mode '{other}' (terminal|client)"))),
 					}
+			}
+			Long("abandon") => {
+				args.abandon = Some(parser.value().map_err(e)?.string().map_err(|e| usage(e.to_string()))?)
 			}
 			Long("icons") => args.icons = true,
 			Long("both") => args.both = true,
@@ -357,6 +366,17 @@ fn run(args: Args) -> Res {
 		"recover" => {
 			let (mut journal, trash) = open_state(&args)?;
 			let validator = any_validator(&args, &mut journal)?;
+			if let Some(id) = &args.abandon {
+				if io::stdin().is_terminal() && io::stderr().is_terminal() {
+					let answer = ask(&format!("Abandon batch {id}? Its changes stay on disk as they are. [y/N] "))?;
+					if !answer.eq_ignore_ascii_case("y") {
+						return Err(cancelled("cancelled; nothing was changed"));
+					}
+				}
+				Executor::new(&validator, &mut journal, trash).abandon(id).map_err(|e| e.to_string())?;
+				println!("Abandoned batch {id}; its changes were left as they are.");
+				return Ok(ExitCode::SUCCESS);
+			}
 			let report = Executor::new(&validator, &mut journal, trash).recover().map_err(|e| e.to_string())?;
 			println!("Rolled back {} interrupted batch(es).", report.rolled_back.len());
 			for e in &report.errors {

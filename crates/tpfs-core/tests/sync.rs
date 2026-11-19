@@ -226,3 +226,27 @@ fn two_way_sync_skips_conflicts_and_undoes_completely() {
 	e.undo();
 	assert_eq!((snap(&e.left), snap(&e.right)), (l0, r0), "undo restores both sides, including the replaced file");
 }
+
+#[test]
+fn tpfs_working_entries_are_never_synced() {
+	let e = Env::new();
+	fs::create_dir_all(e.left.join(".tpfs-trash-1000/batch")).unwrap();
+	e.file(&e.left.join(".tpfs-part-x"), "half", 100);
+	e.file(&e.left.join("real.txt"), "r", 100);
+	let cmp = compare(&e.left, &e.right, true).unwrap();
+	let names: Vec<String> = cmp.items.iter().map(|i| i.rel.to_string_lossy().into_owned()).collect();
+	assert_eq!(names, ["real.txt"]);
+}
+
+#[test]
+fn one_way_and_mirror_syncs_are_idempotent() {
+	for mirror in [false, true] {
+		let e = Env::new();
+		e.file(&e.left.join("a.txt"), "a", 100);
+		e.file(&e.right.join("extra.txt"), "x", 100);
+		e.run(SyncOptions { direction: Direction::LeftToRight, mirror });
+		let cmp = compare(&e.left, &e.right, true).unwrap();
+		let again = sync_plan(&e.left, &e.right, &cmp, SyncOptions { direction: Direction::LeftToRight, mirror });
+		assert!(again.plan.ops.is_empty(), "mirror={mirror}: {:?}", again.plan.preview());
+	}
+}

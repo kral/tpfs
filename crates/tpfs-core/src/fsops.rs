@@ -264,7 +264,7 @@ impl Fs {
 			for name in self.list(from)? {
 				self.copy_tree(&from.join(&name), &to.join(&name), &rel.join(&name), copied)?;
 			}
-			return self.set_dir_mode(to, meta.permissions());
+			return self.set_dir_mode(to, safe_permissions(&meta));
 		} else if ft.is_symlink() {
 			self.symlink(&fs::read_link(from)?, to)?;
 		} else {
@@ -306,8 +306,21 @@ fn copy_stream(mut src: File, mut dst: File, from: &Path, meta: &fs::Metadata) -
 	if let Ok(t) = meta.modified() {
 		dst.set_modified(t)?;
 	}
-	dst.set_permissions(meta.permissions())?;
+	dst.set_permissions(safe_permissions(meta))?;
 	dst.sync_all()
+}
+
+/// The source's permissions for its copy, without setuid and setgid: the copy belongs to whoever
+/// runs tpfs, so keeping them would turn another user's program into one that runs as us
+/// (`cp -p` drops them for the same reason when it cannot keep the owner).
+fn safe_permissions(meta: &fs::Metadata) -> fs::Permissions {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		fs::Permissions::from_mode(meta.permissions().mode() & 0o1777)
+	}
+	#[cfg(not(unix))]
+	meta.permissions()
 }
 
 #[cfg(unix)]
@@ -404,6 +417,13 @@ pub(crate) fn remove_part(part: &Path) -> io::Result<()> {
 		Err(e) => return Err(e),
 	};
 	if !m.is_dir() {
+		#[cfg(windows)]
+		if m.permissions().readonly() {
+			let mut p = m.permissions();
+			#[allow(clippy::permissions_set_readonly_false)]
+			p.set_readonly(false);
+			std::fs::set_permissions(part, p)?;
+		}
 		return std::fs::remove_file(part);
 	}
 	fn writable(dir: &Path) {
@@ -761,7 +781,7 @@ mod confined {
 			dfd,
 			dname,
 			create,
-			Mode::from_raw_mode((meta.permissions().mode() & 0o7777) as rustix::fs::RawMode),
+			Mode::from_raw_mode((meta.permissions().mode() & 0o1777) as rustix::fs::RawMode),
 		)?;
 
 		Ok(Some((File::from(src), File::from(dst))))

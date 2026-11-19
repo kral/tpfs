@@ -314,7 +314,7 @@ impl App {
 			self.status = "Nothing selected.".into();
 			return;
 		}
-		let issues = self.validator.validate(&plan);
+		let issues = self.validator().validate(&plan);
 		let risk = risk::assess(&plan, Source::Human);
 		self.dialog = Some(Dialog::Confirm { plan, risk, issues, offset: 0, fits: false, seen_all: false });
 	}
@@ -484,6 +484,11 @@ impl App {
 			return;
 		}
 		let plan = match kind {
+			// A folder name, not a path: `../x` or `/abs/x` must not create a folder elsewhere.
+			InputKind::Mkdir if value == "." || value == ".." || value.contains(['/', '\\', '\0']) => {
+				self.status = "A folder name cannot contain / or \\, and cannot be . or ..".into();
+				return;
+			}
 			InputKind::Mkdir => Plan::new(
 				vec![Op::Mkdir { path: self.panels[self.active].cwd.join(value) }],
 				format!("Make directory {value}"),
@@ -493,7 +498,7 @@ impl App {
 			}
 		};
 		// Single, low-risk operations typed by the user run directly; anything else is previewed.
-		let issues = self.validator.validate(&plan);
+		let issues = self.validator().validate(&plan);
 		if issues.is_empty() && risk::assess(&plan, Source::Human).level == risk::Level::Low {
 			self.execute(&plan);
 		} else {
@@ -503,7 +508,7 @@ impl App {
 
 	fn execute(&mut self, plan: &Plan) {
 		let result = self.journal().and_then(|mut j| {
-			Executor::new(&self.validator, &mut j, self.state.join("trash"))
+			Executor::new(&self.validator(), &mut j, self.state.join("trash"))
 				.execute(plan, Source::Human)
 				.map(|b| format!("Done: {} operation(s). Ctrl+Z to undo.", b.steps))
 				.map_err(|e| one_line(&e))
@@ -522,6 +527,13 @@ impl App {
 		match batch {
 			Err(e) => self.status = format!("Undo failed: {e}"),
 			Ok(None) => self.status = "Nothing to undo.".into(),
+			Ok(Some(b)) if b.status != BatchStatus::Committed || b.damaged => {
+				self.status = format!(
+					"The last batch ({}) was interrupted{}: run `tpfs recover` in a terminal first.",
+					tpfs_core::sanitize(b.id.as_ref()),
+					if b.damaged { " and its journal records are damaged" } else { "" }
+				);
+			}
 			Ok(Some(b)) => {
 				let who = match b.source.as_str() {
 					"agent" => "an AI agent",
@@ -550,7 +562,7 @@ impl App {
 			if newest.is_none_or(|b| b.id != expected) {
 				return Err("the history changed meanwhile; press Undo again to see what it would revert".into());
 			}
-			Executor::new(&self.validator, &mut j, self.state.join("trash"))
+			Executor::new(&self.validator(), &mut j, self.state.join("trash"))
 				.undo_last()
 				.map(|b| match b {
 					Some(b) => format!("Undone batch {}: {} operation(s).", b.id, b.steps),
@@ -564,6 +576,19 @@ impl App {
 
 	fn reload(&mut self) {
 		self.panels.iter_mut().for_each(Panel::reload);
+	}
+
+	/// The roots for an operation: every drive (or `/`), plus the network shares (Windows UNC)
+	/// the panels are on — no drive letter covers those.
+	fn validator(&self) -> Validator {
+		let mut v = self.validator.clone();
+		let shares: Vec<PathBuf> = self.panels.iter().filter_map(|p| tpfs_core::share_root(&p.cwd)).collect();
+		if !shares.is_empty()
+			&& let Ok(with) = Validator::new(self.validator.roots().iter().cloned().chain(shares))
+		{
+			v = with.with_protected(self.validator.protected().iter().cloned());
+		}
+		v
 	}
 
 	/// Opened per operation, so `tpfs` in another terminal and agents over MCP keep working.
@@ -1018,6 +1043,58 @@ mod tests {
 					}
 				}
 			}
+		}
+	}
+
+	#[test]
+	fn a_new_folder_name_cannot_point_elsewhere() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+		fs::create_dir_all(base.join("l")).unwrap();
+		let mut app = App::new(base.join("l"), base.join("l"), base.join("state"), false).unwrap();
+		for name in ["../escaped", "/abs/x", "a/b", ".."] {
+			app.submit_input(name, &InputKind::Mkdir);
+			assert!(app.dialog.is_none(), "{name}");
+		}
+		assert!(!base.join("escaped").exists() && !base.join("l/a").exists());
+		app.submit_input("fine", &InputKind::Mkdir);
+		assert!(base.join("l/fine").is_dir());
+	}
+
+	#[test]
+	fn undo_over_an_interrupted_batch_points_to_recover() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+		fs::create_dir_all(base.join("l")).unwrap();
+		let mut app = App::new(base.join("l"), base.join("l"), base.join("state"), false).unwrap();
+		let mut j = app.journal().unwrap();
+		j.append(&tpfs_core::Entry::Begin {
+			batch: "x".into(),
+			at: 0,
+			source: "human".into(),
+			reason: String::new(),
+			digest: String::new(),
+			v: 1,
+		})
+		.unwrap();
+		drop(j);
+		ctrl(&mut app, 'z');
+		assert!(app.dialog.is_none() && app.status.contains("tpfs recover"), "{}", app.status);
+	}
+
+	#[test]
+	fn undo_dialog_keys_stay_visible_in_small_terminals() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+		fs::create_dir_all(base.join("l")).unwrap();
+		let mut app = App::new(base.join("l"), base.join("l"), base.join("state"), false).unwrap();
+		let ops: Vec<Op> = (0..20).map(|i| Op::Mkdir { path: base.join(format!("l/d{i:02}")) }).collect();
+		app.execute(&Plan::new(ops, "many"));
+		app.undo();
+		assert!(matches!(app.dialog, Some(Dialog::Undo { .. })));
+		for (w, h) in [(80, 24), (80, 16), (60, 12)] {
+			let screen = render(&mut app, w, h);
+			assert!(screen.contains("Esc"), "{w}x{h}\n{screen}");
 		}
 	}
 }

@@ -1218,3 +1218,138 @@ fn each_kind_of_invalid_step_is_named() {
 	}
 	assert!(messages(&s.validator(), &Plan::new(vec![], ""))[0].contains("empty"));
 }
+
+#[test]
+#[cfg(unix)]
+fn copies_never_keep_setuid_or_setgid() {
+	use std::os::unix::fs::PermissionsExt;
+	let s = Sandbox::new();
+	let bin = s.file("tool", "#!/bin/sh\n");
+	fs::set_permissions(&bin, fs::Permissions::from_mode(0o6755)).unwrap();
+	let dir = s.dir("pkg");
+	let inner = dir.join("inner");
+	fs::write(&inner, "x").unwrap();
+	fs::set_permissions(&inner, fs::Permissions::from_mode(0o4711)).unwrap();
+	run(
+		&s,
+		vec![Op::Copy { from: bin, to: s.root.join("tool-copy") }, Op::Copy { from: dir, to: s.root.join("pkg-copy") }],
+	);
+	for p in [s.root.join("tool-copy"), s.root.join("pkg-copy/inner")] {
+		let mode = fs::metadata(&p).unwrap().permissions().mode();
+		assert_eq!(mode & 0o6000, 0, "{}: {mode:o}", p.display());
+	}
+	assert_eq!(fs::metadata(s.root.join("tool-copy")).unwrap().permissions().mode() & 0o777, 0o755);
+}
+
+#[test]
+fn recovery_records_after_a_torn_tail_are_not_damage() {
+	let s = Sandbox::new();
+	let mut j = s.journal();
+	j.append(&Entry::Begin {
+		batch: "x".into(),
+		at: 0,
+		source: "human".into(),
+		reason: String::new(),
+		digest: String::new(),
+		v: 1,
+	})
+	.unwrap();
+	drop(j);
+	let path = s.state.join("journal.jsonl");
+	let mut bytes = fs::read(&path).unwrap();
+	bytes.extend_from_slice(b"0000 {\"kind\":\"intent\""); // torn while writing an intent
+	fs::write(&path, bytes).unwrap();
+	let mut j = s.journal();
+	// A first recovery wrote an intermediate record, then needed a second run.
+	j.append(&Entry::UndoPublished { batch: "x".into(), index: 0 }).unwrap();
+	assert!(!j.batches().unwrap()[0].damaged);
+	let report = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
+	assert!(report.errors.is_empty() && report.rolled_back == ["x"], "{report:?}");
+}
+
+#[test]
+fn undo_finishes_a_move_back_whose_publish_was_not_recorded() {
+	// A crash between publishing the copy back and journaling that: both trees are complete.
+	let s = Sandbox::new();
+	let dir = s.dir("dir");
+	fs::write(dir.join("a"), "A").unwrap();
+	let away = s.root.join("away");
+	run(&s, vec![Op::Move { from: dir.clone(), to: away.clone() }]);
+	fs::create_dir(&dir).unwrap();
+	fs::copy(away.join("a"), dir.join("a")).unwrap();
+	let t = fs::metadata(away.join("a")).unwrap().modified().unwrap();
+	fs::File::options().write(true).open(dir.join("a")).unwrap().set_modified(t).unwrap();
+	assert_eq!(undo(&s).unwrap().unwrap().steps, 1);
+	assert!(!away.exists() && dir.join("a").exists());
+}
+
+#[test]
+fn long_histories_are_read_in_linear_time() {
+	let s = Sandbox::new();
+	let _ = s.journal();
+	let mut text = String::new();
+	let mut line = |e: &Entry| {
+		let json = serde_json::to_string(e).unwrap();
+		text.push_str(&format!("{:08x} {json}\n", crc32fast::hash(json.as_bytes())));
+	};
+	for i in 0..50_000 {
+		let batch = format!("b{i}");
+		let p = s.root.join(format!("d{i}"));
+		line(&Entry::Begin {
+			batch: batch.clone(),
+			at: 0,
+			source: "human".into(),
+			reason: String::new(),
+			digest: String::new(),
+			v: 1,
+		});
+		line(&Entry::Intent {
+			batch: batch.clone(),
+			index: 0,
+			forward: Op::Mkdir { path: p.clone() },
+			inverse: Op::Rmdir { path: p },
+		});
+		line(&Entry::Done { batch: batch.clone(), index: 0, check: None, mode: None });
+		line(&Entry::Commit { batch });
+	}
+	fs::write(s.state.join("journal.jsonl"), text).unwrap();
+	let mut j = s.journal();
+	let started = std::time::Instant::now();
+	assert_eq!(j.batches().unwrap().len(), 50_000);
+	assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+}
+
+#[test]
+fn an_old_unrecoverable_batch_can_be_abandoned_and_does_not_block_new_work() {
+	let s = Sandbox::new();
+	let mut j = s.journal();
+	j.append(&Entry::Begin {
+		batch: "old".into(),
+		at: 0,
+		source: "human".into(),
+		reason: String::new(),
+		digest: String::new(),
+		v: 1,
+	})
+	.unwrap();
+	j.append(&Entry::Begin {
+		batch: "new".into(),
+		at: 0,
+		source: "human".into(),
+		reason: String::new(),
+		digest: String::new(),
+		v: 1,
+	})
+	.unwrap();
+	j.append(&Entry::Commit { batch: "new".into() }).unwrap();
+	drop(j);
+	// The interrupted batch is old, with newer committed work on top: new work may go on.
+	run(&s, vec![Op::Mkdir { path: s.root.join("d") }]);
+	let mut j = s.journal();
+	let report = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
+	assert!(report.errors[0].contains("old"), "{report:?}");
+	Executor::new(&s.validator(), &mut j, s.trash()).abandon("old").unwrap();
+	let report = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
+	assert!(report.errors.is_empty(), "{report:?}");
+	assert!(Executor::new(&s.validator(), &mut j, s.trash()).abandon("new").is_err());
+}

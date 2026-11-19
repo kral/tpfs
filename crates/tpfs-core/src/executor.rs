@@ -152,7 +152,15 @@ impl<'a> Executor<'a> {
 		}
 
 		// Never build on top of an interrupted batch: its rollback would later run over this one.
-		if let Some(b) = self.journal.batches()?.into_iter().find(|b| b.status == BatchStatus::Incomplete) {
+		// (An older one, below committed batches, is reported by recover and can be abandoned.)
+		if let Some(b) = self
+			.journal
+			.batches()?
+			.into_iter()
+			.rev()
+			.find(|b| b.status != BatchStatus::Aborted && b.status != BatchStatus::Undone)
+			.filter(|b| b.status == BatchStatus::Incomplete)
+		{
 			return Err(ExecError::Blocked(format!(
 				"batch {} was interrupted{}; run `tpfs recover` first",
 				b.id,
@@ -353,10 +361,12 @@ impl<'a> Executor<'a> {
 			}
 			_ => {}
 		}
+		// The copy reached its place if the journal says so — or if a crash came between publishing
+		// it and recording that, in which case both sides hold the same tree (copies keep times).
 		if let Op::Move { from, to } = &step.inverse
-			&& step.undo_published
 			&& exists(&n(from))
 			&& exists(&n(to))
+			&& (step.undo_published || fingerprint(&n(from)).is_some_and(|f| fingerprint(&n(to)) == Some(f)))
 		{
 			// The copy reached its place; what is left at the old place duplicates it.
 			return apply(&Op::Trash { path: n(from) }, fs, &self.trash, &label, step.index, None, &mut || Ok(()));
@@ -414,6 +424,21 @@ impl<'a> Executor<'a> {
 		report.rolled_back.append(&mut rest.rolled_back);
 		report.errors.append(&mut rest.errors);
 		Ok(report)
+	}
+
+	/// Give up on an interrupted batch without rolling it back: record it as aborted, leaving the
+	/// disk as it is. For a batch recovery cannot handle (damaged records, or newer changes on top);
+	/// the caller should have shown the user what it did (`tpfs log`).
+	pub fn abandon(&mut self, id: &str) -> Result<(), ExecError> {
+		let batches = self.journal.batches()?;
+		match batches.iter().find(|b| b.id == id) {
+			Some(b) if b.status == BatchStatus::Incomplete => {
+				self.journal.append(&Entry::Abort { batch: id.to_owned() })?;
+				Ok(())
+			}
+			Some(_) => Err(ExecError::Blocked(format!("batch {id} is not interrupted; nothing to abandon"))),
+			None => Err(ExecError::Blocked(format!("no batch {id} in the journal"))),
+		}
 	}
 
 	/// Roll back the newest batch if, and only if, it was interrupted: the change "Undo" means.

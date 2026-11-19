@@ -106,11 +106,11 @@ pub fn private_dir(dir: &Path) -> io::Result<()> {
 		fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
 		let m = fs::symlink_metadata(dir)?;
 		let uid = rustix::process::geteuid().as_raw();
-		if !m.is_dir() || m.uid() != uid || m.permissions().mode() & 0o022 != 0 {
+		if !m.is_dir() || m.uid() != uid || m.permissions().mode() & 0o077 != 0 {
 			return Err(io::Error::new(
 				io::ErrorKind::PermissionDenied,
 				format!(
-					"refusing to use {}: it must be a real folder owned by you and not writable by others (chmod 700)",
+					"refusing to use {}: it must be a real folder owned by you that only you can use (chmod 700)",
 					dir.display()
 				),
 			));

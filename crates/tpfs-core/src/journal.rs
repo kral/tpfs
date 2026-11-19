@@ -280,6 +280,8 @@ impl Journal {
 	/// All batches in journal order.
 	pub fn batches(&mut self) -> io::Result<Vec<BatchView>> {
 		let mut batches: Vec<BatchView> = Vec::new();
+		// Batch id -> position of its latest view: one lookup per record, not a scan of history.
+		let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 		// Batches that were open when an unreadable line appeared, until the next readable record.
 		let mut suspect: Vec<String> = Vec::new();
 		for e in self.records()? {
@@ -295,15 +297,21 @@ impl Journal {
 			// end of a crash with a torn last line — means records of the open batches may be lost
 			// (an intent, a done, or the commit itself).
 			if !suspect.is_empty() {
-				let closes_suspect = matches!(&e, Entry::Abort { batch } if suspect.contains(batch));
+				// Records recovery itself writes for a suspect batch (it may need several runs).
+				let closes_suspect = matches!(&e,
+					Entry::Abort { batch } | Entry::UndoPublished { batch, .. } if suspect.contains(batch));
 				if !closes_suspect {
 					for b in batches.iter_mut().filter(|b| suspect.contains(&b.id)) {
 						b.damaged = true;
 					}
 				}
-				suspect.clear();
+				// After recovery's intermediate records the batch is still open: keep watching it.
+				if !matches!(&e, Entry::UndoPublished { .. }) {
+					suspect.clear();
+				}
 			}
 			if let Entry::Begin { batch, at, source, reason, v, .. } = &e {
+				index.insert(batch.clone(), batches.len());
 				batches.push(BatchView {
 					id: batch.clone(),
 					at: *at,
@@ -318,7 +326,8 @@ impl Journal {
 
 			// A record without its `begin` (lost to damage): keep it visible as a damaged batch
 			// instead of dropping it, so undo cannot silently skip over it.
-			if !batches.iter().any(|b| b.id == e.batch()) {
+			if !index.contains_key(e.batch()) {
+				index.insert(e.batch().to_owned(), batches.len());
 				batches.push(BatchView {
 					id: e.batch().to_owned(),
 					at: 0,
@@ -329,7 +338,7 @@ impl Journal {
 					steps: Vec::new(),
 				});
 			}
-			let Some(b) = batches.iter_mut().rev().find(|b| b.id == e.batch()) else { continue };
+			let Some(b) = index.get(e.batch()).and_then(|&i| batches.get_mut(i)) else { continue };
 			match e {
 				Entry::Intent { index, forward, inverse, .. } => {
 					b.steps.push(Step {
