@@ -11,6 +11,12 @@ use crate::store::Store;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// Protocol versions this server implements; a client asking for another gets [`PROTOCOL_VERSION`].
+const SUPPORTED_VERSIONS: [&str; 3] = [PROTOCOL_VERSION, "2025-03-26", "2024-11-05"];
+
+/// Longest plan reason accepted from an agent.
+const MAX_REASON: usize = 2_000;
+
 /// Longest JSON-RPC message accepted on stdin.
 pub const MAX_MESSAGE: usize = 4 << 20;
 
@@ -89,8 +95,19 @@ impl Server {
 			Ok(v) => v,
 			Err(e) => return Some(rpc_error(Value::Null, -32700, &format!("parse error: {e}"))),
 		};
+		if !message.is_object() {
+			// Batches are not supported (MCP 2025-06-18 removed them).
+			return Some(rpc_error(Value::Null, -32600, "invalid request: expected a JSON-RPC object"));
+		}
 		let id = message.get("id").cloned();
-		let method = message.get("method").and_then(Value::as_str).unwrap_or_default();
+		let Some(method) = message.get("method").and_then(Value::as_str) else {
+			// A response from the client (result/error) is never answered; anything else is invalid.
+			return match id {
+				Some(_) if message.get("result").is_some() || message.get("error").is_some() => None,
+				Some(id) => Some(rpc_error(id, -32600, "invalid request: missing 'method'")),
+				None => None,
+			};
+		};
 		let params = message.get("params").cloned().unwrap_or(Value::Null);
 
 		let id = id?; // notifications (e.g. notifications/initialized) are not answered
@@ -108,7 +125,8 @@ impl Server {
 	}
 
 	fn initialize(&self, params: &Value) -> Value {
-		let version = params.get("protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL_VERSION);
+		let asked = params.get("protocolVersion").and_then(Value::as_str);
+		let version = asked.filter(|v| SUPPORTED_VERSIONS.contains(v)).unwrap_or(PROTOCOL_VERSION);
 		let roots: Vec<String> = self.validator.roots().iter().map(|r| show(r)).collect();
 		let approval = match self.config.approval {
 			Approval::Terminal => {
@@ -150,7 +168,13 @@ impl Server {
 
 	fn list_directory(&self, args: &Value) -> Result<Value, String> {
 		let path = args.get("path").and_then(Value::as_str).ok_or("'path' is required")?;
-		let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(500).clamp(1, 5000) as usize;
+		let limit = match args.get("limit") {
+			None | Some(Value::Null) => 500,
+			Some(v) => match v.as_u64() {
+				Some(n @ 1..=5000) => n as usize,
+				_ => return Err("'limit' must be an integer from 1 to 5000".into()),
+			},
+		};
 		let dir = self.validator.check_path(Path::new(path))?;
 		// check_path allows a symlink as the last component (operations act on the link itself);
 		// listing would follow it out of the allowed folders.
@@ -158,18 +182,20 @@ impl Server {
 			return Err(format!("{} is a symlink; list the folder it points to only if that is allowed", show(&dir)));
 		}
 
-		let mut entries: Vec<(bool, String, u64)> = fs::read_dir(&dir)
-			.map_err(|e| format!("{}: {e}", show(&dir)))?
-			.filter_map(Result::ok)
-			.map(|e| {
+		// Keep at most a bounded number of entries in memory, however big the folder is.
+		const SCAN: usize = 100_000;
+		let mut total = 0usize;
+		let mut entries: Vec<(bool, String, u64)> = Vec::new();
+		for e in fs::read_dir(&dir).map_err(|e| format!("{}: {e}", show(&dir)))?.filter_map(Result::ok) {
+			total += 1;
+			if entries.len() < SCAN {
 				let meta = fs::symlink_metadata(e.path()).ok();
 				let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
-				(is_dir, sanitize(&e.file_name()), meta.map_or(0, |m| m.len()))
-			})
-			.collect();
-		entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase())));
+				entries.push((is_dir, sanitize(&e.file_name()), meta.map_or(0, |m| m.len())));
+			}
+		}
+		entries.sort_by_cached_key(|e| (!e.0, e.1.to_lowercase()));
 
-		let total = entries.len();
 		let listed: Vec<Value> = entries
 			.into_iter()
 			.take(limit)
@@ -187,6 +213,9 @@ impl Server {
 	fn propose_plan(&mut self, args: &Value) -> Result<Value, String> {
 		let plan: Plan = serde_json::from_value(args.get("plan").cloned().ok_or("'plan' is required")?)
 			.map_err(|e| format!("not a valid plan: {e}"))?;
+		if plan.reason.chars().count() > MAX_REASON {
+			return Err(format!("the reason is too long (limit {MAX_REASON} characters)"));
+		}
 
 		let issues = self.validator.validate(&plan);
 		let risk = risk::assess(&plan, Source::Agent);
@@ -221,7 +250,11 @@ impl Server {
 	}
 
 	fn apply_plan(&mut self, args: &Value) -> Result<Value, String> {
-		let id = args.get("planId").and_then(Value::as_str).ok_or("'planId' is required")?;
+		let id = match args.get("planId") {
+			Some(Value::String(id)) => id.as_str(),
+			Some(_) => return Err("'planId' must be the string id returned by propose_plan".into()),
+			None => return Err("'planId' is required".into()),
+		};
 		let pending = self.store.get(id).map_err(|e| e.to_string())?;
 
 		if pending.plan.digest() != pending.digest {
@@ -237,8 +270,12 @@ impl Server {
 		let mut journal = self.journal()?;
 		let result = Executor::new(&self.validator, &mut journal, self.config.state.join("trash"))
 			.execute(&pending.plan, Source::Agent);
-		self.store.remove(id).ok();
-		let batch = result.map_err(|e| e.to_string())?;
+		// An approval is for one execution: the plan is used up either way.
+		let removed = self.store.remove(id);
+		let batch = result.map_err(|e| format!("{e}. The plan was used up; propose a corrected plan if needed."))?;
+		removed.map_err(|e| {
+			format!("applied, but the approved plan could not be removed ({e}); reject it with `tpfs reject {id}`")
+		})?;
 		Ok(
 			json!({ "applied": batch.steps, "batch": batch.id, "undo": "undo_last reverts it; the user can also run `tpfs undo`." }),
 		)
@@ -279,7 +316,7 @@ impl Server {
 			.rev()
 			.filter(|b| b.source == Source::Agent.as_str())
 			.take(20)
-			.map(|b| json!({ "batch": b.id, "source": b.source, "status": format!("{:?}", b.status), "steps": b.steps.len(), "reason": sanitize(b.reason.as_ref()) }))
+			.map(|b| json!({ "batch": b.id, "at": b.at, "source": b.source, "status": format!("{:?}", b.status), "steps": b.steps.len(), "reason": sanitize(b.reason.as_ref()) }))
 			.collect();
 		Ok(json!({ "batches": recent }))
 	}
@@ -313,7 +350,7 @@ fn tools() -> Value {
 				"type": "object",
 				"properties": {
 					"path": { "type": "string", "description": "Absolute path." },
-					"limit": { "type": "integer", "description": "Maximum entries (default 500)." }
+					"limit": { "type": "integer", "minimum": 1, "maximum": 5000, "description": "Maximum entries (default 500)." }
 				},
 				"required": ["path"]
 			},
@@ -327,10 +364,10 @@ fn tools() -> Value {
 		},
 		{
 			"name": "apply_plan",
-			"description": "Execute a proposed plan after the user approved it. Fails if it was not approved or was modified.",
+			"description": "Execute a proposed plan after the user approved it. In terminal mode the user approves with `tpfs approve <planId>`; until then this returns 'not approved yet' and you may call it again later. Fails if the plan was modified. A plan can be applied once; if execution fails it is used up and must be proposed again.",
 			"inputSchema": {
 				"type": "object",
-				"properties": { "planId": { "type": "string" } },
+				"properties": { "planId": { "type": "string", "description": "The planId returned by propose_plan." } },
 				"required": ["planId"]
 			},
 			"annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false }
@@ -343,7 +380,7 @@ fn tools() -> Value {
 		},
 		{
 			"name": "history",
-			"description": "Recent batches: who made them, status, number of steps.",
+			"description": "Your recent batches (agent batches only): id, time (Unix seconds), status, number of steps, reason.",
 			"inputSchema": { "type": "object", "properties": {} },
 			"annotations": { "readOnlyHint": true, "openWorldHint": false }
 		}

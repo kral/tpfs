@@ -7,6 +7,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tpfs_core::Plan;
 
+/// Most plans waiting for a decision at once (each may also have an approval file).
+pub const MAX_PENDING: usize = 100;
+
 /// A plan proposed by an agent and waiting for a human decision.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pending {
@@ -31,6 +34,11 @@ impl Store {
 
 	pub fn put(&self, plan: &Plan, roots: &[PathBuf]) -> io::Result<Pending> {
 		create_private_dir(&self.dir)?;
+		if fs::read_dir(&self.dir)?.count() >= 2 * MAX_PENDING {
+			return Err(io::Error::other(format!(
+				"too many plans are waiting (limit {MAX_PENDING}); ask the user to approve or reject some (`tpfs pending`)"
+			)));
+		}
 		let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
 		let pending = Pending {
 			id: format!("{:x}{:x}", nanos, std::process::id() & 0xfff),

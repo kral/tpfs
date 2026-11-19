@@ -205,3 +205,68 @@ fn listing_does_not_follow_a_final_symlink_out_of_the_roots() {
 	assert!(err && v.to_string().contains("symlink"), "{v}");
 	assert!(!v.to_string().contains("secret"));
 }
+
+#[test]
+fn protocol_edge_cases() {
+	let mut f = Fixture::new(Approval::Terminal);
+	let v = f.rpc("initialize", json!({ "protocolVersion": "1999-01-01" }));
+	assert_eq!(v["result"]["protocolVersion"], tpfs_mcp::PROTOCOL_VERSION);
+	let v = f.rpc("initialize", json!({ "protocolVersion": "2025-03-26" }));
+	assert_eq!(v["result"]["protocolVersion"], "2025-03-26");
+	assert_eq!(f.rpc("ping", json!({}))["result"], json!({}));
+
+	assert_eq!(f.server.handle("[]").unwrap()["error"]["code"], -32600);
+	assert_eq!(f.server.handle("\"x\"").unwrap()["error"]["code"], -32600);
+	assert!(f.server.handle(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#).is_none(), "responses are not answered");
+	assert!(f.server.handle(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
+	assert_eq!(f.rpc("tools/call", json!({ "name": "nope" }))["error"]["code"], -32602);
+	assert_eq!(f.rpc("nope", json!({}))["error"]["code"], -32601);
+}
+
+#[test]
+fn invented_options_and_bad_arguments_are_errors() {
+	let mut f = Fixture::new(Approval::Client);
+	let path = f.root.join("x");
+	let (v, err) =
+		f.tool("propose_plan", json!({ "plan": { "ops": [{ "op": "trash", "path": path, "force": true }] } }));
+	assert!(err && v["error"].as_str().unwrap().contains("force"), "{v}");
+	let (v, err) = f.tool("list_directory", json!({ "path": f.root, "limit": -5 }));
+	assert!(err && v["error"].as_str().unwrap().contains("limit"), "{v}");
+	let (v, err) = f.tool("apply_plan", json!({ "planId": 123 }));
+	assert!(err && v["error"].as_str().unwrap().contains("string"), "{v}");
+}
+
+#[test]
+fn agent_can_undo_its_own_batch_and_learns_when_a_plan_is_used_up() {
+	let mut f = Fixture::new(Approval::Client);
+	let dir = f.root.join("made");
+	let id = f.propose(json!({ "ops": [{ "op": "mkdir", "path": dir }] }));
+	let (v, err) = f.tool("apply_plan", json!({ "planId": id }));
+	assert!(!err, "{v}");
+	let (v, err) = f.tool("undo_last", json!({}));
+	assert!(!err && v["undone"] == true, "{v}");
+	assert!(!dir.exists());
+	let (v, _) = f.tool("undo_last", json!({}));
+	assert_eq!(v["undone"], false);
+
+	// Approved, then the source disappears: the error says the plan is used up.
+	let src = f.root.join("src.txt");
+	fs::write(&src, "x").unwrap();
+	let id = f.propose(json!({ "ops": [{ "op": "trash", "path": src }] }));
+	fs::remove_file(&src).unwrap();
+	let (v, err) = f.tool("apply_plan", json!({ "planId": id }));
+	assert!(err && v["error"].as_str().unwrap().contains("used up"), "{v}");
+}
+
+#[test]
+fn listing_reports_truncation() {
+	let mut f = Fixture::new(Approval::Terminal);
+	for i in 0..5 {
+		fs::write(f.root.join(format!("f{i}")), "").unwrap();
+	}
+	let (v, err) = f.tool("list_directory", json!({ "path": f.root, "limit": 2 }));
+	assert!(!err, "{v}");
+	assert_eq!(v["total"], 5);
+	assert_eq!(v["truncated"], true);
+	assert_eq!(v["entries"].as_array().unwrap().len(), 2);
+}

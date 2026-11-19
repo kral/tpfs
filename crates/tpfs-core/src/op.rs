@@ -8,7 +8,7 @@ use crate::display::sanitize;
 
 /// One file operation. Paths are absolute; `to` is the full destination path, not a folder to drop into.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "op", rename_all = "lowercase")]
+#[serde(tag = "op", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Op {
 	/// Move a file or directory.
 	Move { from: PathBuf, to: PathBuf },
@@ -29,7 +29,10 @@ pub enum Op {
 }
 
 /// An ordered list of operations plus a short human-readable reason.
+/// Unknown fields are rejected: an agent that invents an option such as `force` must learn that it
+/// does not exist, instead of believing it took effect.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Plan {
 	pub ops: Vec<Op>,
 	#[serde(default)]
