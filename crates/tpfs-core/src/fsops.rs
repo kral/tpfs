@@ -201,7 +201,7 @@ impl Fs {
 			return result;
 		}
 		#[cfg(windows)]
-		return remove_writable(path, fs::remove_file);
+		return remove_writable(path, |p| fs::remove_file(p));
 		#[cfg(not(windows))]
 		fs::remove_file(path)
 	}
@@ -438,7 +438,7 @@ impl Fs {
 			return result;
 		}
 		#[cfg(windows)]
-		return remove_writable(path, fs::remove_dir);
+		return remove_writable(path, |p| fs::remove_dir(p));
 		#[cfg(not(windows))]
 		fs::remove_dir(path)
 	}

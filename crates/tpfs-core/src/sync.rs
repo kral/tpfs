@@ -1,6 +1,6 @@
 //! Compare two folders and turn the differences into an ordinary [`Plan`].
 //!
-//! Synchronisation adds no new power: it only *proposes* `copy`, `mkdir` and `trash` operations,
+//! Synchronisation adds no new power: it only *proposes* `copy` and `trash` operations,
 //! which go through the same validation, preview, journal and undo as everything else. A newer
 //! file replaces an older one by trashing the old one first, so the old version stays restorable.
 
@@ -93,7 +93,7 @@ pub enum Direction {
 pub struct SyncOptions {
 	pub direction: Direction,
 	/// One-way only: move what exists only on the target side to the trash, so the target becomes
-	/// a copy of the source. Undoable like everything else, but rated as high risk.
+	/// a copy of the source. Undoable like everything else; its trash steps raise the plan's risk.
 	#[serde(default)]
 	pub mirror: bool,
 }

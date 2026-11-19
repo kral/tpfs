@@ -169,11 +169,14 @@ impl<'a> Executor<'a> {
 			.find(|b| !matches!(b.status, BatchStatus::Aborted | BatchStatus::Undone | BatchStatus::Abandoned))
 			.filter(|b| b.status == BatchStatus::Incomplete)
 		{
-			return Err(ExecError::Blocked(format!(
-				"batch {} was interrupted{}; run `tpfs recover` first",
-				b.id,
-				if b.damaged { " and its journal records are damaged" } else { "" }
-			)));
+			let id = crate::sanitize(b.id.as_ref());
+			return Err(ExecError::Blocked(if b.damaged {
+				format!(
+					"batch {id} was interrupted and its journal records are damaged; see `tpfs log {id}`, then `tpfs recover --abandon {id}` to accept the disk as it is"
+				)
+			} else {
+				format!("batch {id} was interrupted; run `tpfs recover` first")
+			}));
 		}
 
 		let batch = new_batch_id();
@@ -505,7 +508,7 @@ impl<'a> Executor<'a> {
 		Ok(report)
 	}
 
-	/// Give up on an interrupted (or damaged) batch without rolling it back: record it as aborted, leaving the
+	/// Give up on an interrupted (or damaged) batch without rolling it back: record it as abandoned, leaving the
 	/// disk as it is. For a batch recovery cannot handle (damaged records, or newer changes on top);
 	/// the caller should have shown the user what it did (`tpfs log`).
 	pub fn abandon(&mut self, id: &str) -> Result<(), ExecError> {
@@ -539,7 +542,10 @@ impl<'a> Executor<'a> {
 			if batch.damaged {
 				report
 					.errors
-					.push(format!("batch {}: journal records are damaged; not rolled back automatically", batch.id));
+					.push(format!(
+						"batch {id}: journal records are damaged; not rolled back automatically: see `tpfs log {id}`, then `tpfs recover --abandon {id}` to accept the disk as it is",
+						id = crate::sanitize(batch.id.as_ref())
+					));
 				continue;
 			}
 			let mut errors = Vec::new();

@@ -57,7 +57,8 @@ EXIT CODES:
   1  failed                                      4  cancelled or not approved; nothing changed
   2  usage error
 
-Nothing is ever deleted permanently: `trash` moves into <home>/trash and can be undone.
+Nothing is ever deleted permanently: `trash` moves into <home>/trash (on Linux and macOS, items
+on another disk go to a private .tpfs-trash-<uid> folder at that disk's top) and can be undone.
 With --approval client, the MCP client's own confirmation is the only approval: a client set to
 \"always allow\" means no human approval at all.
 ";
@@ -298,7 +299,7 @@ fn run(args: Args) -> Res {
 		"apply" => check(&args, true),
 		"sync" => sync(&args),
 		"undo" => {
-			let (mut journal, trash) = open_state(&args)?;
+			let (mut journal, _) = open_state(&args)?;
 			let validator = any_validator(&args, &mut journal)?;
 			let batches = journal.batches().map_err(|e| e.to_string())?;
 			// The same choice as the engine: a newer interrupted batch must be recovered first, so
@@ -324,6 +325,8 @@ fn run(args: Args) -> Res {
 				)
 				.into());
 			}
+			// Not held while the user reads; the batch is checked again when undoing.
+			drop(journal);
 			if let Some(b) = &last {
 				let steps: Vec<_> = b.steps.iter().filter(|s| s.done && !s.undone).collect();
 				if let Some(approved) = &args.approve {
@@ -360,6 +363,7 @@ fn run(args: Args) -> Res {
 					)));
 				}
 			}
+			let (mut journal, trash) = open_state(&args)?;
 			let mut executor = Executor::new(&validator, &mut journal, trash);
 			// Exactly the batch shown and approved: another process may have committed one since.
 			let result = match &last {
@@ -457,6 +461,9 @@ fn run(args: Args) -> Res {
 				let shown = tpfs_core::sanitize(id.as_ref());
 				match journal.batches().map_err(|e| e.to_string())?.iter().find(|b| b.id == *id) {
 					None => return Err(usage(format!("no batch {shown} in the journal (see `tpfs log`)"))),
+					Some(b) if b.status == BatchStatus::Abandoned => {
+						return Err(usage(format!("batch {shown} is already abandoned; nothing to do")));
+					}
 					Some(b)
 						if !(b.status == BatchStatus::Incomplete
 							|| (b.damaged && b.status == BatchStatus::Committed)) =>
@@ -468,10 +475,12 @@ fn run(args: Args) -> Res {
 					_ => {}
 				}
 				if io::stdin().is_terminal() && io::stderr().is_terminal() {
+					drop(journal); // not held while the user reads
 					let answer = ask(&format!("Abandon batch {shown}? Its changes stay on disk as they are. [y/N] "))?;
 					if !matches!(answer.as_str(), "y" | "Y" | "yes") {
 						return Err(cancelled("cancelled; nothing was changed"));
 					}
+					journal = open_state(&args)?.0;
 				}
 				Executor::new(&validator, &mut journal, trash).abandon(id).map_err(|e| match e {
 					ExecError::Blocked(m) if m.starts_with("no batch") => usage(format!("{m} (see `tpfs log`)")),
@@ -586,10 +595,11 @@ fn check(args: &Args, apply: bool) -> Res {
 		println!("OK — the plan is valid.");
 		return Ok(ExitCode::SUCCESS);
 	}
-	// The state folder is checked before the question, not after the user said yes.
-	let state = open_state(args)?;
+	// The state folder is checked before the question, not after the user said yes; the journal is
+	// not held while the user reads, so the commander and the MCP server keep working meanwhile.
+	drop(open_state(args)?);
 	confirm(args, &digest, level)?;
-	execute(args, &validator, &plan, state)
+	execute(args, &validator, &plan, open_state(args)?)
 }
 
 /// Print the plan, its risk and digest, and any problems. `None` when the plan has problems.
@@ -677,7 +687,7 @@ fn execute(args: &Args, validator: &Validator, plan: &Plan, (mut journal, trash)
 /// `--apply` after confirmation (or `--approve <digest>` from a previous dry run).
 fn sync(args: &Args) -> Res {
 	if args.json && (args.do_apply || args.approve.is_some()) {
-		return Err(usage("--json only prints the comparison; drop it to apply"));
+		return Err(usage("--json only prints the plan; drop it to apply, or pass the plan to `tpfs apply`"));
 	}
 	use tpfs_core::sync::{Direction, SyncOptions, compare, sync_plan};
 
@@ -727,9 +737,9 @@ fn sync(args: &Args) -> Res {
 		println!("Dry run. Apply with --apply, or non-interactively with --approve {digest}");
 		return Ok(ExitCode::SUCCESS);
 	}
-	let state = open_state(args)?;
+	drop(open_state(args)?);
 	confirm(args, &digest, level)?;
-	execute(args, &validator, &sp.plan, state)
+	execute(args, &validator, &sp.plan, open_state(args)?)
 }
 
 /// An approval is bound to the exact plan: either the digest is passed explicitly,
