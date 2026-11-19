@@ -1777,6 +1777,7 @@ fn a_mount_point_is_refused_for_trash_and_move() {
 		return; // no separate file system there
 	}
 	let v = Validator::new(["/dev"]).unwrap();
+	eprintln!("checking mount point refusal on /dev/shm");
 	for op in [Op::Trash { path: shm.into() }, Op::Move { from: shm.into(), to: "/dev/shm-moved".into() }] {
 		let issues = v.validate(&Plan::new(vec![op.clone()], ""));
 		assert!(issues.iter().any(|i| i.message.contains("mount point")), "{op}: {issues:?}");
@@ -1831,4 +1832,82 @@ fn own_names_are_recognised_in_any_case() {
 	let v = s.validator();
 	let issues = v.validate(&Plan::new(vec![Op::Mkdir { path: s.root.join(".TPFS-TRASH-1000") }], ""));
 	assert!(!issues.is_empty(), "a plan reached tpfs's own work name in another case");
+}
+
+/// A forged journal rename to a path that stays inside the root is refused too (the journaled
+/// new name must be a plain name).
+#[test]
+fn a_forged_rename_into_a_subfolder_is_refused() {
+	let s = Sandbox::new();
+	let a = s.file("a.txt", "A");
+	s.dir("sub");
+	let mut j = s.journal();
+	begin(&mut j, "g");
+	j.append(&Entry::Intent {
+		batch: "g".into(),
+		index: 0,
+		forward: Op::Rename { path: s.root.join("x"), new_name: "a.txt".into() },
+		inverse: Op::Rename { path: a.clone(), new_name: "sub/moved.txt".into() },
+	})
+	.unwrap();
+	j.append(&Entry::Done { batch: "g".into(), index: 0, check: None, mode: None }).unwrap();
+	j.append(&Entry::Commit { batch: "g".into() }).unwrap();
+	drop(j);
+	assert!(undo(&s).is_err());
+	assert!(a.exists() && !s.root.join("sub/moved.txt").exists());
+}
+
+/// Recovery finishes the mode of a folder an earlier, interrupted recovery recreated.
+#[cfg(unix)]
+#[test]
+fn an_interrupted_recovery_of_rmdir_finishes_the_mode() {
+	use std::os::unix::fs::PermissionsExt;
+	let s = Sandbox::new();
+	let d = s.root.join("private");
+	let mut j = s.journal();
+	begin(&mut j, "h");
+	j.append(&Entry::Intent {
+		batch: "h".into(),
+		index: 0,
+		forward: Op::Rmdir { path: d.clone() },
+		inverse: Op::Mkdir { path: d.clone() },
+	})
+	.unwrap();
+	j.append(&Entry::Mode { batch: "h".into(), index: 0, mode: 0o700 }).unwrap();
+	// The rmdir ran; then a recovery recreated the folder (default mode) and recorded it.
+	fs::create_dir(&d).unwrap();
+	fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+	j.append(&Entry::UndoPublished { batch: "h".into(), index: 0 }).unwrap();
+	let report = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
+	assert!(report.errors.is_empty(), "{report:?}");
+	assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
+	let again = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
+	assert!(again.errors.is_empty() && again.rolled_back.is_empty(), "{again:?}");
+}
+
+/// Linux: a copy of a folder with another disk mounted inside stops there, leaving nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_copy_stops_at_a_disk_mounted_inside() {
+	use std::os::unix::fs::MetadataExt;
+	let dev = Path::new("/dev");
+	if !Path::new("/dev/shm").is_dir()
+		|| fs::metadata("/dev/shm").unwrap().dev() == fs::metadata(dev).unwrap().dev()
+		|| fs::read_dir(dev).is_err()
+	{
+		eprintln!("skipped: no disk mounted inside /dev");
+		return;
+	}
+	let s = Sandbox::new();
+	let v = Validator::new([dev, s.root.as_path()]).unwrap();
+	let target = s.root.join("devcopy");
+	let mut j = s.journal();
+	let err = Executor::new(&v, &mut j, s.trash())
+		.execute(&Plan::new(vec![Op::Copy { from: dev.into(), to: target.clone() }], ""), Source::Human)
+		.unwrap_err();
+	let _ = err; // refused at validation (special files) or at the mount point: either way, nothing copied
+	assert!(!target.exists());
+	assert!(
+		!fs::read_dir(&s.root).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with(".tpfs-part-"))
+	);
 }
