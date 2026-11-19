@@ -23,6 +23,8 @@ pub struct Listed {
 	pub dir: bool,
 	pub link: bool,
 	pub size: u64,
+	/// Last modification time, read from the same confined handle as the rest; `None` when unknown.
+	pub modified: Option<std::time::SystemTime>,
 }
 
 /// List `dir`, which must be below one of `roots`, without following any link on the way: the
@@ -232,6 +234,7 @@ impl Fs {
 			let mut l = Listed { name: e.file_name(), ..Default::default() };
 			if meta && let Ok(m) = fs::symlink_metadata(e.path()) {
 				(l.dir, l.link, l.size) = (m.is_dir(), m.file_type().is_symlink(), m.len());
+				l.modified = m.modified().ok();
 			}
 			out.push(l);
 		}
@@ -838,6 +841,18 @@ pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
 mod confined {
+	/// A `stat` modification time as a `SystemTime`.
+	fn mtime(secs: i64, nanos: i64) -> Option<std::time::SystemTime> {
+		let nanos = u32::try_from(nanos).ok().filter(|n| *n < 1_000_000_000)?;
+		let base = std::time::UNIX_EPOCH;
+		if secs >= 0 {
+			base.checked_add(std::time::Duration::new(secs as u64, nanos))
+		} else {
+			base.checked_sub(std::time::Duration::from_secs(secs.unsigned_abs()))?
+				.checked_add(std::time::Duration::from_nanos(nanos.into()))
+		}
+	}
+
 	use std::{
 		ffi::OsStr,
 		fs::{File, Metadata},
@@ -1085,6 +1100,9 @@ mod confined {
 						l.dir = ft == rustix::fs::FileType::Directory;
 						l.link = ft == rustix::fs::FileType::Symlink;
 						l.size = st.st_size as u64;
+						#[allow(clippy::unnecessary_cast, reason = "the field types differ by platform")]
+						let (secs, nanos) = (st.st_mtime as i64, st.st_mtime_nsec as i64);
+						l.modified = mtime(secs, nanos);
 					}
 					names.push(l);
 				}
@@ -1176,6 +1194,17 @@ mod confined {
 			System::IO::IO_STATUS_BLOCK,
 		},
 	};
+
+	/// A FILETIME (100 ns ticks since 1601) as a `SystemTime`; `None` for zero (unknown).
+	fn filetime(ticks: i64) -> Option<std::time::SystemTime> {
+		const TO_UNIX: i64 = 116_444_736_000_000_000;
+		if ticks <= 0 {
+			return None;
+		}
+		let d = ticks - TO_UNIX;
+		let dur = |t: i64| std::time::Duration::from_nanos(t.unsigned_abs() * 100);
+		if d >= 0 { std::time::UNIX_EPOCH.checked_add(dur(d)) } else { std::time::UNIX_EPOCH.checked_sub(dur(d)) }
+	}
 
 	pub(super) struct Anchor {
 		root: PathBuf,
@@ -1700,7 +1729,7 @@ mod confined {
 				loop {
 					// SAFETY: the system filled `buf` with FILE_FULL_DIR_INFO records chained by
 					// NextEntryOffset; `offset` always points at the start of one of them.
-					let (next, name, attrs, tag, size) = unsafe {
+					let (next, name, attrs, tag, size, written) = unsafe {
 						let e = base.add(offset).cast::<FILE_FULL_DIR_INFO>();
 						let len = (*e).FileNameLength as usize / 2;
 						let p = (&raw const (*e).FileName).cast::<u16>();
@@ -1710,6 +1739,7 @@ mod confined {
 							(*e).FileAttributes,
 							(*e).EaSize, // holds the reparse tag for reparse points
 							(*e).EndOfFile,
+							(*e).LastWriteTime,
 						)
 					};
 					let name = OsString::from_wide(&name);
@@ -1723,6 +1753,7 @@ mod confined {
 							dir: !link && attrs & FILE_ATTRIBUTE_DIRECTORY != 0,
 							link,
 							size: size.max(0) as u64,
+							modified: filetime(written),
 						});
 					}
 					if next == 0 {

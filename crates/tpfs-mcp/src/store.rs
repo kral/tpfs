@@ -10,6 +10,9 @@ use tpfs_core::Plan;
 /// Most plans waiting for a decision at once.
 pub const MAX_PENDING: usize = 100;
 
+/// How long a rejection is remembered, so an agent asking for the plan hears it was rejected.
+const REJECTION_KEPT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 /// A plan proposed by an agent and waiting for a human decision.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pending {
@@ -34,6 +37,7 @@ impl Store {
 
 	pub fn put(&self, plan: &Plan, roots: &[PathBuf]) -> io::Result<Pending> {
 		create_private_dir(&self.dir)?;
+		self.forget_old_rejections();
 		// Only what `tpfs pending` shows (and can reject) counts against the limit.
 		let waiting = fs::read_dir(&self.dir)?
 			.filter_map(Result::ok)
@@ -60,6 +64,9 @@ impl Store {
 	pub fn get(&self, id: &str) -> io::Result<Pending> {
 		let file = self.file(id)?;
 		let bytes = fs::read(&file).map_err(|e| match e.kind() {
+			io::ErrorKind::NotFound if self.was_rejected(id) => {
+				io::Error::new(e.kind(), format!("plan '{id}' was rejected by the user"))
+			}
 			io::ErrorKind::NotFound => io::Error::new(
 				e.kind(),
 				format!("no pending plan '{id}' (already applied, rejected or never proposed)"),
@@ -134,6 +141,42 @@ impl Store {
 			Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
 			_ => Ok(()),
 		}
+	}
+
+	/// Reject a pending plan: remove it and remember for a day that the user rejected it, so
+	/// `apply_plan` can say so. Rejecting a plan that is not pending is a `NotFound` error.
+	pub fn reject(&self, id: &str) -> io::Result<()> {
+		let file = self.file(id)?;
+		if fs::symlink_metadata(&file).is_err() {
+			return Err(io::Error::new(io::ErrorKind::NotFound, format!("no pending plan '{id}'")));
+		}
+		write_private(&self.rejection(id)?, b"")?;
+		self.remove(id)
+	}
+
+	/// The user rejected this plan within the last day.
+	pub fn was_rejected(&self, id: &str) -> bool {
+		self.rejection(id)
+			.and_then(fs::symlink_metadata)
+			.is_ok_and(|m| m.is_file() && m.modified().is_ok_and(|t| t.elapsed().is_ok_and(|a| a < REJECTION_KEPT)))
+	}
+
+	/// Remove rejection markers older than a day (best effort).
+	fn forget_old_rejections(&self) {
+		let Ok(entries) = fs::read_dir(&self.dir) else { return };
+		for e in entries.filter_map(Result::ok) {
+			let path = e.path();
+			let old = || {
+				e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|a| a >= REJECTION_KEPT))
+			};
+			if path.extension().is_some_and(|x| x == "rejected") && old() {
+				fs::remove_file(path).ok();
+			}
+		}
+	}
+
+	fn rejection(&self, id: &str) -> io::Result<PathBuf> {
+		Ok(self.dir.join(format!("{}.rejected", check_id(id)?)))
 	}
 
 	fn file(&self, id: &str) -> io::Result<PathBuf> {
@@ -240,5 +283,40 @@ mod tests {
 		let err = store.scan().unwrap_err();
 		fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
 		assert!(err.to_string().contains("pending"), "{err}");
+	}
+
+	#[test]
+	fn a_rejected_plan_is_reported_as_rejected() {
+		let tmp = tempfile::tempdir().unwrap();
+		let store = Store::new(tmp.path());
+		let p = store.put(&plan(), &[]).unwrap();
+		assert!(!store.was_rejected(&p.id));
+		store.reject(&p.id).unwrap();
+		assert!(store.was_rejected(&p.id));
+		assert!(store.list().unwrap().is_empty());
+		let e = store.get(&p.id).unwrap_err();
+		assert_eq!(e.kind(), io::ErrorKind::NotFound);
+		assert!(e.to_string().contains("rejected by the user"), "{e}");
+		// Rejecting again, or a plan never proposed, is an error and leaves no marker.
+		assert_eq!(store.reject(&p.id).unwrap_err().kind(), io::ErrorKind::NotFound);
+		assert!(store.reject("abc").is_err());
+		assert!(!store.was_rejected("abc"));
+		// A fresh marker survives the next put.
+		store.put(&plan(), &[]).unwrap();
+		assert!(store.was_rejected(&p.id));
+	}
+
+	#[test]
+	fn an_old_rejection_is_forgotten_on_the_next_put() {
+		let tmp = tempfile::tempdir().unwrap();
+		let store = Store::new(tmp.path());
+		let p = store.put(&plan(), &[]).unwrap();
+		store.reject(&p.id).unwrap();
+		let marker = tmp.path().join("pending").join(format!("{}.rejected", p.id));
+		let old = SystemTime::now() - REJECTION_KEPT - std::time::Duration::from_secs(60);
+		fs::File::options().write(true).open(&marker).unwrap().set_modified(old).unwrap();
+		assert!(!store.was_rejected(&p.id), "an old rejection still counts");
+		store.put(&plan(), &[]).unwrap();
+		assert!(!marker.exists(), "the old marker was not cleaned up");
 	}
 }

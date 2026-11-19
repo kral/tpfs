@@ -765,3 +765,21 @@ fn a_cross_device_move_of_a_read_only_folder_completes_and_undoes() {
 	assert_eq!(fs::metadata(src.join("ro")).unwrap().permissions().mode() & 0o777, 0o555);
 	fs::set_permissions(src.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
 }
+
+/// The confined listing reports each entry's size and modification time from its own handle.
+#[test]
+fn the_confined_listing_reports_size_and_modified_time() {
+	let s = Sandbox::new();
+	let roots = vec![s.root.clone()];
+	fs::write(s.root.join("a.txt"), "hello").unwrap();
+	fs::create_dir(s.root.join("d")).unwrap();
+	let (listed, total) = tpfs_core::list_confined(&roots, &s.root, 100).unwrap();
+	assert_eq!(total, 2);
+	let file = listed.iter().find(|l| l.name == "a.txt").unwrap();
+	assert_eq!((file.dir, file.size), (false, 5));
+	let want = fs::metadata(s.root.join("a.txt")).unwrap().modified().unwrap();
+	let got = file.modified.expect("no modification time");
+	let diff = got.duration_since(want).unwrap_or_else(|e| e.duration());
+	assert!(diff < std::time::Duration::from_secs(1), "modified {got:?}, expected {want:?}");
+	assert!(listed.iter().find(|l| l.name == "d").unwrap().modified.is_some());
+}

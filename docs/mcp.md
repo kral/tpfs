@@ -143,7 +143,7 @@ The agent then gets this from `apply_plan`:
 
 ```json
 {
-  "error": "no pending plan '18e97dd0cbba59e268b' (already applied, rejected or never proposed)"
+  "error": "plan '18e97dd0cbba59e268b' was rejected by the user"
 }
 ```
 

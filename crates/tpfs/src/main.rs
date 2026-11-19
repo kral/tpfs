@@ -629,7 +629,7 @@ fn run(args: Args) -> Res {
 			{
 				return Err(usage(format!("{e} (see `tpfs pending`)")));
 			}
-			store.remove(&id).map_err(|e| e.to_string())?;
+			store.reject(&id).map_err(|e| e.to_string())?;
 			println!("Rejected {}.", tpfs_core::sanitize(id.as_ref()));
 			Ok(ExitCode::SUCCESS)
 		}
@@ -954,7 +954,7 @@ fn watch(args: &Args) -> Res {
 					println!("Approved. The agent can now call apply_plan for {id}.");
 				}
 				"no" | "reject" => {
-					store.remove(&pending.id).map_err(|e| e.to_string())?;
+					store.reject(&pending.id).map_err(|e| e.to_string())?;
 					println!("Rejected {id}.");
 				}
 				_ => println!("Left pending: `tpfs approve {id}` or `tpfs reject {id}` later."),

@@ -343,7 +343,9 @@ tpfs reject <planId>
 ```
 
 Removes a pending plan, approved or not, so the agent can no longer apply it:
-`Rejected 18e97dd0cbba59e268b.` A damaged pending file can be rejected too.
+`Rejected 18e97dd0cbba59e268b.` A damaged pending file can be rejected too. For a day afterwards
+the agent's `apply_plan` answers that the user rejected the plan (a `<planId>.rejected` marker in
+the pending folder, removed after a day). Answering `no` in `tpfs watch` does the same.
 
 ## Environment variables
 
