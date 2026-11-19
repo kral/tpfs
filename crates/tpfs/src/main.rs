@@ -138,6 +138,13 @@ struct Args {
 }
 
 fn main() -> ExitCode {
+	// `tpfs log | head`: end quietly when the reader goes away, like other command-line tools,
+	// instead of panicking on a broken pipe.
+	#[cfg(unix)]
+	// SAFETY: restoring the default action for SIGPIPE before any thread exists.
+	unsafe {
+		libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+	}
 	let args = match parse_args() {
 		Ok(a) => a,
 		Err(Fail(code, e)) => {
@@ -306,7 +313,12 @@ fn run(args: Args) -> Res {
 				}
 			}
 			match Executor::new(&validator, &mut journal, trash).undo_last() {
-				Ok(Some(b)) => println!("Undone batch {} ({} step(s)).", b.id, b.steps),
+				Ok(Some(b)) => {
+					println!("Undone batch {} ({} step(s)):", b.id, b.steps);
+					for s in last.iter().flat_map(|l| l.steps.iter().filter(|s| s.done && !s.undone)) {
+						println!("  reverted: {}", s.forward.normalized());
+					}
+				}
 				Ok(None) => println!("Nothing to undo."),
 				Err(e) => return Err(e.to_string().into()),
 			}
@@ -440,8 +452,8 @@ fn present(validator: &Validator, plan: &Plan, source: Source) -> Option<(String
 	}
 	println!("Total: {} operation(s): {}", plan.ops.len(), totals(plan));
 	println!(
-		"Risk: {:?}{}",
-		risk.level,
+		"Risk: {}{}",
+		level_word(risk.level),
 		if risk.reasons.is_empty() { String::new() } else { format!(" — {}", risk.reasons.join("; ")) }
 	);
 	println!("Digest: {digest}");
@@ -454,6 +466,15 @@ fn present(validator: &Validator, plan: &Plan, source: Source) -> Option<(String
 		return None;
 	}
 	Some((digest, risk.level))
+}
+
+/// The same words as the commander's confirmation.
+fn level_word(level: Level) -> &'static str {
+	match level {
+		Level::Low => "low",
+		Level::Medium => "MEDIUM",
+		_ => "HIGH",
+	}
 }
 
 /// Counts per kind of operation, e.g. "3 move, 1 trash".
@@ -611,7 +632,7 @@ fn approve(args: &Args) -> Res {
 		"Allowed folders: {}",
 		pending.roots.iter().map(|r| tpfs_core::sanitize(r.as_os_str())).collect::<Vec<_>>().join(", ")
 	);
-	println!("Risk: {:?} — {}", risk.level, risk.reasons.join("; "));
+	println!("Risk: {} — {}", level_word(risk.level), risk.reasons.join("; "));
 	if !issues.is_empty() {
 		println!("Problems:");
 		for i in &issues {

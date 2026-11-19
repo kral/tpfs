@@ -42,6 +42,19 @@ pub struct Plan {
 }
 
 impl Op {
+	/// The same operation with its absolute paths lexically normalised (`a/../b` is `b`).
+	pub fn normalized(&self) -> Op {
+		let n = |p: &PathBuf| crate::path::normalize(p).unwrap_or_else(|| p.clone());
+		match self {
+			Op::Move { from, to } => Op::Move { from: n(from), to: n(to) },
+			Op::Copy { from, to } => Op::Copy { from: n(from), to: n(to) },
+			Op::Rename { path, new_name } => Op::Rename { path: n(path), new_name: new_name.clone() },
+			Op::Trash { path } => Op::Trash { path: n(path) },
+			Op::Mkdir { path } => Op::Mkdir { path: n(path) },
+			Op::Rmdir { path } => Op::Rmdir { path: n(path) },
+		}
+	}
+
 	/// The paths this operation names (for `rename`, the path being renamed).
 	pub fn paths(&self) -> Vec<&std::path::Path> {
 		match self {
@@ -80,20 +93,7 @@ impl Plan {
 	/// The same plan with every absolute path lexically normalised (relative ones are left alone:
 	/// validation rejects them).
 	pub fn normalized(&self) -> Plan {
-		let n = |p: &PathBuf| crate::path::normalize(p).unwrap_or_else(|| p.clone());
-		let ops = self
-			.ops
-			.iter()
-			.map(|op| match op {
-				Op::Move { from, to } => Op::Move { from: n(from), to: n(to) },
-				Op::Copy { from, to } => Op::Copy { from: n(from), to: n(to) },
-				Op::Rename { path, new_name } => Op::Rename { path: n(path), new_name: new_name.clone() },
-				Op::Trash { path } => Op::Trash { path: n(path) },
-				Op::Mkdir { path } => Op::Mkdir { path: n(path) },
-				Op::Rmdir { path } => Op::Rmdir { path: n(path) },
-			})
-			.collect();
-		Plan { ops, reason: self.reason.clone() }
+		Plan { ops: self.ops.iter().map(Op::normalized).collect(), reason: self.reason.clone() }
 	}
 }
 

@@ -9,7 +9,7 @@ use ratatui::{
 	layout::Rect,
 };
 use tpfs_core::{
-	ExecError, Executor, Issue, Journal, Op, Plan, Source, Validator,
+	BatchStatus, ExecError, Executor, Issue, Journal, Op, Plan, Source, Validator,
 	risk::{self, Risk},
 };
 
@@ -34,6 +34,11 @@ pub(crate) enum Dialog {
 		kind: InputKind,
 	},
 	Help,
+	/// F9 / Ctrl+Z: which batch would be undone (it may come from an agent or another terminal).
+	Undo {
+		batch: String,
+		lines: Vec<String>,
+	},
 	/// Shift+F2: compare the two panels' folders and preview a sync before building the plan.
 	Sync {
 		cmp: tpfs_core::sync::Comparison,
@@ -332,6 +337,8 @@ impl App {
 				self.dialog = Some(Dialog::View { title, lines, offset });
 			}
 			(Some(Dialog::Help), _) => {}
+			(Some(Dialog::Undo { batch, .. }), KeyCode::Char('y' | 'Y')) => self.do_undo(&batch),
+			(Some(d @ Dialog::Undo { .. }), _) => self.dialog = Some(d),
 			(Some(Dialog::Sync { cmp, mut opts, offset }), code) => {
 				use tpfs_core::sync::{Direction::*, sync_plan};
 				let last = cmp.items.len().saturating_sub(1);
@@ -506,12 +513,47 @@ impl App {
 		self.reload();
 	}
 
+	/// Show what Undo would revert and ask first: the newest batch may not be this session's.
 	fn undo(&mut self) {
+		let batch = self
+			.journal()
+			.and_then(|mut j| j.batches().map_err(|e| e.to_string()))
+			.map(|b| b.into_iter().rev().find(|b| b.status != BatchStatus::Aborted && b.status != BatchStatus::Undone));
+		match batch {
+			Err(e) => self.status = format!("Undo failed: {e}"),
+			Ok(None) => self.status = "Nothing to undo.".into(),
+			Ok(Some(b)) => {
+				let who = match b.source.as_str() {
+					"agent" => "an AI agent",
+					_ => "a person",
+				};
+				let mut lines = vec![
+					format!("Batch {} by {who}", tpfs_core::sanitize(b.id.as_ref())),
+					tpfs_core::sanitize(b.reason.as_ref()),
+					String::new(),
+				];
+				let steps: Vec<_> = b.steps.iter().filter(|s| s.done && !s.undone).collect();
+				lines.extend(steps.iter().take(12).map(|s| s.forward.normalized().to_string()));
+				if steps.len() > 12 {
+					lines.push(format!("… and {} more", steps.len() - 12));
+				}
+				self.dialog = Some(Dialog::Undo { batch: b.id, lines });
+			}
+		}
+	}
+
+	/// Undo, if the newest batch is still the one the user just looked at.
+	fn do_undo(&mut self, expected: &str) {
 		let result = self.journal().and_then(|mut j| {
+			let newest =
+				j.batches().map_err(|e| e.to_string())?.into_iter().rev().find(|b| b.status == BatchStatus::Committed);
+			if newest.is_none_or(|b| b.id != expected) {
+				return Err("the history changed meanwhile; press Undo again to see what it would revert".into());
+			}
 			Executor::new(&self.validator, &mut j, self.state.join("trash"))
 				.undo_last()
 				.map(|b| match b {
-					Some(b) => format!("Undone: {} operation(s).", b.steps),
+					Some(b) => format!("Undone batch {}: {} operation(s).", b.id, b.steps),
 					None => "Nothing to undo.".into(),
 				})
 				.map_err(|e| one_line(&e))
@@ -683,10 +725,14 @@ mod tests {
 		key(&mut app, KeyCode::Char('y'));
 		assert!(!left.join("folder").exists());
 
-		// Undo twice restores both.
+		// Undo twice restores both; each asks first and names the batch.
 		ctrl(&mut app, 'z');
+		assert!(matches!(app.dialog, Some(Dialog::Undo { .. })));
+		assert!(!left.join("folder").is_dir(), "nothing is undone before confirming");
+		key(&mut app, KeyCode::Char('y'));
 		assert!(left.join("folder").is_dir());
 		key(&mut app, KeyCode::F(9));
+		key(&mut app, KeyCode::Char('y'));
 		assert!(!right.join("a.txt").exists());
 	}
 
@@ -855,6 +901,7 @@ mod tests {
 		assert!(base.join("r/extra.txt").exists(), "mirror was switched off again");
 
 		ctrl(&mut app, 'z');
+		key(&mut app, KeyCode::Char('y'));
 		assert!(!base.join("r/album").exists());
 	}
 
@@ -932,6 +979,45 @@ mod tests {
 		use crate::ui::tests_support::{pad_for_test as pad, width_for_test as width};
 		for name in ["plain.txt", "日本語.txt", "e\u{301}cole.txt"] {
 			assert_eq!(width(&pad(name, 20)), 20, "{name}");
+		}
+	}
+
+	#[test]
+	fn keys_stay_visible_for_valid_scrolling_plans_at_any_size() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+		fs::create_dir_all(base.join("l/into")).unwrap();
+		fs::create_dir_all(base.join("l/folder")).unwrap();
+		let mut ops: Vec<tpfs_core::Op> = (0..25)
+			.map(|i| {
+				let f = base.join(format!("l/photo-{i:02}.jpg"));
+				fs::write(&f, "x").unwrap();
+				tpfs_core::Op::Move { from: f, to: base.join(format!("l/into/photo-{i:02}.jpg")) }
+			})
+			.collect();
+		for high in [false, true] {
+			if high {
+				ops.push(tpfs_core::Op::Trash { path: base.join("l/folder") });
+			}
+			for (w, h) in [(80, 24), (100, 30), (60, 16), (40, 12)] {
+				let mut app = App::new(base.join("l"), base.join("l"), base.join("state"), false).unwrap();
+				app.propose(Plan::new(ops.clone(), ""));
+				assert!(matches!(&app.dialog, Some(Dialog::Confirm { issues, .. }) if issues.is_empty()));
+				for end in [false, true] {
+					if end {
+						app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+					}
+					let screen = render(&mut app, w, h);
+					let fits = matches!(&app.dialog, Some(Dialog::Confirm { fits: true, .. }));
+					if fits {
+						assert!(screen.contains("Esc"), "{w}x{h} high={high} end={end}: keys cut off\n{screen}");
+						assert!(
+							screen.contains("Proceed") || screen.contains("read the whole list"),
+							"{w}x{h} high={high} end={end}\n{screen}"
+						);
+					}
+				}
+			}
 		}
 	}
 }

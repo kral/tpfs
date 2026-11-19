@@ -75,6 +75,13 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
 
 		Some(Dialog::Input { title, value, .. }) => draw_input(f, title, value),
 		Some(Dialog::Help) => draw_help(f),
+		Some(Dialog::Undo { lines, .. }) => {
+			let w = f.area().width.saturating_sub(10) as usize;
+			let mut body: Vec<Line> = lines.iter().map(|l| Line::raw(truncate_middle(l, w))).collect();
+			body.push(Line::raw(""));
+			body.push(Line::raw("[ Y: Undo ]   [ Esc: Cancel ]").centered());
+			dialog(f, " Undo ", body, Color::Black);
+		}
 		Some(Dialog::Sync { cmp, opts, offset }) => draw_sync(f, app, cmp, *opts, *offset),
 		Some(Dialog::Drives { panel, items, cursor }) => draw_drives(f, *panel, items, *cursor),
 		Some(Dialog::View { title, lines, offset }) => draw_view(f, main, title, lines, *offset),
@@ -299,22 +306,29 @@ fn draw_confirm(
 	let total_lines: usize = plan.ops.iter().map(line_count).sum();
 
 	// Space for the list after the fixed parts; problems get at most a third of what is left.
-	let free = (rect.height as usize).saturating_sub(2 + head.len() + foot.len() + 3);
+	// Fixed lines: borders (2), the list's position line (1), "Nothing is overwritten" when there
+	// are no problems (1), a blank (1) and the key line (1).
+	let free = (rect.height as usize).saturating_sub(2 + head.len() + foot.len() + 3 + usize::from(issues.is_empty()));
 	let shown_issues = issues.len().min(6).min((free / 3).max(1));
 	let rows = free.saturating_sub(shown_issues + usize::from(issues.len() > shown_issues));
 	let fits = w >= 20 && rows >= 2.min(total_lines.max(1));
 	let max_offset = total_lines.saturating_sub(rows.max(1));
 	let offset = offset.min(max_offset);
 	let at_end = fits && offset + rows >= total_lines;
-	let window: Vec<String> = {
+	let window: Vec<Line> = {
 		let mut out = Vec::with_capacity(rows);
 		let mut line = 0;
 		for op in &plan.ops {
 			let n = line_count(op);
 			if line + n > offset {
-				for (k, l) in op_lines(op, w).into_iter().enumerate() {
+				let op = op.normalized();
+				let style = match op {
+					tpfs_core::Op::Trash { .. } | tpfs_core::Op::Rmdir { .. } => DIALOG.fg(Color::Red),
+					_ => DIALOG,
+				};
+				for (k, l) in op_lines(&op, w).into_iter().enumerate() {
 					if line + k >= offset && out.len() < rows {
-						out.push(l);
+						out.push(Line::styled(l, style));
 					}
 				}
 			}
@@ -354,7 +368,7 @@ fn draw_confirm(
 
 	let mut lines = head;
 	if fits {
-		lines.extend(window.into_iter().map(Line::raw));
+		lines.extend(window);
 		if total_lines > rows {
 			lines.push(Line::styled(
 				format!("lines {}–{} of {} (↑↓ PgUp PgDn)", offset + 1, (offset + rows).min(total_lines), total_lines),
