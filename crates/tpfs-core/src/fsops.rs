@@ -602,7 +602,8 @@ mod confined {
 		#[cfg(target_vendor = "apple")]
 		{
 			let _ = &anchor.fd;
-			rustix::fs::open(anchor.root.join(rel), flags | NOFOLLOW_ANY, Mode::empty())
+			// O_NOFOLLOW_ANY implies O_NOFOLLOW; macOS rejects the two together (EINVAL).
+			rustix::fs::open(anchor.root.join(rel), flags.difference(OFlags::NOFOLLOW) | NOFOLLOW_ANY, Mode::empty())
 		}
 	}
 
