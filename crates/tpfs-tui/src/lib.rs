@@ -78,18 +78,30 @@ pub fn run(left: PathBuf, right: PathBuf, state: PathBuf, options: Options) -> i
 fn run_external(external: External) -> Result<String, String> {
 	match external {
 		External::Edit(path) => {
-			let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
+			let editor = editor().ok_or(
+				"no editor found: set the EDITOR environment variable to the editor you use (e.g. nano, vim, code --wait)",
+			)?;
 			let mut parts = editor.split_whitespace();
-			let program = parts.next().unwrap_or("vi");
-			let status =
-				Command::new(program).args(parts).arg(&path).status().map_err(|e| format!("{program}: {e}"))?;
+			let program = parts.next().unwrap_or_default();
+			let status = Command::new(program).args(parts).arg(&path).status().map_err(|e| {
+				if e.kind() == io::ErrorKind::NotFound {
+					format!("editor `{program}` not found: set EDITOR to the editor you use")
+				} else {
+					format!("{program}: {e}")
+				}
+			})?;
 			Ok(format!("{program} exited ({status})."))
 		}
 		External::Shell { command, cwd } => {
-			let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".into());
 			println!("{}> {}", tpfs_core::sanitize(cwd.as_os_str()), tpfs_core::sanitize(command.as_ref()));
+			// The user's shell: $SHELL where set (also Git Bash on Windows), else cmd.exe on Windows.
+			let (shell, flag) = match std::env::var("SHELL").ok().filter(|s| !s.is_empty()) {
+				Some(sh) => (sh, "-c"),
+				None if cfg!(windows) => (std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()), "/C"),
+				None => ("sh".into(), "-c"),
+			};
 			let status = Command::new(&shell)
-				.arg("-c")
+				.arg(flag)
 				.arg(&command)
 				.current_dir(&cwd)
 				.status()
@@ -100,4 +112,17 @@ fn run_external(external: External) -> Result<String, String> {
 			Ok(format!("Shell command finished ({status}); shell commands are not journaled."))
 		}
 	}
+}
+
+/// The editor for F4: $VISUAL or $EDITOR, else the first common one on PATH (Notepad on Windows).
+fn editor() -> Option<String> {
+	if let Some(e) = ["VISUAL", "EDITOR"].iter().find_map(|v| std::env::var(v).ok().filter(|e| !e.trim().is_empty())) {
+		return Some(e);
+	}
+	let candidates: &[&str] = if cfg!(windows) { &["notepad"] } else { &["nano", "vim", "vi"] };
+	if cfg!(windows) {
+		return candidates.first().map(|c| (*c).to_owned());
+	}
+	let path = std::env::var_os("PATH")?;
+	candidates.iter().find(|c| std::env::split_paths(&path).any(|d| d.join(c).is_file())).map(|c| (*c).to_owned())
 }

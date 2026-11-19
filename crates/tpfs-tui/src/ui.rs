@@ -538,7 +538,7 @@ fn draw_help(f: &mut Frame) {
 		("Ins / Space", "mark (also right click)"),
 		("F2", "rename"),
 		("F3 / Enter (file)", "view"),
-		("F4", "edit in $EDITOR"),
+		("F4", "edit ($EDITOR, else nano/vim/vi or Notepad)"),
 		(":", "command line (not journaled)"),
 		("letters", "quick search (Esc leaves it)"),
 		("Ctrl+R", "reload both panels"),

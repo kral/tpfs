@@ -85,7 +85,7 @@ the status line tells you to use `tpfs apply`.
 | Key | Action |
 |---|---|
 | F3 | view the file under the cursor (text, or a hex dump for binary files; first 256 KiB) |
-| F4 | edit the file in `$VISUAL` or `$EDITOR` (default `vi`) |
+| F4 | edit the file in `$VISUAL` or `$EDITOR`; without them the first of `nano`, `vim`, `vi` found (Notepad on Windows) |
 | `:` | command line: runs a shell command in the active panel's folder |
 | F10, Ctrl+Q, Ctrl+C | quit |
 

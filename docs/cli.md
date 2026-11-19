@@ -347,8 +347,8 @@ Removes a pending plan, approved or not, so the agent can no longer apply it:
 | `TPFS_ALLOW_UNCONFINED=1` | run where symlink-safe confinement is not available; see [Roots and confinement](concepts.md#roots-and-confinement) |
 | `TPFS_ICONS` | any value but `0` turns on icons in the commander |
 | `NO_COLOR` | no colour in previews |
-| `VISUAL`, `EDITOR` | the editor the commander starts with F4 (default `vi`) |
-| `SHELL` | the shell the commander's command line uses (default `sh`) |
+| `VISUAL`, `EDITOR` | the editor the commander starts with F4; without them the first of `nano`, `vim`, `vi` on `PATH` (Notepad on Windows) |
+| `SHELL` | the shell the commander's command line uses (default `sh`; on Windows `%COMSPEC%`, usually `cmd.exe`) |
 
 ## Windows notes
 
