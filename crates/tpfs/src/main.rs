@@ -468,9 +468,16 @@ fn run(args: Args) -> Res {
 				return Ok(ExitCode::SUCCESS);
 			}
 			let report = Executor::new(&validator, &mut journal, trash).recover().map_err(|e| e.to_string())?;
-			println!("Rolled back {} interrupted batch(es).", report.rolled_back.len());
+			if report.rolled_back.is_empty() && report.errors.is_empty() {
+				println!("Nothing to recover.");
+			} else {
+				println!("Rolled back {} interrupted batch(es).", report.rolled_back.len());
+			}
 			for e in &report.errors {
 				eprintln!("  error: {e}");
+			}
+			if !report.errors.is_empty() {
+				eprintln!("Fix the cause of each error, then run `tpfs recover` again (finished steps are skipped).");
 			}
 			Ok(if report.errors.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) })
 		}
@@ -501,8 +508,12 @@ fn run(args: Args) -> Res {
 		"pending" => {
 			let store = tpfs_mcp::Store::new(&state_dir(&args)?);
 			let pending = store.list().map_err(|e| e.to_string())?;
-			if pending.is_empty() {
+			let damaged = store.damaged();
+			if pending.is_empty() && damaged.is_empty() {
 				println!("No pending plans.");
+			}
+			for id in &damaged {
+				println!("{id}  DAMAGED  (unreadable; remove it with `tpfs reject {id}`)");
 			}
 			for p in &pending {
 				let approved = if store.is_approved(p) { "approved" } else { "waiting" };
@@ -650,6 +661,9 @@ fn execute(args: &Args, validator: &Validator, plan: &Plan, (mut journal, trash)
 /// `tpfs sync <source> <target>`: compare, build a plan of copy/trash, show it; apply only with
 /// `--apply` after confirmation (or `--approve <digest>` from a previous dry run).
 fn sync(args: &Args) -> Res {
+	if args.json && (args.do_apply || args.approve.is_some()) {
+		return Err(usage("--json only prints the comparison; drop it to apply"));
+	}
 	use tpfs_core::sync::{Direction, SyncOptions, compare, sync_plan};
 
 	let dir = |v: &Option<OsString>, what: &str| -> Result<PathBuf, Fail> {

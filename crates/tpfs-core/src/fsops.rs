@@ -388,18 +388,17 @@ impl Fs {
 			for name in self.list(from)?.into_iter().filter(|n| !crate::validate::is_own_name(n)) {
 				// Never into another disk mounted below (like `cp -x`, but refusing: a move would
 				// then empty that disk).
-				{
-					if crate::validate::is_mount_point(&from.join(&name)) {
-						return Err(io::Error::new(
-							io::ErrorKind::Unsupported,
-							format!(
-								"{} is a mount point (another disk inside the folder); it is not copied or moved",
-								crate::sanitize(from.join(&name).as_os_str())
-							),
-						));
-					}
+				let child = from.join(&name);
+				if crate::validate::is_mount_point(&child) {
+					return Err(io::Error::new(
+						io::ErrorKind::Unsupported,
+						format!(
+							"{} is a mount point (another disk inside the folder); it is not copied or moved",
+							crate::sanitize(child.as_os_str())
+						),
+					));
 				}
-				self.copy_tree(&from.join(&name), &to.join(&name), &rel.join(&name), copied)?;
+				self.copy_tree(&child, &to.join(&name), &rel.join(&name), copied)?;
 			}
 			return self.set_dir_mode(to, safe_permissions(&meta));
 		} else if ft.is_symlink() {
@@ -412,12 +411,31 @@ impl Fs {
 	}
 
 	pub(crate) fn mkdir(&self, path: &Path) -> io::Result<()> {
+		self.mkdir_mode(path, 0o777)
+	}
+
+	/// `mkdir` with the given permission bits (Unix; the umask still applies): a folder that must
+	/// end up private is never, even for a moment, created wider.
+	pub(crate) fn mkdir_mode(&self, path: &Path, mode: u32) -> io::Result<()> {
 		self.guard(path)?;
-		#[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
+		#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+		if let Some(result) = confined::mkdir(&self.anchors, path, mode) {
+			return result;
+		}
+		#[cfg(windows)]
 		if let Some(result) = confined::mkdir(&self.anchors, path) {
 			return result;
 		}
-		fs::create_dir(path)
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::DirBuilderExt;
+			fs::DirBuilder::new().mode(mode).create(path)
+		}
+		#[cfg(not(unix))]
+		{
+			let _ = mode;
+			fs::create_dir(path)
+		}
 	}
 
 	pub(crate) fn rmdir(&self, path: &Path) -> io::Result<()> {
@@ -994,8 +1012,10 @@ mod confined {
 		})())
 	}
 
-	pub(super) fn mkdir(anchors: &[Anchor], path: &Path) -> Option<io::Result<()>> {
-		Some(locate(anchors, path)?.and_then(|(fd, name)| Ok(mkdirat(&fd, name, Mode::from_raw_mode(0o777))?)))
+	pub(super) fn mkdir(anchors: &[Anchor], path: &Path, mode: u32) -> Option<io::Result<()>> {
+		Some(locate(anchors, path)?.and_then(|(fd, name)| {
+			Ok(mkdirat(&fd, name, Mode::from_raw_mode((mode & 0o7777) as rustix::fs::RawMode))?)
+		}))
 	}
 
 	pub(super) fn rmdir(anchors: &[Anchor], path: &Path) -> Option<io::Result<()>> {
@@ -1462,6 +1482,13 @@ mod confined {
 
 	pub(super) fn rmdir(anchors: &[Anchor], path: &Path) -> Option<io::Result<()>> {
 		with_located(anchors, path, |parent, name| {
+			// Write-attributes only when needed: a user may have the right to delete but not to
+			// change attributes.
+			let h = open_final(parent, name, DELETE | FILE_READ_ATTRIBUTES, FILE_DIRECTORY_FILE, path)?;
+			if basic(&h)?.FileAttributes & FILE_ATTRIBUTE_READONLY == 0 {
+				return delete(&h);
+			}
+			drop(h);
 			let h = open_final(
 				parent,
 				name,
@@ -1480,8 +1507,12 @@ mod confined {
 		let original = basic(h)?;
 		let read_only = original.FileAttributes & FILE_ATTRIBUTE_READONLY != 0;
 		if read_only {
-			let mut b = basic(h)?;
+			let mut b = original;
 			b.FileAttributes &= !FILE_ATTRIBUTE_READONLY;
+			// 0 would mean "leave the attributes unchanged": a plain file is FILE_ATTRIBUTE_NORMAL.
+			if b.FileAttributes == 0 {
+				b.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+			}
 			set_basic(h, &b)?;
 		}
 		let result = delete(h);
@@ -1493,6 +1524,13 @@ mod confined {
 
 	pub(super) fn unlink(anchors: &[Anchor], path: &Path) -> Option<io::Result<()>> {
 		with_located(anchors, path, |parent, name| {
+			// Write-attributes only when needed: a user may have the right to delete but not to
+			// change attributes.
+			let h = open_final(parent, name, DELETE | FILE_READ_ATTRIBUTES, FILE_NON_DIRECTORY_FILE, path)?;
+			if basic(&h)?.FileAttributes & FILE_ATTRIBUTE_READONLY == 0 {
+				return delete(&h);
+			}
+			drop(h);
 			let h = open_final(
 				parent,
 				name,

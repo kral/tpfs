@@ -1819,3 +1819,16 @@ fn a_forged_rename_to_a_path_is_refused() {
 	assert!(a.exists());
 	assert!(!s.root.parent().unwrap().join("escaped.txt").exists());
 }
+
+/// tpfs's own work names are recognised in any letter case (case-insensitive volumes).
+#[test]
+fn own_names_are_recognised_in_any_case() {
+	for n in [".tpfs-trash-1000", ".TPFS-TRASH-1000", ".Tpfs-Part-0123abcd-0", ".TPFS-CASE-DEADBEEF-1"] {
+		assert!(tpfs_core::is_own_name(n.as_ref()), "{n}");
+	}
+	assert!(!tpfs_core::is_own_name(".TPFS-notes.txt".as_ref()));
+	let s = Sandbox::new();
+	let v = s.validator();
+	let issues = v.validate(&Plan::new(vec![Op::Mkdir { path: s.root.join(".TPFS-TRASH-1000") }], ""));
+	assert!(!issues.is_empty(), "a plan reached tpfs's own work name in another case");
+}

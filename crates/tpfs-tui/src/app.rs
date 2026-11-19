@@ -508,8 +508,9 @@ impl App {
 		{
 			return;
 		}
-		let value = value.trim();
-		if value.is_empty() {
+		// A folder name is trimmed; a new file name is taken exactly as typed (no silent change).
+		let value = if matches!(kind, InputKind::Rename(_)) { value } else { value.trim() };
+		if value.trim().is_empty() {
 			return;
 		}
 		let plan = match kind {
@@ -567,9 +568,9 @@ impl App {
 						)
 					}
 					(_, true) => format!(
-						"The last batch ({id}) was interrupted and its records are damaged: see `tpfs log`, then `tpfs recover --abandon {id}`."
+						"Undo blocked (interrupted, damaged): `tpfs log {id}`, then `tpfs recover --abandon {id}`"
 					),
-					_ => format!("The last batch ({id}) was interrupted: run `tpfs recover` in a terminal first."),
+					_ => format!("Undo blocked: run `tpfs recover` in a terminal first (batch {id} was interrupted)"),
 				};
 			}
 			Ok(Some(b)) => {
@@ -645,8 +646,10 @@ impl App {
 			return;
 		}
 		if self.dialog.is_some() {
+			// A click never confirms anything; it closes the dialog, and says so.
 			if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
 				self.dialog = None;
+				self.status = "Cancelled; nothing was changed.".into();
 			}
 			return;
 		}
@@ -677,9 +680,11 @@ impl App {
 				}
 				MouseEventKind::Down(MouseButton::Right) => {
 					self.active = i;
-					let row = m.row.saturating_sub(self.areas.panels[i].y + 1) as usize;
+					let area = self.areas.panels[i];
+					let row = m.row.saturating_sub(area.y + 1) as usize;
 					let index = self.panels[i].offset + row;
-					if index < self.panels[i].entries.len() {
+					// Only rows of the list (not the borders) mark an entry.
+					if m.row > area.y && m.row + 1 < area.y + area.height && index < self.panels[i].entries.len() {
 						self.panels[i].cursor = index;
 						self.panels[i].toggle_mark();
 					}

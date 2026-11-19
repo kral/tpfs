@@ -651,3 +651,41 @@ fn recovery_leaves_a_folder_made_by_someone_else_after_a_crash() {
 	assert!(report.errors.is_empty(), "{:?}", report.errors);
 	assert!(p.is_dir(), "recovery removed a folder tpfs did not make");
 }
+
+/// Windows: read-only files and folders (only the read-only attribute set) can be removed through
+/// the confined calls: a folder by rmdir, a file when a cross-volume trash removes the original
+/// (the runner's work folder is on another drive than the state folder in the profile).
+#[cfg(windows)]
+#[test]
+fn read_only_entries_are_removed_on_windows() {
+	let attrib = |args: &[&str], p: &Path| {
+		assert!(std::process::Command::new("attrib").args(args).arg(p).status().unwrap().success());
+	};
+	let s = Sandbox::new();
+	let d = s.root.join("custom");
+	fs::create_dir(&d).unwrap();
+	attrib(&["+r"], &d);
+	let v = s.validator();
+	let mut j = s.journal();
+	Executor::new(&v, &mut j, s.state.join("trash"))
+		.execute(&Plan::new(vec![Op::Rmdir { path: d.clone() }], ""), Source::Human)
+		.unwrap();
+	assert!(!d.exists());
+	drop(j);
+
+	// A file with only the read-only attribute, on another drive than the trash when possible.
+	let base = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+	let other = TempDir::new_in(&base).unwrap();
+	let root = tpfs_core::canonicalize(other.path()).unwrap();
+	let f = root.join("ro.txt");
+	fs::write(&f, "R").unwrap();
+	attrib(&["-a", "+r"], &f);
+	let v = Validator::new([&root]).unwrap();
+	let mut j = s.journal();
+	Executor::new(&v, &mut j, s.state.join("trash"))
+		.execute(&Plan::new(vec![Op::Trash { path: f.clone() }], ""), Source::Human)
+		.unwrap();
+	assert!(!f.exists());
+	Executor::new(&v, &mut j, s.state.join("trash")).undo_last().unwrap();
+	assert_eq!(fs::read_to_string(&f).unwrap(), "R");
+}

@@ -58,7 +58,7 @@ impl fmt::Display for ExecError {
 			}
 			ExecError::Failed { step, error, rollback_errors } => write!(
 				f,
-				"step #{} failed ({error}); rollback was incomplete: {}",
+				"step #{} failed ({error}); rollback was incomplete: {} — fix the cause, then run `tpfs recover`",
 				step + 1,
 				rollback_errors.join("; ")
 			),
@@ -431,16 +431,16 @@ impl<'a> Executor<'a> {
 			let path = n(path);
 			remove_part(fs, &part_path(&path, &t))?; // left by older versions
 			if !exists(&path) {
-				fs.mkdir(&path)?;
+				// Created no wider than its owner-only part, so a crash before the record leaves a
+				// private folder that a rerun recognises (see `folder_as_restored`).
+				fs.mkdir_mode(&path, mode & 0o700)?;
 				self.journal.write(&Entry::UndoPublished { batch: batch.to_owned(), index: step.index })?;
 				return set_mode(fs, &path, mode);
 			}
 			// Already there: made by an earlier attempt of this undo (journaled, or an empty folder
 			// with exactly the recorded permissions), or by someone else — then undo stops.
-			return if step.undo_published {
+			return if step.undo_published || folder_as_restored(&path, mode) {
 				set_mode(fs, &path, mode)
-			} else if folder_as_restored(&path, mode) {
-				Ok(())
 			} else {
 				Err(io::Error::new(
 					io::ErrorKind::AlreadyExists,
@@ -608,7 +608,7 @@ impl<'a> Executor<'a> {
 							.check_path(&path)
 							.map(|_| ())
 							.map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))
-							.and_then(|()| fs.mkdir(&path))
+							.and_then(|()| fs.mkdir_mode(&path, mode & 0o700))
 							.and_then(|()| {
 								// Ours from here on; journaled so a rerun still sets the mode.
 								journal
@@ -634,11 +634,13 @@ impl<'a> Executor<'a> {
 						clean_step = false;
 					}
 				}
-				// A folder an earlier recovery recreated (journaled) before it could set its mode.
+				// A folder an earlier recovery recreated (journaled, or recognisable as our own
+				// creation) before it could set its mode.
 				if clean_step
-					&& let (Op::Rmdir { path }, true, Some(mode)) = (&step.forward, step.undo_published, step.mode)
+					&& let (Op::Rmdir { path }, Some(mode)) = (&step.forward, step.mode)
 					&& let Some(path) = normalize(path)
 					&& path.is_dir()
+					&& (step.undo_published || folder_as_restored(&path, mode))
 					&& let Err(e) = set_mode(&fs, &path, mode)
 				{
 					errors.push(clean(format!("{}: {e}", step.inverse)));
@@ -861,13 +863,17 @@ fn both_exist(old: &Path, new: &Path) -> io::Error {
 	)
 }
 
-/// Whether `path` is an empty folder with exactly `mode`: what `mkdir_with_mode` leaves.
+/// Whether `path` is an empty folder with the recorded `mode`, or with no more than its owner bits:
+/// what an interrupted undo or recovery of an `rmdir` leaves (see `Fs::mkdir_mode`).
 fn folder_as_restored(path: &Path, mode: u32) -> bool {
 	let Ok(m) = fs::symlink_metadata(path) else { return false };
+	// The recorded mode, or what our creation left before the mode was set (owner bits only,
+	// narrowed by the umask).
 	#[cfg(unix)]
 	let same_mode = {
 		use std::os::unix::fs::PermissionsExt;
-		m.permissions().mode() & 0o7777 == mode
+		let now = m.permissions().mode() & 0o7777;
+		now == mode || now & !(mode & 0o700) == 0
 	};
 	#[cfg(not(unix))]
 	let same_mode = {
@@ -997,8 +1003,9 @@ fn apply(
 			// an empty folder of ours unrecorded — left alone, never someone else's removed.
 			let path = n(path)?;
 			fs.mkdir(&path)?;
-			publish()?;
+			// The entry is durable before the record that calls it ours.
 			sync_parent(&path);
+			publish()?;
 			Ok(())
 		}
 		Op::Rmdir { path } => {

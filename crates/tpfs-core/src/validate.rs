@@ -57,7 +57,10 @@ const OWN_PREFIXES: [&str; 3] = [".tpfs-trash-", ".tpfs-part-", ".tpfs-case-"];
 /// case-rename name (`.tpfs-part-<batch>-…`, `.tpfs-case-<batch>-…`). A user's `.tpfs-notes.txt`
 /// is not one.
 pub fn is_own_name(name: &std::ffi::OsStr) -> bool {
-	let Some(n) = name.to_str() else { return false };
+	// Letter case ignored: on a volume that ignores it (FAT, exFAT, APFS, NTFS, casefold folders)
+	// `.TPFS-TRASH-1000` is the same folder as tpfs's trash.
+	let Some(n) = name.to_str().map(str::to_ascii_lowercase) else { return false };
+	let n = n.as_str();
 	if let Some(uid) = n.strip_prefix(OWN_PREFIXES[0]) {
 		return !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit());
 	}
@@ -428,8 +431,9 @@ fn refuse_mount_point(path: &Path) -> Result<(), String> {
 }
 
 /// Whether a folder is the root of a mount: on Linux as the kernel says (a bind mount has the same
-/// device, a btrfs subvolume a different one without being a mount point), elsewhere by a device
-/// different from its parent's.
+/// device, a btrfs subvolume a different one without being a mount point), on other Unix systems
+/// by a device different from its parent's. Always false on Windows, where mounted volumes are
+/// reparse points and refused as links.
 pub(crate) fn is_mount_point(path: &Path) -> bool {
 	#[cfg(target_os = "linux")]
 	if let Ok(st) = rustix::fs::statx(
@@ -572,7 +576,13 @@ fn tree_size(path: &Path, budget: &mut usize) -> Option<u64> {
 		let Ok(meta) = fs::symlink_metadata(&p) else { continue };
 		if meta.is_dir() {
 			if let Ok(rd) = fs::read_dir(&p) {
-				stack.extend(rd.filter_map(Result::ok).map(|e| e.path()));
+				// Never more pending paths in memory than the budget can still measure.
+				for e in rd.filter_map(Result::ok) {
+					if stack.len() >= *budget {
+						return None;
+					}
+					stack.push(e.path());
+				}
 			}
 		} else if meta.is_file() {
 			total = total.saturating_add(meta.len());

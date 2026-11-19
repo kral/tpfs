@@ -342,3 +342,16 @@ fn journal_lock() -> std::sync::MutexGuard<'static, ()> {
 	static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 	LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+#[test]
+fn a_damaged_pending_plan_is_listed_and_can_be_rejected() {
+	let tmp = tempfile::TempDir::new().unwrap();
+	let home = tpfs_core::canonicalize(tmp.path()).unwrap().join("home");
+	tpfs_core::private_dir(&home.join("pending")).unwrap();
+	let file = home.join("pending").join("abcd1234.json");
+	fs::write(&file, "garbage").unwrap();
+	let out = String::from_utf8(tpfs(&home, &["pending"]).stdout).unwrap();
+	assert!(out.contains("abcd1234") && out.contains("DAMAGED"), "{out}");
+	assert_eq!(code(&tpfs(&home, &["reject", "abcd1234"])), 0);
+	assert!(!file.exists());
+}

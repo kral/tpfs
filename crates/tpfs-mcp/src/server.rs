@@ -534,6 +534,7 @@ mod tests {
 	fn shell_words_survive_a_paste() {
 		if cfg!(windows) {
 			assert_eq!(shell_quote(r"C:\Users\x$y\it's"), r"'C:\Users\x$y\it''s'");
+			assert_eq!(shell_quote("C:\\Users\\O\u{2019}Brien"), "'C:\\Users\\O\u{2019}\u{2019}Brien'");
 		} else {
 			assert_eq!(shell_quote("/home/u/tpfs"), "/home/u/tpfs");
 			assert_eq!(shell_quote("/x/a b"), "'/x/a b'");

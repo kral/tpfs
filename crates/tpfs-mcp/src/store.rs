@@ -66,9 +66,24 @@ impl Store {
 		})?;
 		serde_json::from_slice(&bytes).map_err(|e| {
 			io::Error::other(format!(
-				"pending plan '{id}' is unreadable ({e}); propose it again, or ask the user to run `tpfs reject {id}`"
+				"pending plan '{id}' is unreadable ({}); propose it again, or ask the user to reject it (`tpfs pending` lists it)",
+				tpfs_core::sanitize(e.to_string().as_ref())
 			))
 		})
+	}
+
+	/// Ids of pending files that cannot be read as plans (for `tpfs pending`, so they can be rejected).
+	pub fn damaged(&self) -> Vec<String> {
+		let Ok(entries) = fs::read_dir(&self.dir) else { return vec![] };
+		let mut out: Vec<String> = entries
+			.filter_map(Result::ok)
+			.filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+			.filter(|e| fs::read(e.path()).ok().and_then(|b| serde_json::from_slice::<Pending>(&b).ok()).is_none())
+			.filter_map(|e| e.path().file_stem().and_then(|s| s.to_str()).map(str::to_owned))
+			.filter(|id| check_id(id).is_ok())
+			.collect();
+		out.sort();
+		out
 	}
 
 	pub fn list(&self) -> io::Result<Vec<Pending>> {
