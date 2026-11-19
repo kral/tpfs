@@ -86,9 +86,9 @@ flowchart LR
     class Current,Rest no
 ```
 
-The agent talks only to `tpfs mcp`. It can read and propose inside the two roots; the only path to a
-change on disk runs through an approval written by a person in their own terminal, and every change
-goes through the journal first.
+The agent talks only to `tpfs mcp`. It can read and propose inside the two roots; a new change on
+disk needs an approval written by a person in their own terminal (the agent may only undo its own
+batches with `undo_last`), and every change goes through the journal first.
 
 ## Setup
 
@@ -296,9 +296,9 @@ flowchart TD
 
 | Concern | How tpfs handles it |
 |---|---|
-| The agent deletes the wrong thing | It cannot delete: `trash` only, and every batch is undoable with one command. |
+| The agent deletes the wrong thing | tpfs offers no delete: `trash` only, and every batch is undoable with one command (as long as tpfs is its only file tool). |
 | The agent touches the live release or the rest of the server | Only the `--root` folders are reachable; symlinks such as `current` are refused. |
-| The agent acts without a human | Every agent plan is HIGH risk and needs `tpfs approve` in a terminal, bound to the plan's digest. |
+| The agent acts without a human | Every agent plan is HIGH risk and, with the default `--approval terminal`, needs `tpfs approve` in a terminal, bound to the plan's digest. (`--approval client` leaves approval to the MCP client.) |
 | A plan is swapped after approval | The digest no longer matches; `apply_plan` refuses it. |
 | A crash or reboot mid-cleanup | The write-ahead journal lets `tpfs recover` roll the batch back. |
 | Audit | `tpfs log` keeps every batch: who proposed it, why, each step and its undo. |

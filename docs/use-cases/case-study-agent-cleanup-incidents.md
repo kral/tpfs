@@ -198,11 +198,11 @@ flowchart TB
 
 | In the incidents | With tpfs |
 |---|---|
-| Approval per shell command: the dangerous one slipped through, or auto-run skipped approval | The person approves the **whole plan**, with risk and totals, in a terminal the agent does not control; the approval is bound to the digest. |
+| Approval per shell command: the dangerous one slipped through, or auto-run skipped approval | The person approves the **whole plan**, with risk and totals, in a terminal the agent does not control (the default `--approval terminal`); the approval is bound to the digest. |
 | Shell expansion (`~/`), quoting (`\`), globs decide the real target | No shell: exact paths, each one confined to the allowed folders, without symlinks on the way. |
-| `rm -rf` / `rmdir /s /q` bypass the trash | `trash` is the only removal; everything is undoable with `tpfs undo`. |
+| `rm -rf` / `rmdir /s /q` bypass the trash | `trash` is the only removal tpfs offers; every batch it ran is undoable with `tpfs undo`. |
 | Moves overwrite silently | No-replace everywhere; missing target folders are refused. |
-| Agent checkpoints do not cover shell changes | The agent has no other path to change files; every change is journaled. |
+| Agent checkpoints do not cover shell changes | With tpfs as the agent's only file tool, every change is journaled. Give it no shell file commands (see Limits). |
 | A crash mid-cleanup leaves a half-done state | The write-ahead journal lets `tpfs recover` roll an interrupted batch back. |
 
 ## How to set it up
