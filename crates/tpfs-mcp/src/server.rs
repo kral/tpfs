@@ -133,16 +133,25 @@ impl Server {
 		})
 	}
 
+	/// The exact command the human runs: with `--home` naming this server's state folder, so it
+	/// finds the plan whatever TPFS_HOME or --home the server was started with.
+	fn approve_command(&self, id: &str) -> String {
+		let home = show(&self.config.state);
+		let home = if home.contains([' ', '\'', '"']) { format!("\"{home}\"") } else { home };
+		format!("tpfs approve {id} --home {home}")
+	}
+
 	fn initialize(&self, params: &Value) -> Value {
 		let asked = params.get("protocolVersion").and_then(Value::as_str);
 		let version = asked.filter(|v| SUPPORTED_VERSIONS.contains(v)).unwrap_or(PROTOCOL_VERSION);
 		let roots: Vec<String> = self.validator.roots().iter().map(|r| show(r)).collect();
 		let approval = match self.config.approval {
-			Approval::Terminal => {
-				"After proposing, ask the user to review and approve it by running `tpfs approve <planId>` in their terminal, then call apply_plan."
-			}
+			Approval::Terminal => format!(
+				"After proposing, ask the user to review and approve it by running `{}` in their terminal, then call apply_plan.",
+				self.approve_command("<planId>")
+			),
 			Approval::Client => {
-				"apply_plan asks the user for confirmation through this client; show them the preview first."
+				"apply_plan asks the user for confirmation through this client; show them the preview first.".to_owned()
 			}
 		};
 		json!({
@@ -285,8 +294,8 @@ impl Server {
 		let pending = self.store.put(&plan, self.validator.roots()).map_err(|e| e.to_string())?;
 		let next = match self.config.approval {
 			Approval::Terminal => format!(
-				"Show the user the preview and ask them to run `tpfs approve {}` in a terminal. Then call apply_plan.",
-				pending.id
+				"Show the user the preview and ask them to run `{}` in a terminal. Then call apply_plan.",
+				self.approve_command(&pending.id)
 			),
 			Approval::Client => {
 				"Show the user the preview, then call apply_plan; the client will ask them to confirm.".to_owned()
@@ -319,7 +328,8 @@ impl Server {
 		}
 		if self.config.approval == Approval::Terminal && !self.store.is_approved(&pending) {
 			return Err(format!(
-				"not approved yet. Ask the user to run `tpfs approve {id}` in a terminal, then call apply_plan again."
+				"not approved yet. Ask the user to run `{}` in a terminal, then call apply_plan again.",
+				self.approve_command(id)
 			));
 		}
 

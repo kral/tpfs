@@ -582,3 +582,37 @@ fn a_crash_after_a_refused_publish_never_takes_the_other_file() {
 	let trash = s.state.join("trash");
 	assert!(!trash.exists() || fs::read_dir(&trash).unwrap().next().is_none(), "the other file went to the trash");
 }
+
+/// A private folder removed by `rmdir` comes back private: after a crash right after the
+/// removal (before `done`), recovery restores its mode from the record written before it went.
+#[cfg(unix)]
+#[test]
+fn a_crash_after_rmdir_restores_the_folders_own_mode() {
+	use std::os::unix::fs::PermissionsExt;
+	let s = Sandbox::new();
+	let d = s.root.join("private");
+	fs::create_dir(&d).unwrap();
+	fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
+	let plan = Plan::new(vec![Op::Rmdir { path: d.clone() }], "");
+	let default_hook = panic::take_hook();
+	panic::set_hook(Box::new(|_| {}));
+	let crashed = panic::catch_unwind(AssertUnwindSafe(|| {
+		let v = s.validator();
+		let mut j = s.journal();
+		let _ = Executor::new(&v, &mut j, s.state.join("trash"))
+			.hook(|_, p| {
+				if p == Phase::AfterApply {
+					panic!("simulated crash")
+				}
+			})
+			.execute(&plan, Source::Human);
+	}));
+	panic::set_hook(default_hook);
+	assert!(crashed.is_err());
+	assert!(!d.exists());
+	let v = s.validator();
+	let mut j = s.journal();
+	let report = Executor::new(&v, &mut j, s.state.join("trash")).recover().unwrap();
+	assert!(report.errors.is_empty(), "{:?}", report.errors);
+	assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
+}

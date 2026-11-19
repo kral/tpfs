@@ -104,6 +104,7 @@ pub struct Executor<'a> {
 /// and right after it did (before its `done` record).
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Phase {
 	BeforeApply,
 	AfterApply,
@@ -207,11 +208,8 @@ impl<'a> Executor<'a> {
 				forward: op.clone(),
 				inverse: inverse.clone(),
 			})?;
-			if let Some(hook) = &mut self.hook {
-				hook(i, Phase::BeforeApply);
-			}
-
-			// A folder's own permissions, so undoing its removal restores them.
+			// A folder's own permissions, so undoing its removal restores them; journaled before
+			// the folder goes, so a crash right after the removal does not lose them.
 			let mode = match op {
 				#[cfg(unix)]
 				Op::Rmdir { path } => {
@@ -220,6 +218,12 @@ impl<'a> Executor<'a> {
 				}
 				_ => None,
 			};
+			if let Some(mode) = mode {
+				self.journal.write(&Entry::Mode { batch: batch.clone(), index: i, mode })?;
+			}
+			if let Some(hook) = &mut self.hook {
+				hook(i, Phase::BeforeApply);
+			}
 			let published = std::cell::Cell::new(false);
 			let result = {
 				let journal = &mut self.journal;
@@ -420,19 +424,14 @@ impl<'a> Executor<'a> {
 			}
 			_ => {}
 		}
-		if already_applied(&step.inverse) {
-			return Ok(());
+		if !already_applied(&step.inverse) {
+			let journal = &mut self.journal;
+			let mut publish = || journal.write(&Entry::UndoPublished { batch: batch.to_owned(), index: step.index });
+			apply(&step.inverse, fs, &self.trash, &label, step.index, None, &mut publish)?;
 		}
-		let journal = &mut self.journal;
-		let mut publish = || journal.write(&Entry::UndoPublished { batch: batch.to_owned(), index: step.index });
-		apply(&step.inverse, fs, &self.trash, &label, step.index, None, &mut publish)?;
-		// Restore a removed folder's own permissions, not the default ones.
-		#[cfg(unix)]
-		if let (Op::Mkdir { path }, Some(mode)) = (&step.inverse, step.mode) {
-			use std::os::unix::fs::PermissionsExt;
-			crate::fsops::set_dir_mode_at(fs, &n(path), fs::Permissions::from_mode(mode))?;
-		}
-		Ok(())
+		// Restore a removed folder's own permissions, not the default ones — also when an earlier,
+		// interrupted attempt already recreated it.
+		restore_mode(fs, &step.inverse, step.mode)
 	}
 
 	/// A journaled operation replayed by undo or recovery must stay where tpfs may act: below the
@@ -562,6 +561,10 @@ impl<'a> Executor<'a> {
 						clean_step = false;
 					}
 				}
+				if clean_step && let Err(e) = restore_mode(&fs, &step.inverse, step.mode) {
+					errors.push(clean(format!("{}: {e}", step.inverse)));
+					clean_step = false;
+				}
 				if !clean_step {
 					break; // older steps wait until this one is cleaned up
 				}
@@ -596,7 +599,8 @@ impl<'a> Executor<'a> {
 		// create one; for other paths an existing one is anchored (undo moves out of it).
 		let mut trashes: Vec<PathBuf> = Vec::new();
 		for op in ops {
-			let create = matches!(op, Op::Trash { .. });
+			// Trash steps use it; so may the clean-up of a copy or move that fails half way.
+			let create = matches!(op, Op::Trash { .. } | Op::Copy { .. } | Op::Move { .. });
 			for p in op.paths() {
 				// A target that does not exist yet lives on the file system of its nearest existing
 				// folder: that trash is used too (clean-up of a cross-device move, its undo).
@@ -771,6 +775,20 @@ fn both_exist(old: &Path, new: &Path) -> io::Error {
 			crate::sanitize(new.as_os_str())
 		),
 	)
+}
+
+/// A folder recreated by an inverse `mkdir` gets the permissions it had before its `rmdir`.
+fn restore_mode(fs: &Fs, inverse: &Op, mode: Option<u32>) -> io::Result<()> {
+	#[cfg(unix)]
+	if let (Op::Mkdir { path }, Some(mode)) = (inverse, mode)
+		&& let Some(path) = normalize(path)
+		&& fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir())
+	{
+		use std::os::unix::fs::PermissionsExt;
+		return crate::fsops::set_dir_mode_at(fs, &path, fs::Permissions::from_mode(mode));
+	}
+	let _ = (fs, inverse, mode);
+	Ok(())
 }
 
 /// Private tag of one step, used for its in-progress names.
@@ -1036,8 +1054,8 @@ fn local_trash(trash: &Path, path: &Path, create: bool) -> Option<PathBuf> {
 		return None;
 	}
 
-	// The mount point: the highest ancestor still on the same device.
-	let mut mount = path.parent()?;
+	// The mount point: the highest ancestor (or the path itself) still on the same device.
+	let mut mount = path;
 	for a in path.ancestors().skip(1) {
 		match fs::metadata(a) {
 			Ok(m) if m.dev() == dev => mount = a,

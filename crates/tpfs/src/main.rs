@@ -349,7 +349,7 @@ fn run(args: Args) -> Res {
 					if steps.len() > 20 {
 						eprintln!("  … and {} more (see `tpfs log`)", steps.len() - 20);
 					}
-					if !ask("Undo it? [y/N] ")?.eq_ignore_ascii_case("y") {
+					if !matches!(ask("Undo it? [y/N] ")?.as_str(), "y" | "Y" | "yes") {
 						return Err(cancelled("cancelled; nothing was changed"));
 					}
 				} else {
@@ -419,7 +419,7 @@ fn run(args: Args) -> Res {
 					_ => "unknown",
 				};
 				let status = match b.status {
-					BatchStatus::Abandoned => status,
+					BatchStatus::Abandoned | BatchStatus::Undone | BatchStatus::Aborted => status,
 					_ if b.damaged => "DAMAGED (see `tpfs log <batch>`)",
 					_ => status,
 				};
@@ -456,7 +456,7 @@ fn run(args: Args) -> Res {
 				}
 				if io::stdin().is_terminal() && io::stderr().is_terminal() {
 					let answer = ask(&format!("Abandon batch {shown}? Its changes stay on disk as they are. [y/N] "))?;
-					if !answer.eq_ignore_ascii_case("y") {
+					if !matches!(answer.as_str(), "y" | "Y" | "yes") {
 						return Err(cancelled("cancelled; nothing was changed"));
 					}
 				}
@@ -671,7 +671,11 @@ fn sync(args: &Args) -> Res {
 
 	println!("{} difference(s), {} identical file(s).", cmp.items.len(), cmp.same);
 	for s in &sp.skipped {
-		println!("  skip  {}  ({})", tpfs_core::sanitize(s.rel.as_os_str()), s.why);
+		if s.rel.as_os_str().is_empty() {
+			println!("  {}", s.why);
+		} else {
+			println!("  skip  {}  ({})", tpfs_core::sanitize(s.rel.as_os_str()), s.why);
+		}
 	}
 	if sp.plan.ops.is_empty() {
 		println!("Nothing to sync.");

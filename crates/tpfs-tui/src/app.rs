@@ -357,6 +357,11 @@ impl App {
 						if sp.plan.ops.is_empty() {
 							self.status = if sp.skipped.is_empty() {
 								"Nothing to sync.".into()
+							} else if sp.skipped.iter().any(|k| k.why.contains("empty")) {
+								format!(
+									"Nothing to sync: {}",
+									sp.skipped.iter().find(|k| k.why.contains("empty")).map_or("", |k| k.why.as_str())
+								)
 							} else {
 								format!(
 									"Nothing to sync; {} item(s) left alone (conflicts or against the direction).",

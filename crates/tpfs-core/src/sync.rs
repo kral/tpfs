@@ -350,29 +350,16 @@ pub fn sync_plan(left: &Path, right: &Path, cmp: &Comparison, opts: SyncOptions)
 			skipped: vec![Skipped { rel: PathBuf::new(), why: "comparison incomplete; nothing planned".into() }],
 		};
 	}
-	// A mirror from an empty source (often a mount point with nothing mounted) would trash the
-	// whole target: never planned; the user can trash the target's contents explicitly.
-	let target_only = match opts.direction {
-		Direction::RightToLeft => Diff::OnlyLeft,
-		_ => Diff::OnlyRight,
+	// A mirror from an empty source folder (often a mount point with nothing mounted) would trash
+	// everything under the matching target folder: those trashes are never planned. Checked per
+	// folder, on the source itself (identical files are not among the differences).
+	let source = |rel: &Path| if opts.direction == Direction::RightToLeft { right.join(rel) } else { left.join(rel) };
+	let empty_source = |rel: &Path| {
+		rel.ancestors().skip(1).any(|dir| {
+			fs::read_dir(source(dir))
+				.is_ok_and(|mut rd| !rd.any(|e| e.is_ok_and(|e| !crate::validate::is_own_name(&e.file_name()))))
+		})
 	};
-	if opts.mirror
-		&& opts.direction != Direction::Both
-		&& !cmp.items.is_empty()
-		&& cmp.items.iter().all(|i| i.diff == target_only)
-	{
-		return SyncPlan {
-			plan: Plan::new(
-				vec![],
-				"Sync not planned: the source folder is empty, so a mirror would trash the whole target",
-			),
-			skipped: vec![Skipped {
-				rel: PathBuf::new(),
-				why: "the source folder is empty (is it mounted?); a mirror would trash everything in the target"
-					.into(),
-			}],
-		};
-	}
 	let mut ops = Vec::new();
 	let mut skipped = Vec::new();
 	let (mut copies, mut replaced, mut trashed) = (0usize, 0usize, 0usize);
@@ -406,6 +393,11 @@ pub fn sync_plan(left: &Path, right: &Path, cmp: &Comparison, opts: SyncOptions)
 				ops.push(Op::Copy { from: r, to: l });
 				replaced += 1;
 			}
+			Action::TrashLeft | Action::TrashRight if empty_source(&item.rel) => skipped.push(Skipped {
+				rel: item.rel.clone(),
+				why: "its source folder is empty (is a disk not mounted?); a mirror would trash it — not planned"
+					.into(),
+			}),
 			Action::TrashLeft => {
 				ops.push(Op::Trash { path: l });
 				trashed += 1;

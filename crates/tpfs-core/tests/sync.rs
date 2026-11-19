@@ -265,3 +265,32 @@ fn a_mirror_from_a_missing_or_empty_source_plans_nothing() {
 	assert!(sp.skipped[0].why.contains("empty"));
 	assert!(e.right.join("photo.jpg").exists());
 }
+
+#[test]
+fn a_right_to_left_mirror_from_an_empty_or_missing_right_plans_nothing() {
+	let e = Env::new();
+	e.file(&e.left.join("photo.jpg"), "P", 0);
+	assert!(compare(&e.left, &e.base.join("not-mounted"), true).is_err());
+	let cmp = compare(&e.left, &e.right, true).unwrap();
+	let sp = sync_plan(&e.left, &e.right, &cmp, SyncOptions { direction: Direction::RightToLeft, mirror: true });
+	assert!(sp.plan.ops.is_empty(), "{:?}", sp.plan.ops);
+	assert!(sp.skipped.iter().any(|k| k.why.contains("empty")));
+}
+
+/// Only the empty source folder is protected: a deletion mirrored from a source that still has
+/// (identical) files is planned, and a nested empty source folder keeps its target side.
+#[test]
+fn mirror_deletions_are_planned_except_under_an_empty_source_folder() {
+	let e = Env::new();
+	e.file(&e.left.join("one"), "1", 0);
+	e.file(&e.right.join("one"), "1", 0);
+	e.file(&e.right.join("extra"), "X", 0);
+	fs::create_dir(e.left.join("photos")).unwrap(); // a mount point with nothing mounted
+	e.file(&e.right.join("photos/p1.jpg"), "P", 0);
+	let cmp = compare(&e.left, &e.right, true).unwrap();
+	let sp = sync_plan(&e.left, &e.right, &cmp, SyncOptions { direction: Direction::LeftToRight, mirror: true });
+	let trashed: Vec<String> = sp.plan.ops.iter().map(ToString::to_string).collect();
+	assert_eq!(trashed.len(), 1, "{trashed:?}");
+	assert!(trashed[0].contains("extra"), "{trashed:?}");
+	assert!(sp.skipped.iter().any(|k| k.rel.ends_with("p1.jpg") && k.why.contains("empty")), "{:?}", sp.skipped);
+}

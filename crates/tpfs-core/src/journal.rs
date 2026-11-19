@@ -49,6 +49,13 @@ pub enum Entry {
 		index: usize,
 		check: String,
 	},
+	/// For `rmdir`: the folder's permission bits, recorded before it is removed (the same value
+	/// also goes in `done`), so recovery after a crash in between restores them.
+	Mode {
+		batch: String,
+		index: usize,
+		mode: u32,
+	},
 	/// Undo or recovery is about to rename the copy of a step's cross-device inverse move into place.
 	UndoPublished {
 		batch: String,
@@ -95,6 +102,7 @@ impl Entry {
 			| Entry::Check { batch, .. }
 			| Entry::UndoPublished { batch, .. }
 			| Entry::Failed { batch, .. }
+			| Entry::Mode { batch, .. }
 			| Entry::Commit { batch }
 			| Entry::Abort { batch }
 			| Entry::Abandon { batch }
@@ -410,7 +418,7 @@ impl Journal {
 					if let Some(s) = step_mut(&mut b.steps, index) {
 						s.done = true;
 						s.check = s.check.take().or(check);
-						s.mode = mode;
+						s.mode = mode.or(s.mode);
 					}
 				}
 				Entry::Check { index, check, .. } => {
@@ -431,6 +439,11 @@ impl Journal {
 				Entry::UndoStep { index, .. } => {
 					if let Some(s) = step_mut(&mut b.steps, index) {
 						s.undone = true;
+					}
+				}
+				Entry::Mode { index, mode, .. } => {
+					if let Some(s) = step_mut(&mut b.steps, index) {
+						s.mode = Some(mode);
 					}
 				}
 				Entry::Failed { index, .. } => {
