@@ -64,7 +64,11 @@ impl Store {
 			),
 			_ => io::Error::new(e.kind(), format!("{}: {e}", tpfs_core::sanitize(file.as_os_str()))),
 		})?;
-		serde_json::from_slice(&bytes).map_err(io::Error::other)
+		serde_json::from_slice(&bytes).map_err(|e| {
+			io::Error::other(format!(
+				"pending plan '{id}' is unreadable ({e}); propose it again, or ask the user to run `tpfs reject {id}`"
+			))
+		})
 	}
 
 	pub fn list(&self) -> io::Result<Vec<Pending>> {

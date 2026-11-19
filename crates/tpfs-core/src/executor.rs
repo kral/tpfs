@@ -440,10 +440,8 @@ impl<'a> Executor<'a> {
 			} else {
 				Err(io::Error::new(
 					io::ErrorKind::AlreadyExists,
-					format!(
-						"{} is there again (made by someone else since); it is left as it is",
-						crate::sanitize(path.as_os_str())
-					),
+					"something is there again, not made by tpfs; it is left as it is. Move or remove it \
+					 yourself, then run undo again",
 				))
 			};
 		}

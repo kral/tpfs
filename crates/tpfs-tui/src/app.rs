@@ -502,6 +502,12 @@ impl App {
 	}
 
 	fn submit_input(&mut self, value: &str, kind: &InputKind) {
+		// An unchanged name (even one with spaces at either end) means nothing to do.
+		if let InputKind::Rename(path) = kind
+			&& path.file_name().is_some_and(|n| n == value)
+		{
+			return;
+		}
 		let value = value.trim();
 		if value.is_empty() {
 			return;
@@ -597,7 +603,7 @@ impl App {
 			Executor::new(&self.validator(), &mut j, self.state.join("trash"))
 				.undo_last()
 				.map(|b| match b {
-					Some(b) => format!("Undone batch {}: {} operation(s).", b.id, b.steps),
+					Some(b) => format!("Undone batch {}: {} step(s).", tpfs_core::sanitize(b.id.as_ref()), b.steps),
 					None => "Nothing to undo.".into(),
 				})
 				.map_err(|e| one_line(&e))
@@ -661,7 +667,10 @@ impl App {
 						self.panels[i].cursor = index;
 						self.last_click = Some((now, i, index));
 						if double {
-							self.panels[i].enter();
+							self.active = i;
+							if !self.panels[i].enter() {
+								self.fkey(3); // a file opens in the viewer, as with Enter
+							}
 							self.last_click = None;
 						}
 					}

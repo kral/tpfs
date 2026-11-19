@@ -1461,9 +1461,33 @@ mod confined {
 
 	pub(super) fn rmdir(anchors: &[Anchor], path: &Path) -> Option<io::Result<()>> {
 		with_located(anchors, path, |parent, name| {
-			let h = open_final(parent, name, DELETE | FILE_READ_ATTRIBUTES, FILE_DIRECTORY_FILE, path)?;
-			delete(&h)
+			let h = open_final(
+				parent,
+				name,
+				DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+				FILE_DIRECTORY_FILE,
+				path,
+			)?;
+			delete_writable(&h)
 		})
+	}
+
+	/// Delete through `h`, clearing a read-only attribute first (NTFS refuses to delete read-only
+	/// files and folders; Explorer marks customised folders read-only). If the delete still fails,
+	/// the attribute is put back.
+	fn delete_writable(h: &OwnedHandle) -> io::Result<()> {
+		let original = basic(h)?;
+		let read_only = original.FileAttributes & FILE_ATTRIBUTE_READONLY != 0;
+		if read_only {
+			let mut b = basic(h)?;
+			b.FileAttributes &= !FILE_ATTRIBUTE_READONLY;
+			set_basic(h, &b)?;
+		}
+		let result = delete(h);
+		if result.is_err() && read_only {
+			let _ = set_basic(h, &original);
+		}
+		result
 	}
 
 	pub(super) fn unlink(anchors: &[Anchor], path: &Path) -> Option<io::Result<()>> {
@@ -1475,13 +1499,7 @@ mod confined {
 				FILE_NON_DIRECTORY_FILE,
 				path,
 			)?;
-			// A read-only file cannot be deleted: clear the attribute on this very handle first.
-			let mut b = basic(&h)?;
-			if b.FileAttributes & FILE_ATTRIBUTE_READONLY != 0 {
-				b.FileAttributes &= !FILE_ATTRIBUTE_READONLY;
-				set_basic(&h, &b)?;
-			}
-			delete(&h)
+			delete_writable(&h)
 		})
 	}
 

@@ -149,8 +149,9 @@ impl Server {
 		let roots: Vec<String> = self.validator.roots().iter().map(|r| show(r)).collect();
 		let approval = match self.config.approval {
 			Approval::Terminal => format!(
-				"After proposing, ask the user to review and approve it by running `{}` in their terminal, then call apply_plan.",
-				self.approve_command("<planId>")
+				"After proposing, ask the user to review and approve it by running `{}` in their terminal{}, then call apply_plan.",
+				self.approve_command("<planId>"),
+				SHELL
 			),
 			Approval::Client => {
 				"apply_plan asks the user for confirmation through this client; show them the preview first.".to_owned()
@@ -296,8 +297,9 @@ impl Server {
 		let pending = self.store.put(&plan, self.validator.roots()).map_err(|e| e.to_string())?;
 		let next = match self.config.approval {
 			Approval::Terminal => format!(
-				"Show the user the preview and ask them to run `{}` in a terminal. Then call apply_plan.",
-				self.approve_command(&pending.id)
+				"Show the user the preview and ask them to run `{}` in a terminal{}. Then call apply_plan.",
+				self.approve_command(&pending.id),
+				SHELL
 			),
 			Approval::Client => {
 				"Show the user the preview, then call apply_plan; the client will ask them to confirm.".to_owned()
@@ -330,8 +332,9 @@ impl Server {
 		}
 		if self.config.approval == Approval::Terminal && !self.store.is_approved(&pending) {
 			return Err(format!(
-				"not approved yet. Ask the user to run `{}` in a terminal, then call apply_plan again.",
-				self.approve_command(id)
+				"not approved yet. Ask the user to run `{}` in a terminal{}, then call apply_plan again.",
+				self.approve_command(id),
+				SHELL
 			));
 		}
 
@@ -496,13 +499,26 @@ fn show(p: &Path) -> String {
 	sanitize(p.as_os_str())
 }
 
+/// Which shell the quoting in approval hints is for.
+const SHELL: &str = if cfg!(windows) { " (PowerShell)" } else { "" };
+
 /// A path as one shell word, safe to paste: single quotes on POSIX shells (an inner `'` as `'\''`),
-/// double quotes on Windows (where `"` cannot occur in a path).
+/// PowerShell single quotes on Windows (the hint says the command is for PowerShell).
 fn shell_quote(s: &str) -> String {
 	if cfg!(windows) {
 		// PowerShell (the default Windows terminal): single quotes take everything literally
 		// (`$`, backtick, `%`); an inner `'` is doubled.
-		format!("'{}'", s.replace('\'', "''"))
+		// PowerShell also takes the typographic quotes ‘ ’ ‚ ‛ as single quotes.
+		// Each is escaped by doubling it.
+		let mut out = String::from("'");
+		for c in s.chars() {
+			if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}') {
+				out.push(c);
+			}
+			out.push(c);
+		}
+		out.push('\'');
+		out
 	} else if s.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-+,:@".contains(&b)) {
 		s.to_owned()
 	} else {
