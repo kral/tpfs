@@ -115,22 +115,28 @@ pub fn private_dir(dir: &Path) -> io::Result<()> {
 				),
 			));
 		}
-		// A folder above that anyone may change (and not sticky, like /tmp) lets another user swap
-		// the whole state folder for one of their own.
-		let abs = std::path::absolute(dir)?;
-		for parent in abs.ancestors().skip(1) {
-			if let Ok(p) = fs::metadata(parent)
-				&& p.permissions().mode() & 0o1002 == 0o002
-			{
-				return Err(io::Error::new(
-					io::ErrorKind::PermissionDenied,
-					format!(
-						"refusing to use {}: any user can replace it, as {} is writable by everyone",
-						dir.display(),
-						parent.display()
-					),
-				));
-			}
+		// A folder above that anyone may change (and is not sticky, like /tmp), or that belongs to
+		// another user, lets someone else swap the whole state folder for one of their own. Checked
+		// on the real path: through a symlink the folders above its target are the ones that count.
+		let real = canonicalize(dir)?;
+		for parent in real.ancestors().skip(1) {
+			let Ok(p) = fs::symlink_metadata(parent) else { continue };
+			let why = if p.permissions().mode() & 0o1002 == 0o002 {
+				"is writable by everyone"
+			} else if p.uid() != 0 && p.uid() != uid {
+				"belongs to another user"
+			} else {
+				continue;
+			};
+			return Err(io::Error::new(
+				io::ErrorKind::PermissionDenied,
+				format!(
+					"refusing to use {}: any user able to change {} could replace it ({} {why})",
+					dir.display(),
+					parent.display(),
+					parent.display()
+				),
+			));
 		}
 		Ok(())
 	}

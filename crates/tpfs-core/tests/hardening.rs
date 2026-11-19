@@ -720,6 +720,12 @@ fn a_state_folder_under_a_world_writable_folder_is_refused() {
 	fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
 	let err = tpfs_core::private_dir(&shared.join("tpfs")).unwrap_err();
 	assert!(err.to_string().contains("writable by everyone"), "{err}");
+	// Reached through a symlink: the folders above its target count.
+	let link = tmp.path().join("link");
+	fs::create_dir(shared.join("real")).unwrap();
+	std::os::unix::fs::symlink(shared.join("real"), &link).unwrap();
+	let err = tpfs_core::private_dir(&link.join("tpfs")).unwrap_err();
+	assert!(err.to_string().contains("writable by everyone"), "{err}");
 	fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
 	tpfs_core::private_dir(&shared.join("tpfs")).unwrap();
 }

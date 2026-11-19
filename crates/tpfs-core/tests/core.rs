@@ -2061,3 +2061,26 @@ fn folded_spellings_of_own_names_and_state_are_recognised() {
 		assert!(messages(&v, &plan).iter().any(|m| m.contains("tpfs's state")), "{spelled}: {:?}", messages(&v, &plan));
 	}
 }
+
+/// A copy whose result would be deeper than tpfs can address is refused before it starts, so a
+/// copy can never leave a partial tree tpfs cannot remove again.
+#[test]
+fn a_copy_too_deep_for_its_target_is_refused() {
+	let s = Sandbox::new();
+	let mut src = s.root.join("src");
+	for _ in 0..200 {
+		src.push("d");
+	}
+	fs::create_dir_all(&src).unwrap();
+	let mut target = s.root.clone();
+	for _ in 0..60 {
+		target.push("t");
+	}
+	fs::create_dir_all(&target).unwrap();
+	let plan = Plan::new(vec![Op::Copy { from: s.root.join("src"), to: target.join("copy") }], "");
+	let m = messages(&s.validator(), &plan);
+	assert!(m.iter().any(|m| m.contains("Too deep to copy")), "{m:?}");
+	// A shallow target takes the same tree.
+	let plan = Plan::new(vec![Op::Copy { from: s.root.join("src"), to: s.root.join("copy") }], "");
+	assert!(messages(&s.validator(), &plan).is_empty(), "{:?}", messages(&s.validator(), &plan));
+}

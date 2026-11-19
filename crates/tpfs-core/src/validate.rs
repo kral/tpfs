@@ -623,16 +623,28 @@ impl Sim {
 
 	/// Refuse a copy that would not fit, counting everything the plan already writes to that file system.
 	fn reserve_space(&mut self, from: &Path, target_dir: &Path) -> Result<(), String> {
-		let Some((dev, free)) = free_space(target_dir) else { return Ok(()) };
 		let needed = match self.sizes.get(from) {
 			Some(&n) => n,
 			None => {
 				let budget = self.size_budget.get_or_insert(1_000_000);
-				let Some(n) = tree_size(from, budget) else { return Ok(()) };
+				// A copy deeper than tpfs can address (or remove again, should it fail) is refused
+				// here, not halfway through.
+				let fits = |p: &Path| {
+					let rel = p.strip_prefix(from).unwrap_or(p);
+					p.components().count() <= MAX_DEPTH
+						&& p.as_os_str().len() <= MAX_PATH
+						&& target_dir.components().count() + 1 + rel.components().count() <= MAX_DEPTH
+						&& target_dir.as_os_str().len() + 64 + rel.as_os_str().len() <= MAX_PATH
+				};
+				let size = tree_size(from, budget, &fits).map_err(|p| {
+					format!("Too deep to copy (more than {MAX_DEPTH} folders or {MAX_PATH} bytes): {}", show(&p))
+				})?;
+				let Some(n) = size else { return Ok(()) };
 				self.sizes.insert(from.to_path_buf(), n);
 				n
 			}
 		};
+		let Some((dev, free)) = free_space(target_dir) else { return Ok(()) };
 		let total = self.reserved.entry(dev).or_default();
 		*total = total.saturating_add(needed);
 		if *total > free {
@@ -648,19 +660,24 @@ impl Sim {
 }
 
 /// Logical size of a file or directory tree (symlinks count as nothing), within a budget of
-/// entries shared by the whole plan; `None` once it runs out.
-fn tree_size(path: &Path, budget: &mut usize) -> Option<u64> {
+/// entries shared by the whole plan; `Ok(None)` once it runs out, `Err` with the first entry
+/// that does not `fit`.
+fn tree_size(path: &Path, budget: &mut usize, fits: &dyn Fn(&Path) -> bool) -> Result<Option<u64>, PathBuf> {
 	let mut total = 0u64;
 	let mut stack = vec![path.to_path_buf()];
 	while let Some(p) = stack.pop() {
-		*budget = budget.checked_sub(1)?;
+		if !fits(&p) {
+			return Err(p);
+		}
+		let Some(left) = budget.checked_sub(1) else { return Ok(None) };
+		*budget = left;
 		let Ok(meta) = fs::symlink_metadata(&p) else { continue };
 		if meta.is_dir() {
 			if let Ok(rd) = fs::read_dir(&p) {
 				// Never more pending paths in memory than the budget can still measure.
 				for e in rd.filter_map(Result::ok) {
 					if stack.len() >= *budget {
-						return None;
+						return Ok(None);
 					}
 					stack.push(e.path());
 				}
@@ -669,7 +686,7 @@ fn tree_size(path: &Path, budget: &mut usize) -> Option<u64> {
 			total = total.saturating_add(meta.len());
 		}
 	}
-	Some(total)
+	Ok(Some(total))
 }
 
 /// (file system id, bytes free to the user) for the file system holding `dir`.
@@ -726,9 +743,9 @@ mod tests {
 		}
 		fs::create_dir_all(&deep).unwrap();
 		let chain = tmp.path().join("chain");
-		assert_eq!(tree_size(&chain, &mut 10), None);
+		assert_eq!(tree_size(&chain, &mut 10, &|_| true), Ok(None));
 		let mut budget = 100;
-		assert_eq!(tree_size(&chain, &mut budget), Some(0));
+		assert_eq!(tree_size(&chain, &mut budget, &|_| true), Ok(Some(0)));
 		assert_eq!(budget, 69);
 	}
 
@@ -741,10 +758,10 @@ mod tests {
 			fs::write(tmp.path().join(format!("f{i}")), "x").unwrap();
 		}
 		let mut budget = 10;
-		assert_eq!(tree_size(tmp.path(), &mut budget), None);
+		assert_eq!(tree_size(tmp.path(), &mut budget, &|_| true), Ok(None));
 		assert_eq!(budget, 9, "stopped while listing, before measuring any file");
 		let mut budget = 100;
-		assert_eq!(tree_size(tmp.path(), &mut budget), Some(50));
+		assert_eq!(tree_size(tmp.path(), &mut budget, &|_| true), Ok(Some(50)));
 		assert_eq!(budget, 49);
 	}
 

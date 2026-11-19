@@ -356,6 +356,15 @@ impl Fs {
 	/// Never overwrites. On Linux every entry under a root, at any depth, is listed, read and
 	/// created through descriptors confined to that root.
 	fn copy_tree(&self, from: &Path, to: &Path, rel: &Path, copied: &mut Vec<Copied>) -> io::Result<()> {
+		// Never deeper than tpfs can address: a partial copy must always be removable again.
+		for p in [from, to] {
+			if p.components().count() > crate::validate::MAX_DEPTH || p.as_os_str().len() > crate::validate::MAX_PATH {
+				return Err(io::Error::new(
+					io::ErrorKind::InvalidInput,
+					format!("{} is too deep to copy; nothing of it is kept", crate::sanitize(from.as_os_str())),
+				));
+			}
+		}
 		let meta = fs::symlink_metadata(from)?;
 		let ft = meta.file_type();
 
