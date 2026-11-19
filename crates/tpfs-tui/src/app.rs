@@ -319,7 +319,7 @@ impl App {
 		let issues = self.validator().validate(&plan);
 		let risk = risk::assess(&plan, Source::Human);
 		let summary = format!(
-			"Total: {}   Digest: {}",
+			"Total: {}\nDigest: {}",
 			tpfs_core::risk::totals_line(&plan, " · "),
 			plan.digest().get(..12).unwrap_or_default()
 		);
@@ -544,11 +544,16 @@ impl App {
 			Err(e) => self.status = format!("Undo failed: {e}"),
 			Ok(None) => self.status = "Nothing to undo.".into(),
 			Ok(Some(b)) if b.status != BatchStatus::Committed || b.damaged => {
-				self.status = format!(
-					"The last batch ({}) was interrupted{}: run `tpfs recover` in a terminal first.",
-					tpfs_core::sanitize(b.id.as_ref()),
-					if b.damaged { " and its journal records are damaged" } else { "" }
-				);
+				let id = tpfs_core::sanitize(b.id.as_ref());
+				self.status = match (b.status, b.damaged) {
+					(BatchStatus::Committed, _) => {
+						format!("The last batch ({id}) has damaged journal records: undo it by hand from `tpfs log`.")
+					}
+					(_, true) => format!(
+						"The last batch ({id}) was interrupted and its records are damaged: see `tpfs log`, then `tpfs recover --abandon {id}`."
+					),
+					_ => format!("The last batch ({id}) was interrupted: run `tpfs recover` in a terminal first."),
+				};
 			}
 			Ok(Some(b)) => {
 				let who = match b.source.as_str() {

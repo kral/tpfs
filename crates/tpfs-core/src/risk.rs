@@ -140,6 +140,8 @@ pub fn totals(plan: &Plan) -> Vec<Total> {
 	const KINDS: [&str; 6] = ["move", "copy", "rename", "trash", "mkdir", "rmdir"];
 	let mut out: Vec<Total> = KINDS.iter().map(|&kind| Total { kind, count: 0, bytes: 0, more: false }).collect();
 	let mut budget = 200_000usize;
+	// Measure the paths the executor will act on (`a/tmp/../x` is `a/x`).
+	let plan = &plan.normalized();
 	for op in &plan.ops {
 		let (i, source) = match op {
 			Op::Move { from, .. } => (0, Some(from)),
@@ -152,7 +154,7 @@ pub fn totals(plan: &Plan) -> Vec<Total> {
 		out[i].count += 1;
 		if let Some(p) = source {
 			let (bytes, complete) = tree_bytes(p, &mut budget);
-			out[i].bytes += bytes;
+			out[i].bytes = out[i].bytes.saturating_add(bytes);
 			out[i].more |= !complete;
 		}
 	}
@@ -176,7 +178,7 @@ fn tree_bytes(path: &Path, budget: &mut usize) -> (u64, bool) {
 			*budget -= 1;
 			match e.file_type() {
 				Ok(t) if t.is_dir() => stack.push(e.path()),
-				Ok(t) if t.is_file() => total += e.metadata().map_or(0, |m| m.len()),
+				Ok(t) if t.is_file() => total = total.saturating_add(e.metadata().map_or(0, |m| m.len())),
 				_ => {}
 			}
 		}
@@ -192,7 +194,8 @@ pub fn human_bytes(bytes: u64) -> String {
 	}
 	let mut v = bytes as f64 / 1000.0;
 	let mut unit = 0;
-	while v >= 1000.0 && unit < UNITS.len() - 1 {
+	// 999.95 would print as "1000.0": move up a unit once it rounds that far.
+	while v >= 999.95 && unit < UNITS.len() - 1 {
 		v /= 1000.0;
 		unit += 1;
 	}
@@ -211,4 +214,19 @@ pub fn totals_line(plan: &Plan, separator: &str) -> String {
 		})
 		.collect::<Vec<_>>()
 		.join(separator)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::human_bytes;
+
+	#[test]
+	fn sizes_read_like_a_file_manager() {
+		assert_eq!(human_bytes(0), "0 B");
+		assert_eq!(human_bytes(999), "999 B");
+		assert_eq!(human_bytes(1000), "1.0 KB");
+		assert_eq!(human_bytes(999_950), "1.0 MB");
+		assert_eq!(human_bytes(4_100_000), "4.1 MB");
+		assert!(human_bytes(u64::MAX).ends_with("PB"));
+	}
 }

@@ -289,7 +289,7 @@ fn draw_confirm(
 		}
 		_ => (DIALOG.fg(Color::Red).add_modifier(Modifier::BOLD), format!("Risk: HIGH — {}", risk.reasons.join("; "))),
 	};
-	let mut foot: Vec<Line> = vec![Line::styled(truncate_right(summary, w), DIALOG)];
+	let mut foot: Vec<Line> = summary.lines().map(|l| Line::styled(truncate_right(l, w), DIALOG)).collect();
 	foot.extend(wrap(&risk_text, w).into_iter().map(|l| Line::styled(l, risk_style)));
 	// Only the visible window is formatted: a 10 000-operation plan costs nothing per redraw.
 	let line_count = |op: &tpfs_core::Op| match op {

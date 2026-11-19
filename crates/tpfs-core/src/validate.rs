@@ -387,8 +387,10 @@ fn check_names(path: &Path) -> Result<(), String> {
 		let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
 			|| ((stem.starts_with("COM") || stem.starts_with("LPT"))
 				&& stem.chars().count() == 4
-				&& stem[3..].chars().all(|d| ('1'..='9').contains(&d) || "¹²³".contains(d)));
-		if name.contains(':') || name.ends_with(['.', ' ']) || device {
+				&& stem[3..].chars().all(|d| d.is_ascii_digit() || "¹²³".contains(d)));
+		// Characters Windows refuses in names (`:` would also open an alternate data stream).
+		let forbidden = name.chars().any(|c| matches!(c, ':' | '<' | '>' | '"' | '|' | '?' | '*') || c < ' ');
+		if forbidden || name.ends_with(['.', ' ']) || device {
 			return Err(format!("Windows cannot use this name safely: '{}'", sanitize(name.as_ref().as_ref())));
 		}
 	}

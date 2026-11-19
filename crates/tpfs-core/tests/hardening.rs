@@ -505,3 +505,40 @@ fn a_root_swapped_for_a_link_is_not_followed() {
 	assert!(listed.is_err(), "listed the link's target: {listed:?}");
 	assert!(tpfs_core::list_confined(&roots, &outside, 100).is_err(), "a folder outside the roots was listed");
 }
+
+/// The root itself swapped for a link while a plan runs: the steps still act on the real root
+/// (through its handle) or fail, and nothing appears or disappears outside.
+#[test]
+fn a_root_swapped_mid_plan_never_redirects_a_step() {
+	let s = Sandbox::new();
+	fs::write(s.root.join("f.txt"), "mine").unwrap();
+	let outside = s.base.join("outside");
+	fs::create_dir(&outside).unwrap();
+	fs::write(outside.join("f.txt"), "secret").unwrap();
+	let plan = Plan::new(
+		vec![
+			Op::Mkdir { path: s.root.join("new") },
+			Op::Trash { path: s.root.join("f.txt") },
+			Op::Copy { from: s.root.join("new"), to: s.root.join("new2") },
+		],
+		"",
+	);
+	let (root2, out2) = (s.root.clone(), outside.clone());
+	let v = s.validator();
+	let mut j = s.journal();
+	let mut swapped = false;
+	let _ = Executor::new(&v, &mut j, s.state.join("trash"))
+		.before_apply(move |_| {
+			// Windows holds the root open without share-delete: the swap itself is refused there.
+			if !swapped && fs::rename(&root2, root2.with_file_name("root-real")).is_ok() {
+				link_dir(&out2, &root2);
+				swapped = true;
+			}
+		})
+		.execute(&plan, Source::Human);
+	let mut now: Vec<String> =
+		fs::read_dir(&outside).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+	now.sort();
+	assert_eq!(now, ["f.txt"], "the outside folder changed");
+	assert_eq!(fs::read_to_string(outside.join("f.txt")).unwrap(), "secret");
+}

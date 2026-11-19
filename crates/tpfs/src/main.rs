@@ -21,6 +21,8 @@ USAGE:
                                                   --icons (or TPFS_ICONS=1) needs a Nerd Font
   tpfs schema                                   print the JSON Schema of a plan
   tpfs check  <plan.json|-> --root <dir>...     validate; show preview, risk and digest
+                [--source human|agent]            judge the risk as for this proposer
+                [--max-ops <n>]                   allow a longer human plan (default 10000)
   tpfs apply  <plan.json|-> --root <dir>...     validate, confirm, execute
                 [--approve <digest>]              non-interactive approval of exactly this plan
                 [--source human|agent]            who proposed the plan (default: human)
@@ -313,6 +315,13 @@ fn run(args: Args) -> Res {
 				});
 			}
 			let last = batches.into_iter().rev().find(|b| b.status == BatchStatus::Committed);
+			if let Some(b) = last.as_ref().filter(|b| b.damaged) {
+				return Err(format!(
+					"batch {} has damaged journal records; it cannot be undone automatically — undo it by hand from `tpfs log`",
+					tpfs_core::sanitize(b.id.as_ref())
+				)
+				.into());
+			}
 			if let Some(b) = &last {
 				let steps: Vec<_> = b.steps.iter().filter(|s| s.done && !s.undone).collect();
 				if let Some(approved) = &args.approve {
@@ -350,7 +359,7 @@ fn run(args: Args) -> Res {
 			}
 			match Executor::new(&validator, &mut journal, trash).undo_last() {
 				Ok(Some(b)) => {
-					println!("Undone batch {} ({} step(s)):", b.id, b.steps);
+					println!("Undone batch {} ({} step(s)):", tpfs_core::sanitize(b.id.as_ref()), b.steps);
 					for s in last.iter().flat_map(|l| l.steps.iter().filter(|s| s.done && !s.undone)) {
 						println!("  reverted: {}", s.forward.normalized());
 					}
@@ -401,7 +410,10 @@ fn run(args: Args) -> Res {
 						return Err(cancelled("cancelled; nothing was changed"));
 					}
 				}
-				Executor::new(&validator, &mut journal, trash).abandon(id).map_err(|e| e.to_string())?;
+				Executor::new(&validator, &mut journal, trash).abandon(id).map_err(|e| match e {
+					ExecError::Blocked(m) if m.starts_with("no batch") => usage(format!("{m} (see `tpfs log`)")),
+					e => e.to_string().into(),
+				})?;
 				println!("Abandoned batch {id}; its changes were left as they are.");
 				return Ok(ExitCode::SUCCESS);
 			}
@@ -482,7 +494,10 @@ fn check(args: &Args, apply: bool) -> Res {
 		validator = validator.with_max_ops(n);
 	}
 
-	let Some((digest, level)) = present(&validator, &plan, args.source) else { return Ok(ExitCode::from(3)) };
+	let Some((digest, level)) = present(&validator, &plan, args.source) else {
+		eprintln!("tpfs {}: plan rejected (see the problems above); nothing was changed", args.command);
+		return Ok(ExitCode::from(3));
+	};
 	if !apply {
 		println!("OK — the plan is valid.");
 		return Ok(ExitCode::SUCCESS);
@@ -502,20 +517,7 @@ fn present(validator: &Validator, plan: &Plan, source: Source) -> Option<(String
 	if !plan.reason.is_empty() {
 		println!("Plan: {}", tpfs_core::sanitize(plan.reason.as_ref()));
 	}
-	// On a terminal, what goes to the trash or removes a folder stands out (as in the commander).
-	let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-	for line in plan.preview() {
-		if color && (line.starts_with("TRASH") || line.starts_with("RMDIR")) {
-			println!("  \x1b[1;31m{line}\x1b[0m");
-		} else {
-			println!("  {line}");
-		}
-	}
-	println!("Total: {} operation(s): {}", plan.ops.len(), risk::totals_line(plan, ", "));
-	let trashed = plan.ops.iter().filter(|op| matches!(op, tpfs_core::Op::Trash { .. })).count();
-	if trashed > 0 {
-		println!("{trashed} item(s) go to the trash (nothing is deleted; `tpfs undo` puts them back).");
-	}
+	print_preview(plan);
 	println!(
 		"Risk: {}{}",
 		level_word(risk.level),
@@ -531,6 +533,24 @@ fn present(validator: &Validator, plan: &Plan, source: Source) -> Option<(String
 		return None;
 	}
 	Some((digest, risk.level))
+}
+
+/// The operation list, totals and a trash line — the same for `check`, `apply`, `sync` and `approve`.
+fn print_preview(plan: &Plan) {
+	// On a terminal, what goes to the trash or removes a folder stands out (as in the commander).
+	let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+	for line in plan.preview() {
+		if color && (line.starts_with("TRASH") || line.starts_with("RMDIR")) {
+			println!("  \x1b[1;31m{line}\x1b[0m");
+		} else {
+			println!("  {line}");
+		}
+	}
+	println!("Total: {} operation(s): {}", plan.ops.len(), risk::totals_line(plan, ", "));
+	let trashed = plan.ops.iter().filter(|op| matches!(op, tpfs_core::Op::Trash { .. })).count();
+	if trashed > 0 {
+		println!("{trashed} item(s) go to the trash (nothing is deleted; `tpfs undo` puts them back).");
+	}
 }
 
 /// The same words as the commander's confirmation.
@@ -669,14 +689,11 @@ fn approve(args: &Args) -> Res {
 	if !pending.plan.reason.is_empty() {
 		println!("  \"{}\"", tpfs_core::sanitize(pending.plan.reason.as_ref()));
 	}
-	for line in pending.plan.preview() {
-		println!("  {line}");
-	}
+	print_preview(&pending.plan);
 	println!(
 		"Allowed folders: {}",
 		pending.roots.iter().map(|r| tpfs_core::sanitize(r.as_os_str())).collect::<Vec<_>>().join(", ")
 	);
-	println!("Total: {} operation(s): {}", pending.plan.ops.len(), risk::totals_line(&pending.plan, ", "));
 	println!(
 		"Risk: {}{}",
 		level_word(risk.level),

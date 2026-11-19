@@ -1514,3 +1514,97 @@ fn interrupted_recovery_resumes_after_the_steps_it_finished() {
 	assert!(!b.exists());
 	assert_eq!(j.batches().unwrap()[0].status, BatchStatus::Aborted);
 }
+
+fn begin(j: &mut Journal, batch: &str) {
+	j.append(&Entry::Begin {
+		batch: batch.into(),
+		at: 0,
+		source: "human".into(),
+		reason: String::new(),
+		digest: String::new(),
+		v: 1,
+	})
+	.unwrap();
+}
+
+fn corrupt_line(s: &Sandbox) {
+	let path = s.state.join("journal.jsonl");
+	let mut bytes = fs::read(&path).unwrap();
+	bytes.extend_from_slice(b"0000 {\"kind\":\"undo_step\"\n");
+	fs::write(&path, bytes).unwrap();
+}
+
+/// A torn tail, then a recovery that rolls back one step, records it and stops on a conflict: once
+/// the user clears the conflict, a second `recover` finishes (its own records are not "damage").
+#[test]
+fn recovery_after_a_torn_tail_may_take_several_runs() {
+	let s = Sandbox::new();
+	let (a, a2, b, b2) = (s.root.join("a"), s.root.join("a2"), s.root.join("b"), s.root.join("b2"));
+	fs::write(&a2, "A").unwrap();
+	fs::write(&b2, "B").unwrap();
+	let mut j = s.journal();
+	begin(&mut j, "x");
+	for (i, from, to) in [(0, &a, &a2), (1, &b, &b2)] {
+		j.append(&Entry::Intent {
+			batch: "x".into(),
+			index: i,
+			forward: Op::Move { from: from.clone(), to: to.clone() },
+			inverse: Op::Move { from: to.clone(), to: from.clone() },
+		})
+		.unwrap();
+		j.append(&Entry::Done { batch: "x".into(), index: i, check: None, mode: None }).unwrap();
+	}
+	drop(j);
+	corrupt_line(&s); // torn while writing
+	fs::write(&a, "USER NEW").unwrap();
+	let mut j = s.journal();
+	let first = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
+	assert_eq!(first.errors.len(), 1, "{first:?}");
+	assert_eq!(fs::read_to_string(&b).unwrap(), "B", "step 1 was rolled back");
+	fs::remove_file(&a).unwrap();
+	let second = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
+	assert!(second.errors.is_empty() && second.rolled_back == ["x"], "{second:?}");
+	assert_eq!(fs::read_to_string(&a).unwrap(), "A");
+}
+
+/// A record lost in the middle of an undo of a committed batch: the batch is damaged, and undo
+/// refuses it instead of replaying the lost step from what the disk looks like.
+#[test]
+fn a_record_lost_during_an_undo_makes_the_batch_damaged() {
+	let s = Sandbox::new();
+	fs::write(s.root.join("a"), "A").unwrap();
+	let id = run(&s, vec![Op::Mkdir { path: s.root.join("d") }, Op::Mkdir { path: s.root.join("e") }]);
+	let mut j = s.journal();
+	j.append(&Entry::UndoStep { batch: id.clone(), index: 1 }).unwrap();
+	drop(j);
+	corrupt_line(&s); // the next UndoStep rotted
+	let mut j = s.journal();
+	j.append(&Entry::UndoStep { batch: id.clone(), index: 0 }).unwrap();
+	let b = j.batches().unwrap().pop().unwrap();
+	assert!(b.damaged, "a lost undo record went unnoticed");
+	drop(j);
+	assert!(undo(&s).is_err());
+}
+
+/// Recovery cut off after step 0's inverse ran but before it was recorded, with both steps on the
+/// same path: the recorded step 1 is not replayed (that would trash the restored original).
+#[test]
+fn recovery_never_replays_a_step_it_recorded() {
+	let s = Sandbox::new();
+	let (a, b) = (s.root.join("a.txt"), s.root.join("b.txt"));
+	fs::write(&a, "ORIGINAL").unwrap(); // step 0's inverse (b -> a) already ran
+	let mut j = s.journal();
+	begin(&mut j, "y");
+	for (i, forward, inverse) in [
+		(0, Op::Move { from: a.clone(), to: b.clone() }, Op::Move { from: b.clone(), to: a.clone() }),
+		(1, Op::Copy { from: b.clone(), to: a.clone() }, Op::Trash { path: a.clone() }),
+	] {
+		j.append(&Entry::Intent { batch: "y".into(), index: i, forward, inverse }).unwrap();
+		j.append(&Entry::Done { batch: "y".into(), index: i, check: None, mode: None }).unwrap();
+	}
+	j.append(&Entry::UndoStep { batch: "y".into(), index: 1 }).unwrap();
+	let report = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
+	assert!(report.errors.is_empty(), "{report:?}");
+	assert_eq!(fs::read_to_string(&a).unwrap(), "ORIGINAL", "the restored original was trashed");
+	assert!(!s.trash().exists() || fs::read_dir(s.trash()).unwrap().next().is_none());
+}

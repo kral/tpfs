@@ -304,33 +304,45 @@ impl Journal {
 		let mut batches: Vec<BatchView> = Vec::new();
 		// Batch id -> position of its latest view: one lookup per record, not a scan of history.
 		let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-		// Batches that were open when an unreadable line appeared, until the next readable record.
-		let mut suspect: Vec<String> = Vec::new();
+		// Batches that were open when an unreadable line appeared, until the next readable record:
+		// (id, whether it was committed — then an undo of it may have lost a record).
+		let mut suspect: Vec<(String, bool)> = Vec::new();
 		for e in self.records()? {
 			let Some(e) = e else {
 				// Only the batch being written when the damage happened (the newest) can have lost
-				// a record to it; an older interrupted batch is not affected by later damage.
-				if let Some(b) = batches.last().filter(|b| b.status == BatchStatus::Incomplete)
-					&& !suspect.contains(&b.id)
+				// a record to it; an older batch is not affected by later damage.
+				if let Some(b) = batches.last()
+					&& matches!(b.status, BatchStatus::Incomplete | BatchStatus::Committed)
+					&& !suspect.iter().any(|(id, _)| *id == b.id)
 				{
-					suspect.push(b.id.clone());
+					suspect.push((b.id.clone(), b.status == BatchStatus::Committed));
 				}
 				continue;
 			};
-			// Anything readable after the damage — except recovery closing a suspect batch, the normal
-			// end of a crash with a torn last line — means records of the open batches may be lost
-			// (an intent, a done, or the commit itself).
 			if !suspect.is_empty() {
-				// Records recovery itself writes for a suspect batch (it may need several runs).
-				let closes_suspect = matches!(&e,
-					Entry::Abort { batch } | Entry::UndoPublished { batch, .. } if suspect.contains(batch));
-				if !closes_suspect {
-					for b in batches.iter_mut().filter(|b| suspect.contains(&b.id)) {
-						b.damaged = true;
+				let ours = |id: &str| suspect.iter().find(|(s, _)| s == id);
+				// Recovery's own records for an interrupted batch (it may need several runs) are the
+				// normal end of a crash with a torn last line; anything else after the damage means
+				// records of the open batch may be lost (an intent, a done, the commit itself).
+				let recovery = match &e {
+					Entry::Abort { batch } | Entry::UndoPublished { batch, .. } | Entry::UndoStep { batch, .. } => {
+						ours(batch).is_some_and(|(_, committed)| !committed)
+					}
+					_ => false,
+				};
+				if !recovery {
+					for (id, committed) in &suspect {
+						let Some(b) = index.get(id).and_then(|&i| batches.get_mut(i)) else { continue };
+						// A committed batch lost a record only if it was being undone: its own record
+						// follows, or an undo of it had already started.
+						let undoing = e.batch() == id || b.steps.iter().any(|s| s.undone || s.undo_published);
+						if !committed || undoing {
+							b.damaged = true;
+						}
 					}
 				}
 				// After recovery's intermediate records the batch is still open: keep watching it.
-				if !matches!(&e, Entry::UndoPublished { .. }) {
+				if !matches!(&e, Entry::UndoPublished { .. } | Entry::UndoStep { .. }) || !recovery {
 					suspect.clear();
 				}
 			}

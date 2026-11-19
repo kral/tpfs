@@ -186,7 +186,7 @@ impl<'a> Executor<'a> {
 		// Act on the paths as validated: spelled the way the file system spells them, under a root,
 		// with no symlink on the way (the confined calls refuse any other spelling).
 		let resolved = self.resolve_plan(plan);
-		let fs = Fs::confined(self.validator.roots());
+		let fs = self.fs();
 		let mut applied: Vec<Op> = Vec::new();
 		for (i, op) in resolved.ops.iter().enumerate() {
 			// Re-check this step against the disk as it is right now: earlier steps are already
@@ -308,7 +308,7 @@ impl<'a> Executor<'a> {
 				error: "its journal records are damaged; undo it by hand from `tpfs log`".into(),
 			});
 		}
-		let fs = Fs::confined(self.validator.roots());
+		let fs = self.fs();
 		let mut reverted = 0;
 		for step in batch.steps.iter().rev().filter(|s| s.done && !s.undone) {
 			let fail = |error: String| ExecError::Undo { batch: batch.id.clone(), error };
@@ -489,7 +489,7 @@ impl<'a> Executor<'a> {
 
 	fn recover_batches(&mut self, batches: Vec<crate::journal::BatchView>) -> Result<RecoveryReport, ExecError> {
 		let mut report = RecoveryReport::default();
-		let fs = Fs::confined(self.validator.roots());
+		let fs = self.fs();
 		// Newest first: an older batch's inverses assume the later ones were undone already.
 		for batch in batches.into_iter().rev() {
 			if batch.damaged {
@@ -558,6 +558,13 @@ impl<'a> Executor<'a> {
 		Ok(self.recover_batches(vec![view])?.errors)
 	}
 
+	/// Confined file operations for the roots, and for the per-file-system trash folders next to
+	/// them (outside the roots, so they get anchors of their own).
+	fn fs(&self) -> Fs {
+		let trashes: Vec<PathBuf> = self.validator.roots().iter().filter_map(|r| local_trash(&self.trash, r)).collect();
+		Fs::confined_with_private(self.validator.roots(), &trashes)
+	}
+
 	/// The operation that undoes `op`. Computed *before* `op` runs, so it can be journaled first.
 	fn inverse(&self, op: &Op, batch: &str, index: usize) -> Op {
 		let n = |p: &Path| normalize(p).unwrap_or_else(|| p.to_path_buf());
@@ -604,7 +611,7 @@ fn in_local_trash(path: &Path) -> bool {
 	#[cfg(unix)]
 	{
 		use std::os::unix::fs::{MetadataExt, PermissionsExt};
-		let uid = rustix::process::getuid().as_raw();
+		let uid = rustix::process::geteuid().as_raw();
 		let name = format!(".tpfs-trash-{uid}");
 		path.ancestors().any(|a| {
 			a.file_name().is_some_and(|n| n == name.as_str())
@@ -792,7 +799,20 @@ fn apply(
 				}
 			};
 			let parent = slot.parent().ok_or_else(|| io::Error::other("trash slot without a parent"))?;
-			fs::create_dir_all(parent)?;
+			// <trash>/<batch>/<index>/<name>: the trash folder exists; the two levels below are made
+			// through the confined calls (a local trash is anchored like a root, never followed).
+			let batch_dir = parent.parent().ok_or_else(|| io::Error::other("trash slot without a batch folder"))?;
+			if let Some(base) = batch_dir.parent()
+				&& !exists(base)
+			{
+				fs::create_dir_all(base)?; // the private trash in the state folder
+			}
+			for d in [batch_dir, parent] {
+				match fs.mkdir(d) {
+					Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+					_ => {}
+				}
+			}
 			// Make the new slot folders durable: trash/<batch> in trash, <index> in trash/<batch>.
 			if let Some(batch_dir) = parent.parent() {
 				sync_parent(batch_dir);
@@ -971,7 +991,7 @@ fn local_trash(trash: &Path, path: &Path) -> Option<PathBuf> {
 		}
 	}
 
-	let uid = rustix::process::getuid().as_raw();
+	let uid = rustix::process::geteuid().as_raw();
 	let dir = mount.join(format!(".tpfs-trash-{uid}"));
 	let _ = fs::DirBuilder::new().mode(0o700).create(&dir);
 

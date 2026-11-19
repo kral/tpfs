@@ -58,6 +58,23 @@ impl Fs {
 		}
 	}
 
+	/// Like [`Fs::confined`], plus private folders outside the roots (per-file-system trash folders)
+	/// that operations may also use: each is anchored the same way and must, on the opened handle,
+	/// be owned by the user and closed to everyone else — else it gets no anchor and is refused.
+	pub(crate) fn confined_with_private(roots: &[PathBuf], private: &[PathBuf]) -> Self {
+		let mut fs = Self::confined(roots);
+		#[cfg(unix)]
+		for p in private {
+			match confined::Anchor::open(p).filter(confined::Anchor::is_private) {
+				Some(a) => fs.anchors.push(a),
+				None => fs.unanchored.push(p.clone()),
+			}
+		}
+		#[cfg(not(unix))]
+		fs.unanchored.extend(private.iter().cloned());
+		fs
+	}
+
 	/// Operations under any of `roots` are confined to it; roots are expected to be canonical.
 	pub(crate) fn confined(roots: &[PathBuf]) -> Self {
 		#[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
@@ -700,6 +717,13 @@ mod confined {
 			&self.root
 		}
 
+		/// Owned by the effective user and not open to group or others, judged on the open handle.
+		#[allow(clippy::useless_conversion)] // st_mode is u16 on macOS
+		pub(super) fn is_private(&self) -> bool {
+			rustix::fs::fstat(&self.fd)
+				.is_ok_and(|st| st.st_uid == rustix::process::geteuid().as_raw() && u32::from(st.st_mode) & 0o077 == 0)
+		}
+
 		/// The root is canonical, so it has no symlink in it: open it so that none is followed either,
 		/// or a root swapped for a link after validation would bind every operation to the link's
 		/// target (`openat2(RESOLVE_NO_SYMLINKS)` on Linux, `O_NOFOLLOW_ANY` on macOS).
@@ -713,14 +737,16 @@ mod confined {
 				ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
 			) {
 				Ok(fd) => fd,
-				// No openat2: operations are refused anyway unless the user opted out of confinement.
-				Err(Errno::NOSYS) => rustix::fs::open(root, DIR | OFlags::CLOEXEC, Mode::empty()).ok()?,
+				// No openat2 (or no O_NOFOLLOW_ANY below): no anchor, so operations under this root
+				// are refused, or with TPFS_ALLOW_UNCONFINED=1 re-checked for links right before.
 				Err(_) => return None,
 			};
 			#[cfg(target_vendor = "apple")]
 			let fd = {
-				let follow = if nofollow_any_works() { NOFOLLOW_ANY } else { OFlags::empty() };
-				rustix::fs::open(root, DIR | OFlags::CLOEXEC | follow, Mode::empty()).ok()?
+				if !nofollow_any_works() {
+					return None;
+				}
+				rustix::fs::open(root, DIR | OFlags::CLOEXEC | NOFOLLOW_ANY, Mode::empty()).ok()?
 			};
 			Some(Self { root: root.to_path_buf(), fd })
 		}

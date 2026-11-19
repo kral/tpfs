@@ -16,9 +16,9 @@ const SUPPORTED_VERSIONS: [&str; 3] = [PROTOCOL_VERSION, "2025-03-26", "2024-11-
 
 /// Longest plan reason accepted from an agent: stricter than the core limit, as the reason is
 /// shown to the human approving it and should stay readable.
+const AGENT_MAX_REASON: usize = 2_000;
 /// Preview lines returned for a valid plan; the rest is counted in `stepCount`.
 const PREVIEW_LINES: usize = 200;
-const AGENT_MAX_REASON: usize = 2_000;
 
 /// Longest JSON-RPC message accepted on stdin.
 pub const MAX_MESSAGE: usize = 4 << 20;
@@ -219,7 +219,7 @@ impl Server {
 
 		// Keep at most a bounded number of entries in memory, however big the folder is.
 		const SCAN: usize = 100_000;
-		let mut entries: Vec<(bool, String, u64)> = Vec::new();
+		let mut entries: Vec<(&str, String, u64)> = Vec::new();
 		// Listed relative to the folder's own confined handle: a folder swapped for a link after the
 		// check above is refused instead of followed out of the allowed folders.
 		let (listing, all) = tpfs_core::list_confined(self.validator.roots(), &dir, SCAN)
@@ -231,19 +231,23 @@ impl Server {
 				total -= 1;
 				continue;
 			}
-			entries.push((e.dir, sanitize(&e.name), e.size));
+			let kind = if e.dir {
+				"dir"
+			} else if e.link {
+				"symlink"
+			} else {
+				"file"
+			};
+			entries.push((kind, sanitize(&e.name), e.size));
 		}
-		entries.sort_by_cached_key(|e| (!e.0, e.1.to_lowercase()));
+		entries.sort_by_cached_key(|e| (e.0 != "dir", e.1.to_lowercase()));
 
 		let listed: Vec<Value> = entries
 			.into_iter()
 			.take(limit)
-			.map(|(d, name, size)| {
-				if d {
-					json!({ "name": name, "type": "dir" })
-				} else {
-					json!({ "name": name, "type": "file", "size": size })
-				}
+			.map(|(kind, name, size)| match kind {
+				"file" => json!({ "name": name, "type": "file", "size": size }),
+				_ => json!({ "name": name, "type": kind }),
 			})
 			.collect();
 		Ok(json!({ "path": show(&dir), "total": total, "truncated": total > limit, "entries": listed }))
@@ -393,6 +397,7 @@ fn tools() -> Value {
 		}
 		if let Some(o) = p.get_mut("ops") {
 			o["maxItems"] = json!(tpfs_core::MAX_OPS);
+			o["minItems"] = json!(1);
 		}
 	}
 	if let Some(defs) = defs {
