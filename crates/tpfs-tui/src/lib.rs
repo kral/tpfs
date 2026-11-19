@@ -30,9 +30,20 @@ pub struct Options {
 
 /// Run the commander in the current terminal until the user quits.
 pub fn run(left: PathBuf, right: PathBuf, state: PathBuf, options: Options) -> io::Result<()> {
+	use std::io::IsTerminal;
+	if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+		return Err(io::Error::other("the commander needs an interactive terminal"));
+	}
 	let mut app = App::new(left, right, state, options.icons)?;
 
 	let mut terminal = ratatui::init();
+	// ratatui's hook leaves raw mode and the alternate screen; mouse reporting must go too, or the
+	// shell receives escape garbage for every mouse move after a panic.
+	let restore = std::panic::take_hook();
+	std::panic::set_hook(Box::new(move |info| {
+		let _ = execute!(io::stdout(), DisableMouseCapture);
+		restore(info);
+	}));
 	execute!(io::stdout(), EnableMouseCapture)?;
 	let result = (|| -> io::Result<()> {
 		while !app.quit {

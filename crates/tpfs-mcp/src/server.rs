@@ -1,6 +1,6 @@
 use std::{
 	fs,
-	io::{self, BufRead, Write},
+	io::{self, BufRead, Read, Write},
 	path::{Path, PathBuf},
 };
 
@@ -10,6 +10,9 @@ use tpfs_core::{BatchStatus, Executor, Journal, Plan, Source, Validator, risk, s
 use crate::store::Store;
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// Longest JSON-RPC message accepted on stdin.
+pub const MAX_MESSAGE: usize = 4 << 20;
 
 /// Who confirms an agent's plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,18 +49,38 @@ impl Server {
 	}
 
 	/// Serve newline-delimited JSON-RPC until the input closes. Nothing but protocol goes to `output`.
-	pub fn run(&mut self, input: impl BufRead, mut output: impl Write) -> io::Result<()> {
-		for line in input.lines() {
-			let line = line?;
-			if line.trim().is_empty() {
-				continue;
+	/// A message that is not valid UTF-8 or longer than [`MAX_MESSAGE`] is answered with a JSON-RPC
+	/// error and skipped; it never ends the session.
+	pub fn run(&mut self, mut input: impl BufRead, mut output: impl Write) -> io::Result<()> {
+		let mut buf = Vec::new();
+		loop {
+			buf.clear();
+			let n = (&mut input).take(MAX_MESSAGE as u64 + 1).read_until(b'\n', &mut buf)?;
+			if n == 0 {
+				return Ok(());
 			}
-			if let Some(response) = self.handle(&line) {
+			let response = if buf.last() != Some(&b'\n') && buf.len() > MAX_MESSAGE {
+				// Skip the rest of the oversized line without buffering it.
+				loop {
+					buf.clear();
+					let m = (&mut input).take(MAX_MESSAGE as u64).read_until(b'\n', &mut buf)?;
+					if m == 0 || buf.last() == Some(&b'\n') {
+						break;
+					}
+				}
+				Some(rpc_error(Value::Null, -32600, &format!("message longer than {MAX_MESSAGE} bytes")))
+			} else {
+				match std::str::from_utf8(&buf) {
+					Ok(line) if line.trim().is_empty() => None,
+					Ok(line) => self.handle(line),
+					Err(_) => Some(rpc_error(Value::Null, -32700, "parse error: message is not valid UTF-8")),
+				}
+			};
+			if let Some(response) = response {
 				writeln!(output, "{response}")?;
 				output.flush()?;
 			}
 		}
-		Ok(())
 	}
 
 	/// Handle one JSON-RPC message; notifications get no response.

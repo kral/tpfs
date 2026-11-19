@@ -211,6 +211,10 @@ impl Validator {
 	/// Normalise, confine to a root, and refuse paths that pass through a symlink.
 	fn resolve(&self, path: &Path) -> Result<PathBuf, String> {
 		let path = normalize(path).ok_or_else(|| format!("Path must be absolute: {}", show(path)))?;
+		if path.to_str().is_none() {
+			// The plan, its digest and the journal store paths as JSON strings.
+			return Err(format!("File names that are not valid Unicode are not supported yet: {}", show(&path)));
+		}
 		let root = self.root_of(&path).ok_or_else(|| format!("Outside the allowed folders: {}", show(&path)))?;
 		match symlink_in_between(&path, root) {
 			Ok(None) => Ok(path),

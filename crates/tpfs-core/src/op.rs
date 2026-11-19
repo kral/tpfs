@@ -43,7 +43,9 @@ impl Plan {
 
 	/// SHA-256 of the canonical JSON form. An approval refers to exactly this plan and nothing else.
 	pub fn digest(&self) -> String {
-		let bytes = serde_json::to_vec(self).expect("a plan always serialises");
+		// A path that is not valid UTF-8 has no JSON form; validation rejects such plans, and the
+		// lossless Debug form still gives each of them a distinct digest instead of a panic.
+		let bytes = serde_json::to_vec(self).unwrap_or_else(|_| format!("{self:?}").into_bytes());
 		Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 	}
 

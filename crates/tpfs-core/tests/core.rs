@@ -520,3 +520,23 @@ fn recover_last_only_touches_an_interrupted_newest_batch() {
 	assert_eq!(r.rolled_back, vec!["new".to_string()]);
 	assert!(!dir.exists() && newer.exists());
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn non_unicode_names_are_rejected_without_a_panic() {
+	use std::os::unix::ffi::OsStrExt;
+	let s = Sandbox::new();
+	let name = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
+	let path = s.root.join(name);
+	fs::write(&path, "x").unwrap();
+	let plan = Plan::new(vec![Op::Trash { path: path.clone() }], "");
+	let digest = plan.digest();
+	assert_eq!(digest.len(), 64);
+	assert!(messages(&s.validator(), &plan)[0].contains("not valid Unicode"));
+	let mut j = s.journal();
+	assert!(matches!(
+		Executor::new(&s.validator(), &mut j, s.trash()).execute(&plan, Source::Human),
+		Err(ExecError::Rejected(_))
+	));
+	assert!(path.exists());
+}

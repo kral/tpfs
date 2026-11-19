@@ -195,7 +195,14 @@ fn run(args: Args) -> Result<ExitCode, String> {
 					BatchStatus::Undone => "undone",
 					BatchStatus::Incomplete => "INCOMPLETE (run `tpfs recover`)",
 				};
-				println!("{}  {:<6} {:<10} {} step(s)  {}", b.id, b.source, status, b.steps.len(), b.reason);
+				println!(
+					"{}  {:<6} {:<10} {} step(s)  {}",
+					tpfs_core::sanitize(b.id.as_ref()),
+					tpfs_core::sanitize(b.source.as_ref()),
+					status,
+					b.steps.len(),
+					tpfs_core::sanitize(b.reason.as_ref())
+				);
 			}
 			if journal.corrupt_lines() > 0 {
 				eprintln!("warning: {} unreadable journal line(s) skipped", journal.corrupt_lines());

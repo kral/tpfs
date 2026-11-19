@@ -124,11 +124,12 @@ fn client_mode_trusts_the_clients_confirmation() {
 #[test]
 fn invalid_plans_and_paths_are_reported_not_stored() {
 	let mut f = Fixture::new(Approval::Terminal);
-	let (v, err) = f.tool("propose_plan", json!({ "plan": { "ops": [{ "op": "trash", "path": "/etc/passwd" }] } }));
+	let outside = f.root.parent().unwrap().join("outside.txt");
+	let (v, err) = f.tool("propose_plan", json!({ "plan": { "ops": [{ "op": "trash", "path": outside }] } }));
 	assert!(!err && v["valid"] == false, "{v}");
 	assert!(v["issues"][0].as_str().unwrap().contains("Outside"));
 
-	let (v, err) = f.tool("list_directory", json!({ "path": "/" }));
+	let (v, err) = f.tool("list_directory", json!({ "path": f.root.parent().unwrap() }));
 	assert!(err, "{v}");
 
 	let (v, err) = f.tool("apply_plan", json!({ "planId": "../../journal" }));
@@ -136,6 +137,7 @@ fn invalid_plans_and_paths_are_reported_not_stored() {
 }
 
 #[test]
+#[cfg(unix)] // Windows does not allow control characters in file names.
 fn listing_sanitises_hostile_names() {
 	let mut f = Fixture::new(Approval::Terminal);
 	fs::write(f.root.join("evil\x1b[2Jname"), "").unwrap();
@@ -171,4 +173,21 @@ fn agent_undoes_only_agent_batches() {
 	let (v, _) = f.tool("history", json!({}));
 	assert_eq!(v["batches"][0]["source"], "human");
 	assert_eq!(v["batches"][1]["source"], "agent");
+}
+
+#[test]
+fn bad_input_lines_get_errors_and_the_session_goes_on() {
+	let mut f = Fixture::new(Approval::Terminal);
+	let mut input = b"\xff\xfe\n\n".to_vec();
+	input.extend(std::iter::repeat_n(b'x', tpfs_mcp::MAX_MESSAGE + 10));
+	input.extend_from_slice(b"\n{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}\n");
+	let mut out = Vec::new();
+	f.server.run(&input[..], &mut out).unwrap();
+	let replies: Vec<Value> =
+		String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+	assert_eq!(replies.len(), 3, "{replies:?}");
+	assert_eq!(replies[0]["error"]["code"], -32700);
+	assert_eq!(replies[1]["error"]["code"], -32600);
+	assert_eq!(replies[2]["id"], 9);
+	assert_eq!(replies[2]["result"], json!({}));
 }
