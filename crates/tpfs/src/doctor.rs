@@ -197,9 +197,17 @@ pub fn check(home: &Path, project: &Path, state: &Path) -> Vec<Finding> {
 		}
 	}
 
-	match tpfs_core::private_dir(state) {
-		Ok(()) => findings.push(ok(format!("state folder {} is private", state.display()))),
-		Err(e) => findings.push(fail(e.to_string())),
+	// Checked without creating it: a check changes nothing.
+	if !state.exists() {
+		findings.push(ok(format!(
+			"state folder {} does not exist yet; tpfs creates it private on first use",
+			state.display()
+		)));
+	} else {
+		match tpfs_core::private_dir(state) {
+			Ok(()) => findings.push(ok(format!("state folder {} is private", state.display()))),
+			Err(e) => findings.push(fail(e.to_string())),
+		}
 	}
 	findings
 }

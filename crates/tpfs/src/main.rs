@@ -698,10 +698,22 @@ fn present(validator: &Validator, plan: &Plan, source: Source) -> Option<(String
 }
 
 /// The operation list, totals and a trash line — the same for `check`, `apply`, `sync` and `approve`.
+/// Steps shown at once when a long plan is reviewed in a terminal.
+const PAGE: usize = 30;
+
 fn print_preview(plan: &Plan) {
 	// On a terminal, what goes to the trash or removes a folder stands out (as in the commander).
 	let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-	for line in plan.preview() {
+	// A long plan is shown a page at a time when someone is reading it, so no step scrolls past
+	// unseen before the question.
+	let paged = io::stdout().is_terminal() && io::stdin().is_terminal();
+	for (n, line) in plan.preview().into_iter().enumerate() {
+		if paged && n > 0 && n % PAGE == 0 {
+			print!("  -- {n} of {} steps shown; Enter for more --", plan.ops.len());
+			io::stdout().flush().ok();
+			let mut skip = String::new();
+			let _ = io::stdin().lock().read_line(&mut skip);
+		}
 		if color && (line.starts_with("TRASH") || line.starts_with("RMDIR")) {
 			println!("  \x1b[1;31m{line}\x1b[0m");
 		} else {

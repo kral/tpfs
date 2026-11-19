@@ -7,7 +7,10 @@
 //! `xargs`, `sh -c`, `find -exec` and one-line interpreter scripts), but a determined program can
 //! still change files in ways no command line shows.
 
-use std::io::{self, Read};
+use std::{
+	io::{self, Read},
+	path::{Path, PathBuf},
+};
 
 /// Commands that remove, move or rename files, as the first word of a command (Unix and Windows).
 const MUTATING: &[&str] = &[
@@ -57,13 +60,24 @@ const SCRIPT_CALLS: &[&str] = &[
 
 /// Why a shell command is refused, or `None` when it does not move, rename or remove files.
 pub fn verdict(command: &str) -> Option<String> {
-	segments(command).into_iter().find_map(|words| judge(&words, 0))
+	verdict_in(command, None)
+}
+
+/// As [`verdict`], and with the folder the command runs in (`cwd`), also refuse a command that
+/// would overwrite an existing file: a `>` redirection to it, or a `cp` onto it.
+pub fn verdict_in(command: &str, cwd: Option<&Path>) -> Option<String> {
+	segments(command).into_iter().find_map(|words| judge(&words, 0, cwd))
 }
 
 /// Judge one simple command (its words).
-fn judge(words: &[String], depth: usize) -> Option<String> {
+fn judge(words: &[String], depth: usize, cwd: Option<&Path>) -> Option<String> {
 	if depth > 4 {
 		return None;
+	}
+	if let Some(cwd) = cwd
+		&& let Some(why) = overwrites(words, cwd)
+	{
+		return Some(why);
 	}
 	let mut i = 0;
 	// Leading variable assignments and wrappers (with their own options) run what follows.
@@ -108,7 +122,7 @@ fn judge(words: &[String], depth: usize) -> Option<String> {
 				.iter()
 				.position(|w| matches!(w.to_ascii_lowercase().as_str(), "-c" | "/c" | "/k" | "-command" | "-c:"))?;
 			let line = words[script + 1..].join(" ");
-			segments(&line).into_iter().find_map(|w| judge(&w, depth + 1))
+			segments(&line).into_iter().find_map(|w| judge(&w, depth + 1, cwd))
 		}
 		"find" => {
 			if words.iter().any(|w| w == "-delete") {
@@ -116,7 +130,7 @@ fn judge(words: &[String], depth: usize) -> Option<String> {
 			}
 			// `find … -exec rm {} ;`
 			let exec = words.iter().position(|w| w == "-exec" || w == "-execdir" || w == "-ok")?;
-			judge(&words[exec + 1..], depth + 1)
+			judge(&words[exec + 1..], depth + 1, cwd)
 		}
 		"git" if words.get(1).is_some_and(|w| w == "clean") => refuse("git clean"),
 		"rsync" if words.iter().any(|w| w.starts_with("--delete") || w == "--remove-source-files") => {
@@ -129,6 +143,64 @@ fn judge(words: &[String], depth: usize) -> Option<String> {
 		}
 		_ => None,
 	}
+}
+
+/// An existing file this command would replace: the target of a `>` redirection (not `>>`), or
+/// what a copy lands on. A new file, a folder, and `/dev/null` (`NUL`) are fine.
+fn overwrites(words: &[String], cwd: &Path) -> Option<String> {
+	let existing_file = |target: &str| -> Option<PathBuf> {
+		if matches!(target.to_ascii_lowercase().as_str(), "/dev/null" | "nul" | "/dev/stdout" | "/dev/stderr" | "$null")
+		{
+			return None;
+		}
+		let p = match target.strip_prefix("~/") {
+			Some(rest) => {
+				std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)?.join(rest)
+			}
+			None => cwd.join(target),
+		};
+		p.is_file().then_some(p)
+	};
+	let refuse = |p: &Path, how: &str| {
+		Some(format!(
+			"{how} would overwrite the existing file {}. Write to a new file, or edit it with your file-editing tool; \
+			 to replace a file, move the old one aside with tpfs (propose_plan) first.",
+			p.display()
+		))
+	};
+	// Redirections: `>`, `1>`, `2>`, `&>`, `>|`, as a word of their own or glued to the target.
+	for (i, w) in words.iter().enumerate() {
+		let rest = w.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+		let Some(after) = rest.strip_prefix('>') else { continue };
+		if after.starts_with('>') || after.starts_with('&') {
+			continue; // append, or a descriptor duplication
+		}
+		let after = after.strip_prefix('|').unwrap_or(after);
+		let target = if after.is_empty() { words.get(i + 1).map(String::as_str) } else { Some(after) };
+		if let Some(p) = target.and_then(existing_file) {
+			return refuse(&p, "The `>` redirection");
+		}
+	}
+	// A copy onto an existing file (or onto a file of the same name in an existing folder).
+	let first = base(words.first()?);
+	if matches!(first.as_str(), "cp" | "copy" | "copy-item" | "cpi" | "xcopy") {
+		let args: Vec<&str> =
+			words[1..].iter().map(String::as_str).filter(|a| !a.starts_with('-') && !a.starts_with('/')).collect();
+		let (dest, sources) = args.split_last()?;
+		if let Some(p) = existing_file(dest) {
+			return refuse(&p, &format!("`{first}`"));
+		}
+		let dir = cwd.join(dest);
+		if dir.is_dir() {
+			for src in sources {
+				let name = Path::new(src).file_name()?;
+				if dir.join(name).is_file() {
+					return refuse(&dir.join(name), &format!("`{first}`"));
+				}
+			}
+		}
+	}
+	None
 }
 
 /// The command's name without a path or a Windows extension, lower case.
@@ -220,7 +292,9 @@ pub fn respond(input: &str) -> Option<String> {
 		return None;
 	}
 	let command = call.get("tool_input")?.get("command")?.as_str()?;
-	let reason = verdict(command)?;
+	// The folder the agent's shell is in (Claude Code sends it), for paths in the command.
+	let cwd = call.get("cwd").and_then(|c| c.as_str()).map(PathBuf::from).or_else(|| std::env::current_dir().ok());
+	let reason = verdict_in(command, cwd.as_deref())?;
 	Some(
 		serde_json::json!({
 			"hookSpecificOutput": {
@@ -287,6 +361,38 @@ mod tests {
 			"tpfs log",
 		] {
 			assert_eq!(verdict(cmd), None, "refused: {cmd}");
+		}
+	}
+
+	/// With the folder it runs in, a command that would overwrite an existing file is refused;
+	/// a new file, an append and `/dev/null` are fine.
+	#[test]
+	fn overwriting_an_existing_file_is_refused() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let cwd = tmp.path();
+		std::fs::write(cwd.join("notes.txt"), "mine").unwrap();
+		std::fs::create_dir(cwd.join("dir")).unwrap();
+		std::fs::write(cwd.join("dir").join("notes.txt"), "mine").unwrap();
+		for cmd in [
+			"echo x > notes.txt",
+			"echo x >notes.txt",
+			"cargo test 2> notes.txt",
+			"cmd &> notes.txt",
+			"cp a.txt notes.txt",
+			"cp -f other/notes.txt dir",
+			"Copy-Item x notes.txt",
+		] {
+			assert!(verdict_in(cmd, Some(cwd)).is_some(), "not refused: {cmd}");
+		}
+		for cmd in [
+			"echo x > new.txt",
+			"echo x >> notes.txt",
+			"cargo test > /dev/null 2>&1",
+			"cp notes.txt copy.txt",
+			"cp -r src dir2",
+			"ls 2>&1 | head",
+		] {
+			assert_eq!(verdict_in(cmd, Some(cwd)), None, "refused: {cmd}");
 		}
 	}
 
