@@ -104,7 +104,7 @@ fn agent_plans_are_approved_only_in_a_terminal_and_can_be_rejected() {
 	assert!(!server.store().is_approved(&server.store().get(&id).unwrap()));
 	assert_eq!(code(&tpfs(&home, &["reject", &id])), 0);
 	assert!(server.store().get(&id).is_err());
-	assert_eq!(code(&tpfs(&home, &["reject", "deadbeef"])), 1);
+	assert_eq!(code(&tpfs(&home, &["reject", "deadbeef"])), 2, "an unknown id is a usage error");
 }
 
 #[test]
@@ -231,4 +231,45 @@ fn a_missing_option_value_is_a_usage_error() {
 	for flag in ["--root", "--approve", "--home", "--source", "--approval", "--max-ops"] {
 		assert_eq!(code(&tpfs(&home, &["apply", "p.json", flag])), 2, "{flag}");
 	}
+}
+
+#[test]
+fn an_empty_plan_is_nothing_to_do_and_undo_points_to_recover_first() {
+	let tmp = tempfile::TempDir::new().unwrap();
+	let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+	let (root, home) = (base.join("root"), base.join("home"));
+	fs::create_dir(&root).unwrap();
+	let empty = base.join("empty.json");
+	fs::write(&empty, r#"{"ops":[]}"#).unwrap();
+	let o = tpfs(&home, &["apply", empty.to_str().unwrap(), "--root", root.to_str().unwrap()]);
+	assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+	assert!(String::from_utf8_lossy(&o.stdout).contains("Nothing to do"));
+
+	// An interrupted batch on top: undo names it and points to recover, without asking.
+	{
+		use tpfs_core::{Entry, Journal, Op};
+		tpfs_core::private_dir(&home).unwrap();
+		let mut j = Journal::open(home.join("journal.jsonl")).unwrap();
+		let dir = root.join("d");
+		j.append(&Entry::Begin {
+			batch: "1-cut".into(),
+			at: 0,
+			source: "human".into(),
+			reason: String::new(),
+			digest: String::new(),
+			v: 1,
+		})
+		.unwrap();
+		j.append(&Entry::Intent {
+			batch: "1-cut".into(),
+			index: 0,
+			forward: Op::Mkdir { path: dir.clone() },
+			inverse: Op::Rmdir { path: dir },
+		})
+		.unwrap();
+	}
+	let o = tpfs(&home, &["undo"]);
+	assert_eq!(code(&o), 1);
+	let err = String::from_utf8_lossy(&o.stderr);
+	assert!(err.contains("1-cut") && err.contains("tpfs recover"), "{err}");
 }

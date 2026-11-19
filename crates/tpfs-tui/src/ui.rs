@@ -63,8 +63,8 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
 	f.render_widget(Paragraph::new(status_line).style(Style::new().fg(Color::Gray).bg(Color::Black)), status);
 	draw_fkeys(f, fkeys);
 
-	if let Some(Dialog::Confirm { plan, risk, issues, offset, fits, seen_all }) = &mut app.dialog {
-		let view = draw_confirm(f, plan, risk, issues, *offset);
+	if let Some(Dialog::Confirm { plan, risk, issues, offset, fits, seen_all, summary }) = &mut app.dialog {
+		let view = draw_confirm(f, plan, risk, issues, summary, *offset);
 		*offset = view.offset;
 		*fits = view.fits;
 		*seen_all |= view.at_end;
@@ -251,25 +251,6 @@ fn op_lines(op: &tpfs_core::Op, width: usize) -> Vec<String> {
 	}
 }
 
-/// Totals per kind of operation, e.g. "3 move · 1 trash".
-fn totals(plan: &tpfs_core::Plan) -> String {
-	use tpfs_core::Op;
-	let mut counts = [0usize; 6];
-	for op in &plan.ops {
-		counts[match op {
-			Op::Move { .. } => 0,
-			Op::Copy { .. } => 1,
-			Op::Rename { .. } => 2,
-			Op::Trash { .. } => 3,
-			Op::Mkdir { .. } => 4,
-			Op::Rmdir { .. } => 5,
-			_ => continue,
-		}] += 1;
-	}
-	let names = ["move", "copy", "rename", "trash", "mkdir", "rmdir"];
-	counts.iter().zip(names).filter(|(n, _)| **n > 0).map(|(n, k)| format!("{n} {k}")).collect::<Vec<_>>().join(" · ")
-}
-
 /// The confirmation before anything changes. The risk, the totals and the keys are always on
 /// screen; the operation list scrolls in the space left. If even that does not fit, nothing can be
 /// approved and the dialog says so.
@@ -278,6 +259,7 @@ fn draw_confirm(
 	plan: &tpfs_core::Plan,
 	risk: &tpfs_core::risk::Risk,
 	issues: &[tpfs_core::Issue],
+	summary: &str,
 	offset: usize,
 ) -> ConfirmView {
 	use tpfs_core::risk::Level;
@@ -307,7 +289,7 @@ fn draw_confirm(
 		}
 		_ => (DIALOG.fg(Color::Red).add_modifier(Modifier::BOLD), format!("Risk: HIGH — {}", risk.reasons.join("; "))),
 	};
-	let mut foot: Vec<Line> = vec![Line::styled(truncate_right(&format!("Total: {}", totals(plan)), w), DIALOG)];
+	let mut foot: Vec<Line> = vec![Line::styled(truncate_right(summary, w), DIALOG)];
 	foot.extend(wrap(&risk_text, w).into_iter().map(|l| Line::styled(l, risk_style)));
 	// Only the visible window is formatted: a 10 000-operation plan costs nothing per redraw.
 	let line_count = |op: &tpfs_core::Op| match op {
@@ -364,7 +346,13 @@ fn draw_confirm(
 		}
 	};
 	if issues.is_empty() {
-		foot.push(Line::raw(truncate_right("Nothing is overwritten; Ctrl+Z undoes it.", w)));
+		let trashes = plan.ops.iter().any(|op| matches!(op, tpfs_core::Op::Trash { .. }));
+		let note = if trashes {
+			"Nothing is overwritten; trashed items stay in the trash; Ctrl+Z undoes it."
+		} else {
+			"Nothing is overwritten; Ctrl+Z undoes it."
+		};
+		foot.push(Line::raw(truncate_right(note, w)));
 	} else {
 		for i in issues.iter().take(shown_issues) {
 			foot.push(Line::styled(truncate_middle(&format!("✗ {i}"), w), DIALOG.fg(Color::Red)));

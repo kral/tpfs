@@ -31,9 +31,24 @@ pub(crate) struct Panel {
 
 impl Panel {
 	pub fn new(path: &Path) -> Self {
-		let cwd = tpfs_core::canonicalize(path).unwrap_or_else(|_| PathBuf::from("/"));
+		// A folder that cannot be opened falls back to the current one (or the first drive), and
+		// the panel says why instead of silently showing somewhere else.
+		let (cwd, failed) = match tpfs_core::canonicalize(path) {
+			Ok(c) => (c, None),
+			Err(e) => {
+				let fallback = std::env::current_dir()
+					.ok()
+					.and_then(|d| tpfs_core::canonicalize(&d).ok())
+					.or_else(|| tpfs_core::system_roots().into_iter().next())
+					.unwrap_or_else(|| PathBuf::from("/"));
+				(fallback, Some(format!("cannot open {}: {e}", tpfs_core::sanitize(path.as_os_str()))))
+			}
+		};
 		let mut p = Self { cwd, entries: vec![], cursor: 0, offset: 0, marked: HashSet::new(), error: None };
 		p.reload();
+		if failed.is_some() {
+			p.error = failed;
+		}
 		p
 	}
 

@@ -295,12 +295,23 @@ fn run(args: Args) -> Res {
 		"undo" => {
 			let (mut journal, trash) = open_state(&args)?;
 			let validator = any_validator(&args, &mut journal)?;
-			let last = journal
-				.batches()
-				.map_err(|e| e.to_string())?
-				.into_iter()
+			let batches = journal.batches().map_err(|e| e.to_string())?;
+			// The same choice as the engine: a newer interrupted batch must be recovered first, so
+			// do not offer an older one only to refuse it after the user said yes.
+			if let Some(b) = batches
+				.iter()
 				.rev()
-				.find(|b| b.status == BatchStatus::Committed);
+				.find(|b| !matches!(b.status, BatchStatus::Aborted | BatchStatus::Undone | BatchStatus::Abandoned))
+				&& b.status == BatchStatus::Incomplete
+			{
+				let id = tpfs_core::sanitize(b.id.as_ref());
+				return Err(if b.damaged {
+					format!("batch {id} is interrupted and its journal records are damaged; see `tpfs log`, then `tpfs recover --abandon {id}` if you accept the disk as it is").into()
+				} else {
+					format!("batch {id} was interrupted; run `tpfs recover` first (it rolls it back), then undo").into()
+				});
+			}
+			let last = batches.into_iter().rev().find(|b| b.status == BatchStatus::Committed);
 			if let Some(b) = &last
 				&& io::stdin().is_terminal()
 				&& io::stderr().is_terminal()
@@ -424,7 +435,7 @@ fn run(args: Args) -> Res {
 		"reject" => {
 			let id = plan_id(&args)?;
 			let store = tpfs_mcp::Store::new(&state_dir(&args)?);
-			store.get(&id).map_err(|e| e.to_string())?;
+			find_pending(&store, &id)?;
 			store.remove(&id).map_err(|e| e.to_string())?;
 			println!("Rejected {id}.");
 			Ok(ExitCode::SUCCESS)
@@ -437,6 +448,11 @@ fn check(args: &Args, apply: bool) -> Res {
 	let plan = read_plan(args.plan.as_deref().ok_or_else(|| usage("missing plan file (use - for stdin)"))?)?;
 	if args.roots.is_empty() {
 		return Err(usage("at least one --root <dir> is required"));
+	}
+	if plan.ops.is_empty() {
+		// Like `sync` and `undo` with nothing to do: not a rejection.
+		println!("Nothing to do: the plan has no operations.");
+		return Ok(ExitCode::SUCCESS);
 	}
 	let mut validator =
 		Validator::new(&args.roots).map_err(|e| root_error(&args.roots, e))?.with_protected([state_dir(args)?]);
@@ -453,8 +469,10 @@ fn check(args: &Args, apply: bool) -> Res {
 		println!("OK — the plan is valid.");
 		return Ok(ExitCode::SUCCESS);
 	}
+	// The state folder is checked before the question, not after the user said yes.
+	let state = open_state(args)?;
 	confirm(args, &digest, level)?;
-	execute(args, &validator, &plan)
+	execute(args, &validator, &plan, state)
 }
 
 /// Print the plan, its risk and digest, and any problems. `None` when the plan has problems.
@@ -466,10 +484,20 @@ fn present(validator: &Validator, plan: &Plan, source: Source) -> Option<(String
 	if !plan.reason.is_empty() {
 		println!("Plan: {}", tpfs_core::sanitize(plan.reason.as_ref()));
 	}
+	// On a terminal, what goes to the trash or removes a folder stands out (as in the commander).
+	let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
 	for line in plan.preview() {
-		println!("  {line}");
+		if color && (line.starts_with("TRASH") || line.starts_with("RMDIR")) {
+			println!("  \x1b[1;31m{line}\x1b[0m");
+		} else {
+			println!("  {line}");
+		}
 	}
-	println!("Total: {} operation(s): {}", plan.ops.len(), totals(plan));
+	println!("Total: {} operation(s): {}", plan.ops.len(), risk::totals_line(plan, ", "));
+	let trashed = plan.ops.iter().filter(|op| matches!(op, tpfs_core::Op::Trash { .. })).count();
+	if trashed > 0 {
+		println!("{trashed} item(s) go to the trash (nothing is deleted; `tpfs undo` puts them back).");
+	}
 	println!(
 		"Risk: {}{}",
 		level_word(risk.level),
@@ -496,34 +524,12 @@ fn level_word(level: Level) -> &'static str {
 	}
 }
 
-/// Counts per kind of operation, e.g. "3 move, 1 trash".
-fn totals(plan: &Plan) -> String {
-	let mut counts: Vec<(&str, usize)> = Vec::new();
-	for op in &plan.ops {
-		let k = op.to_string().split_whitespace().next().unwrap_or("").to_lowercase();
-		let k: &str = match k.as_str() {
-			"move" => "move",
-			"copy" => "copy",
-			"rename" => "rename",
-			"trash" => "trash",
-			"mkdir" => "mkdir",
-			_ => "rmdir",
-		};
-		match counts.iter_mut().find(|(n, _)| *n == k) {
-			Some((_, c)) => *c += 1,
-			None => counts.push((k, 1)),
-		}
-	}
-	counts.iter().map(|(k, c)| format!("{c} {k}")).collect::<Vec<_>>().join(", ")
-}
-
 fn root_error(roots: &[PathBuf], e: io::Error) -> Fail {
 	let shown: Vec<String> = roots.iter().map(|r| tpfs_core::sanitize(r.as_os_str())).collect();
 	usage(format!("--root {}: {e}", shown.join(", ")))
 }
 
-fn execute(args: &Args, validator: &Validator, plan: &Plan) -> Res {
-	let (mut journal, trash) = open_state(args)?;
+fn execute(args: &Args, validator: &Validator, plan: &Plan, (mut journal, trash): (Journal, PathBuf)) -> Res {
 	match Executor::new(validator, &mut journal, trash).execute(plan, args.source) {
 		Ok(b) => {
 			println!("Done: {} step(s), batch {}. Undo with `tpfs undo`.", b.steps, b.id);
@@ -586,8 +592,9 @@ fn sync(args: &Args) -> Res {
 		println!("Dry run. Apply with --apply, or non-interactively with --approve {digest}");
 		return Ok(ExitCode::SUCCESS);
 	}
+	let state = open_state(args)?;
 	confirm(args, &digest, level)?;
-	execute(args, &validator, &sp.plan)
+	execute(args, &validator, &sp.plan, state)
 }
 
 /// An approval is bound to the exact plan: either the digest is passed explicitly,
@@ -630,7 +637,7 @@ fn ask(prompt: &str) -> Result<String, Fail> {
 fn approve(args: &Args) -> Res {
 	let id = plan_id(args)?;
 	let store = tpfs_mcp::Store::new(&state_dir(args)?);
-	let pending = store.get(&id).map_err(|e| e.to_string())?;
+	let pending = find_pending(&store, &id)?;
 	if pending.plan.digest() != pending.digest {
 		return Err("the stored plan was modified after it was proposed; reject it".into());
 	}
@@ -651,7 +658,13 @@ fn approve(args: &Args) -> Res {
 		"Allowed folders: {}",
 		pending.roots.iter().map(|r| tpfs_core::sanitize(r.as_os_str())).collect::<Vec<_>>().join(", ")
 	);
-	println!("Risk: {} — {}", level_word(risk.level), risk.reasons.join("; "));
+	println!("Total: {} operation(s): {}", pending.plan.ops.len(), risk::totals_line(&pending.plan, ", "));
+	println!(
+		"Risk: {}{}",
+		level_word(risk.level),
+		if risk.reasons.is_empty() { String::new() } else { format!(" — {}", risk.reasons.join("; ")) }
+	);
+	println!("Digest: {}", pending.digest);
 	if !issues.is_empty() {
 		println!("Problems:");
 		for i in &issues {
@@ -669,6 +682,14 @@ fn approve(args: &Args) -> Res {
 	store.approve(&pending).map_err(|e| e.to_string())?;
 	println!("Approved. The agent can now call apply_plan for {id}.");
 	Ok(ExitCode::SUCCESS)
+}
+
+/// A pending plan by id; an unknown id is a usage error that points to the list.
+fn find_pending(store: &tpfs_mcp::Store, id: &str) -> Result<tpfs_mcp::Pending, Fail> {
+	store.get(id).map_err(|e| match e.kind() {
+		io::ErrorKind::NotFound | io::ErrorKind::InvalidInput => usage(format!("{e} (see `tpfs pending`)")),
+		_ => e.to_string().into(),
+	})
 }
 
 fn plan_id(args: &Args) -> Result<String, Fail> {

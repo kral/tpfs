@@ -44,7 +44,8 @@ pub fn run(left: PathBuf, right: PathBuf, state: PathBuf, options: Options) -> i
 		let _ = execute!(io::stdout(), DisableMouseCapture);
 		restore(info);
 	}));
-	execute!(io::stdout(), EnableMouseCapture)?;
+	// Mouse support is a convenience: a terminal that refuses it still gets the commander.
+	let _ = execute!(io::stdout(), EnableMouseCapture);
 	let result = (|| -> io::Result<()> {
 		while !app.quit {
 			terminal.draw(|f| ui::draw(f, &mut app))?;
@@ -55,18 +56,19 @@ pub fn run(left: PathBuf, right: PathBuf, state: PathBuf, options: Options) -> i
 			}
 
 			if let Some(external) = app.external.take() {
-				execute!(io::stdout(), DisableMouseCapture)?;
+				let _ = execute!(io::stdout(), DisableMouseCapture);
 				ratatui::restore();
 				let outcome = run_external(external);
 				terminal = ratatui::init();
-				execute!(io::stdout(), EnableMouseCapture)?;
+				let _ = execute!(io::stdout(), EnableMouseCapture);
 				terminal.clear()?;
 				app.after_external(outcome);
 			}
 		}
 		Ok(())
 	})();
-	execute!(io::stdout(), DisableMouseCapture)?;
+	// Always give the terminal back, whatever failed above.
+	let _ = execute!(io::stdout(), DisableMouseCapture);
 	ratatui::restore();
 	result
 }

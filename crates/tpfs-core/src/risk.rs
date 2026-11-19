@@ -120,3 +120,95 @@ fn crosses_devices(from: &Path, to: &Path) -> bool {
 		None => false,
 	}
 }
+
+/// How many operations of one kind a plan has, and how much data they move, copy or trash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Total {
+	/// `move`, `copy`, `rename`, `trash`, `mkdir` or `rmdir`.
+	pub kind: &'static str,
+	pub count: usize,
+	/// Bytes of the sources (files and whole folders), for move, copy and trash.
+	pub bytes: u64,
+	/// The size is a lower bound: a folder was too big to measure in full.
+	pub more: bool,
+}
+
+/// Per-kind totals of a plan in a fixed order, with the bytes each kind touches. Folders are
+/// measured without following links, up to a bounded number of entries per plan.
+pub fn totals(plan: &Plan) -> Vec<Total> {
+	const KINDS: [&str; 6] = ["move", "copy", "rename", "trash", "mkdir", "rmdir"];
+	let mut out: Vec<Total> = KINDS.iter().map(|&kind| Total { kind, count: 0, bytes: 0, more: false }).collect();
+	let mut budget = 200_000usize;
+	for op in &plan.ops {
+		let (i, source) = match op {
+			Op::Move { from, .. } => (0, Some(from)),
+			Op::Copy { from, .. } => (1, Some(from)),
+			Op::Rename { .. } => (2, None),
+			Op::Trash { path } => (3, Some(path)),
+			Op::Mkdir { .. } => (4, None),
+			Op::Rmdir { .. } => (5, None),
+		};
+		out[i].count += 1;
+		if let Some(p) = source {
+			let (bytes, complete) = tree_bytes(p, &mut budget);
+			out[i].bytes += bytes;
+			out[i].more |= !complete;
+		}
+	}
+	out.retain(|t| t.count > 0);
+	out
+}
+
+fn tree_bytes(path: &Path, budget: &mut usize) -> (u64, bool) {
+	let Ok(m) = fs::symlink_metadata(path) else { return (0, true) };
+	if !m.is_dir() {
+		return (m.len(), true);
+	}
+	let mut total = 0u64;
+	let mut stack = vec![path.to_path_buf()];
+	while let Some(dir) = stack.pop() {
+		let Ok(rd) = fs::read_dir(&dir) else { continue };
+		for e in rd.flatten() {
+			if *budget == 0 {
+				return (total, false);
+			}
+			*budget -= 1;
+			match e.file_type() {
+				Ok(t) if t.is_dir() => stack.push(e.path()),
+				Ok(t) if t.is_file() => total += e.metadata().map_or(0, |m| m.len()),
+				_ => {}
+			}
+		}
+	}
+	(total, true)
+}
+
+/// A size in the units people read: "512 B", "4.1 MB", "2.3 GB" (decimal, like file managers).
+pub fn human_bytes(bytes: u64) -> String {
+	const UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
+	if bytes < 1000 {
+		return format!("{bytes} B");
+	}
+	let mut v = bytes as f64 / 1000.0;
+	let mut unit = 0;
+	while v >= 1000.0 && unit < UNITS.len() - 1 {
+		v /= 1000.0;
+		unit += 1;
+	}
+	format!("{v:.1} {}", UNITS[unit])
+}
+
+/// Totals as one line: "2 copy (4.1 MB) · 1 trash (12 B)".
+pub fn totals_line(plan: &Plan, separator: &str) -> String {
+	totals(plan)
+		.iter()
+		.map(|t| match t.kind {
+			"move" | "copy" | "trash" => {
+				format!("{} {} ({}{})", t.count, t.kind, human_bytes(t.bytes), if t.more { "+" } else { "" })
+			}
+			_ => format!("{} {}", t.count, t.kind),
+		})
+		.collect::<Vec<_>>()
+		.join(separator)
+}

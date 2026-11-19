@@ -27,6 +27,8 @@ pub(crate) enum Dialog {
 		fits: bool,
 		/// …and every operation line has been on screen at least once.
 		seen_all: bool,
+		/// Totals with sizes and the short digest, worked out once when the dialog opens.
+		summary: String,
 	},
 	Input {
 		title: &'static str,
@@ -316,7 +318,12 @@ impl App {
 		}
 		let issues = self.validator().validate(&plan);
 		let risk = risk::assess(&plan, Source::Human);
-		self.dialog = Some(Dialog::Confirm { plan, risk, issues, offset: 0, fits: false, seen_all: false });
+		let summary = format!(
+			"Total: {}   Digest: {}",
+			tpfs_core::risk::totals_line(&plan, " · "),
+			plan.digest().get(..12).unwrap_or_default()
+		);
+		self.dialog = Some(Dialog::Confirm { plan, risk, issues, offset: 0, fits: false, seen_all: false, summary });
 	}
 
 	fn on_dialog_key(&mut self, key: KeyEvent) {
@@ -352,7 +359,14 @@ impl App {
 							);
 						}
 						if sp.plan.ops.is_empty() {
-							self.status = "Nothing to sync.".into();
+							self.status = if sp.skipped.is_empty() {
+								"Nothing to sync.".into()
+							} else {
+								format!(
+									"Nothing to sync; {} item(s) left alone (conflicts or against the direction).",
+									sp.skipped.len()
+								)
+							};
 						} else {
 							self.propose(sp.plan);
 						}
@@ -413,7 +427,7 @@ impl App {
 			}
 			// Only Low risk proceeds on Enter. Medium needs a deliberate `y`; High needs `y` after
 			// every operation has been on screen. Nothing proceeds if the dialog does not fit.
-			(Some(Dialog::Confirm { plan, risk, issues, mut offset, fits, seen_all }), code) => {
+			(Some(Dialog::Confirm { plan, risk, issues, mut offset, fits, seen_all, summary }), code) => {
 				let ok = issues.is_empty() && fits;
 				let level = risk.level;
 				match code {
@@ -429,7 +443,7 @@ impl App {
 					KeyCode::End => offset = usize::MAX / 2,
 					_ => {}
 				}
-				self.dialog = Some(Dialog::Confirm { plan, risk, issues, offset, fits, seen_all });
+				self.dialog = Some(Dialog::Confirm { plan, risk, issues, offset, fits, seen_all, summary });
 			}
 			(Some(Dialog::Input { title, mut value, kind }), code) => match code {
 				KeyCode::Enter => self.submit_input(&value, &kind),
