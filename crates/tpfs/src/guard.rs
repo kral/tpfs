@@ -38,6 +38,9 @@ const MUTATING: &[&str] = &[
 /// Words that run the rest of the line as a command.
 const WRAPPERS: &[&str] =
 	&["sudo", "doas", "env", "nohup", "time", "command", "exec", "nice", "xargs", "busybox", "builtin"];
+/// Wrapper options followed by a value (`sudo -u bob`, `env -u NAME`, `xargs -n 1`).
+const VALUE_OPTIONS: &[&str] =
+	&["-u", "-g", "-U", "-C", "-D", "-h", "-p", "-r", "-t", "-n", "-I", "-L", "-P", "-s", "-d", "-E", "-a"];
 /// Interpreters whose one-line scripts are checked for file removal and renaming calls.
 const INTERPRETERS: &[&str] = &["python", "python3", "python2", "node", "deno", "bun", "perl", "ruby", "php"];
 /// Calls in such scripts that remove or rename files.
@@ -85,15 +88,7 @@ fn judge(words: &[String], depth: usize, cwd: Option<&Path>) -> Option<String> {
 	while let Some(w) = words.get(i) {
 		if after_wrapper && w.starts_with('-') {
 			// A wrapper's option; some take a value (`sudo -u bob`, `env -u NAME`, `xargs -n 1`).
-			let with_value = matches!(
-				w.as_str(),
-				"-u" | "-g"
-					| "-U" | "-C" | "-D"
-					| "-h" | "-p" | "-r"
-					| "-t" | "-n" | "-I"
-					| "-L" | "-P" | "-s"
-					| "-d" | "-E" | "-a"
-			);
+			let with_value = VALUE_OPTIONS.contains(&w.as_str());
 			i += if with_value { 2 } else { 1 };
 		} else if WRAPPERS.contains(&base(w).as_str()) {
 			after_wrapper = true;
