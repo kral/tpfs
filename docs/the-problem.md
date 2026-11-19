@@ -78,7 +78,7 @@ files, and backups are only as fresh as the last run.
 | A failed step is treated as a success | Each step is checked again right before it runs; a failed step stops the batch and the steps before it are rolled back. |
 | Quiet deletions noticed days later | Every batch is in `tpfs log`: who proposed it (person or agent), why, each step and its undo. |
 | One-command-at-a-time approval misses the dangerous one | The agent proposes the **whole plan**; a person approves exactly that plan, by its digest, in their own terminal. Agent plans are always HIGH risk. |
-| Checkpoints miss shell changes | When tpfs is the agent's only file tool (its shell file commands denied), every file change goes through the journal and is undoable. |
+| Checkpoints miss shell changes | When tpfs is the agent's only file tool (its shell file commands refused by `tpfs guard`, see [Agent setup](agent-setup.md)), every file change goes through the journal and is undoable. |
 | A crash or reboot mid-operation | The write-ahead journal records each step's inverse before the step; `tpfs recover` rolls an interrupted batch back. |
 
 What tpfs does not cover: changes an agent makes through other tools it is given (a shell, an

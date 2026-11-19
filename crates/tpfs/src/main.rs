@@ -1,3 +1,6 @@
+mod doctor;
+mod guard;
+
 use std::{
 	ffi::OsString,
 	fs,
@@ -46,6 +49,11 @@ USAGE:
   tpfs pending                                  list plans proposed by agents
   tpfs approve <planId>                         review and approve an agent's plan (interactive)
   tpfs reject <planId>                          discard an agent's plan
+  tpfs guard                                    hook for AI agents (Claude Code, Cursor): refuses shell
+                                                  commands that move, rename or delete files and points
+                                                  the agent to tpfs (reads the tool call on stdin)
+  tpfs doctor [<project>]                       check an AI agent setup: tpfs MCP server, terminal
+                                                  approval, `tpfs guard` hook, no blanket shell allow
 
 OPTIONS:
   --home <dir>    state directory (journal, trash). Default: $TPFS_HOME, else
@@ -123,6 +131,8 @@ fn allowed(command: &str) -> Option<(&'static [&'static str], usize)> {
 		"recover" => (&["home", "abandon"], 0),
 		"mcp" => (&["root", "approval", "home"], 0),
 		"approve" | "reject" => (&["home"], 1),
+		"guard" => (&[], 0),
+		"doctor" => (&["home"], 1),
 		_ => return None,
 	})
 }
@@ -299,6 +309,42 @@ fn run(args: Args) -> Res {
 	match args.command.as_str() {
 		"schema" => {
 			println!("{}", serde_json::to_string_pretty(&Plan::schema()).map_err(|e| e.to_string())?);
+			Ok(ExitCode::SUCCESS)
+		}
+		"guard" => {
+			guard::run_hook().map_err(|e| e.to_string())?;
+			Ok(ExitCode::SUCCESS)
+		}
+		"doctor" => {
+			let project = match &args.plan {
+				Some(p) => PathBuf::from(p),
+				None => std::env::current_dir().map_err(|e| e.to_string())?,
+			};
+			let project = std::path::absolute(&project).map_err(|e| e.to_string())?;
+			let home = std::env::var_os("HOME")
+				.or_else(|| std::env::var_os("USERPROFILE"))
+				.map(PathBuf::from)
+				.ok_or("cannot tell the home folder (HOME or USERPROFILE)")?;
+			let findings = doctor::check(&home, &project, &state_dir(&args)?);
+			for f in &findings {
+				let mark = match f.level {
+					doctor::Level::Ok => "ok  ",
+					doctor::Level::Warn => "warn",
+					doctor::Level::Fail => "FAIL",
+				};
+				for (i, line) in f.text.lines().enumerate() {
+					let line = tpfs_core::sanitize(line.as_ref());
+					if i == 0 { println!("{mark}  {line}") } else { println!("      {line}") }
+				}
+			}
+			let failed = findings.iter().filter(|f| f.level == doctor::Level::Fail).count();
+			if failed > 0 {
+				println!(
+					"\n{failed} problem(s): the agent can still change files outside tpfs or without your approval."
+				);
+				return Ok(ExitCode::from(1));
+			}
+			println!("\nThe agent's file changes go through tpfs and need your approval.");
 			Ok(ExitCode::SUCCESS)
 		}
 		"check" => check(&args, false),

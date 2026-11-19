@@ -291,6 +291,8 @@ A walk-through is in [Recover after a crash](use-cases/recover-after-a-crash.md)
 
 ```text
 tpfs mcp --root <dir>... [--approval terminal|client]
+tpfs guard
+tpfs doctor [<project>]
 ```
 
 Runs the MCP server on stdin and stdout for an AI agent. Details are in [MCP server](mcp.md).
@@ -358,3 +360,24 @@ Removes a pending plan, approved or not, so the agent can no longer apply it:
 - Plans use Windows paths, for example `"C:\\Users\\you\\Downloads\\a.pdf"` (a backslash is doubled
   in JSON).
 - The `tpfs approve` command an agent shows you is quoted for PowerShell.
+
+## tpfs guard
+
+```text
+tpfs guard
+```
+
+A PreToolUse hook for AI coding agents: reads the proposed tool call as JSON on stdin and, for a
+shell command that moves, renames or deletes files, prints a refusal that points the agent to tpfs.
+Prints nothing for other commands. Always exits 0. See [Agent setup](agent-setup.md).
+
+## tpfs doctor
+
+```text
+tpfs doctor [<project>]
+```
+
+Checks that an agent's setup for `<project>` (default: the current folder) routes file changes
+through tpfs: the MCP server with terminal approval, the `tpfs guard` hook, no blanket shell allow
+rule, a private state folder. Exit 0 when nothing failed, 1 otherwise. See
+[Agent setup](agent-setup.md#check-the-setup).

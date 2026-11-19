@@ -69,6 +69,7 @@ tpfs
 - [Concepts](docs/concepts.md): plans, validation, risk, digest, journal, trash, roots, state folder
 - [Command line](docs/cli.md): every command, flag and exit code
 - [Commander (TUI)](docs/tui.md): keys and workflow of the two-panel file manager
+- [Agent setup](docs/agent-setup.md): Claude Code and Cursor, the `tpfs guard` hook, `tpfs doctor`
 - [MCP server](docs/mcp.md): let an AI agent propose plans that you approve
 - [Plan format](docs/plan-format.md): the plan JSON
 - [Use cases](docs/use-cases/README.md): worked examples

@@ -207,8 +207,8 @@ flowchart TB
 
 ## How to set it up
 
-Give the agent tpfs for file work and keep its shell out of it (or deny `rm`, `mv`, `del` and
-friends in the agent's own permissions):
+Give the agent tpfs for file work and keep its shell out of it with the `tpfs guard` hook (full
+setup and `tpfs doctor` in [Agent setup](../agent-setup.md)):
 
 ```json
 {

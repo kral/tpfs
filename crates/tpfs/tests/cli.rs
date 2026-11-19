@@ -403,3 +403,28 @@ fn mcp_refuses_a_shared_state_folder_at_start() {
 	assert!(err.contains("chmod 700") && !err.contains("serving"), "{err}");
 	assert!(o.stdout.is_empty());
 }
+
+/// `tpfs guard` as Claude Code runs it: the tool call on stdin, a refusal on stdout for a shell
+/// command that deletes files, nothing for anything else, exit 0 either way.
+#[test]
+fn guard_refuses_file_deleting_shell_commands() {
+	use std::io::Write;
+	let run = |input: &str| {
+		let mut child = Command::new(env!("CARGO_BIN_EXE_tpfs"))
+			.arg("guard")
+			.stdin(Stdio::piped())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()
+			.unwrap();
+		child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+		child.wait_with_output().unwrap()
+	};
+	let o = run(r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf tests/ patches/ plan/ ~/"}}"#);
+	assert_eq!(code(&o), 0);
+	let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+	assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+	let o = run(r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"cargo test"}}"#);
+	assert_eq!(code(&o), 0);
+	assert!(o.stdout.is_empty());
+}
