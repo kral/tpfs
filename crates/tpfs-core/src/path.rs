@@ -153,6 +153,40 @@ pub fn check_private_file(path: &Path) -> io::Result<()> {
 	Ok(())
 }
 
+/// Identity of the file system (volume) holding `path`, judged on the path itself (a final symlink
+/// is not followed) or its nearest existing ancestor. On Windows: the drive or share prefix.
+/// The one helper for "same file system?" questions in validation, risk and the trash.
+pub(crate) fn device_of(path: &Path) -> Option<u64> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::MetadataExt;
+		path.ancestors().find_map(|a| fs::symlink_metadata(a).ok()).map(|m| m.dev())
+	}
+	#[cfg(windows)]
+	{
+		use std::hash::{Hash, Hasher};
+		let mut h = std::collections::hash_map::DefaultHasher::new();
+		match path.components().next() {
+			Some(std::path::Component::Prefix(pre)) => pre.as_os_str().to_ascii_uppercase().hash(&mut h),
+			_ => return None,
+		}
+		Some(h.finish())
+	}
+	#[cfg(not(any(unix, windows)))]
+	{
+		let _ = path;
+		None
+	}
+}
+
+/// Whether `from` and `target_dir` are on different file systems (unknown counts as the same).
+pub(crate) fn crosses_devices(from: &Path, target_dir: &Path) -> bool {
+	match (device_of(from), device_of(target_dir)) {
+		(Some(a), Some(b)) => a != b,
+		_ => false,
+	}
+}
+
 /// Whether something exists at `path` without following a final symlink.
 pub(crate) fn exists(path: &Path) -> bool {
 	fs::symlink_metadata(path).is_ok()

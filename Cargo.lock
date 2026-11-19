@@ -932,7 +932,7 @@ checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
 
 [[package]]
 name = "tpfs"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "lexopt",
  "libc",
@@ -945,7 +945,7 @@ dependencies = [
 
 [[package]]
 name = "tpfs-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "crc32fast",
  "libc",
@@ -955,12 +955,13 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tpfs-core",
  "windows-sys",
 ]
 
 [[package]]
 name = "tpfs-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -970,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "tpfs-tui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "ratatui",

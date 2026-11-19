@@ -1,0 +1,149 @@
+{
+  "$defs": {
+    "Op": {
+      "description": "One file operation. Paths are absolute; `to` is the full destination path, not a folder to drop into.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Move a file or directory.",
+          "properties": {
+            "from": {
+              "type": "string"
+            },
+            "op": {
+              "const": "move",
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "from",
+            "to"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Copy a file or directory (recursively). Never overwrites.",
+          "properties": {
+            "from": {
+              "type": "string"
+            },
+            "op": {
+              "const": "copy",
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "from",
+            "to"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Rename in place. `newName` is a bare file name.",
+          "properties": {
+            "newName": {
+              "type": "string"
+            },
+            "op": {
+              "const": "rename",
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "path",
+            "newName"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Move to the journaled trash (undoable). There is no permanent delete.",
+          "properties": {
+            "op": {
+              "const": "trash",
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Create a directory.",
+          "properties": {
+            "op": {
+              "const": "mkdir",
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Remove an empty directory.",
+          "properties": {
+            "op": {
+              "const": "rmdir",
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "path"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "An ordered list of operations plus a short human-readable reason.\nUnknown fields are rejected: an agent that invents an option such as `force` must learn that it\ndoes not exist, instead of believing it took effect.",
+  "properties": {
+    "ops": {
+      "items": {
+        "$ref": "#/$defs/Op"
+      },
+      "type": "array"
+    },
+    "reason": {
+      "default": "",
+      "type": "string"
+    }
+  },
+  "required": [
+    "ops"
+  ],
+  "title": "Plan",
+  "type": "object"
+}

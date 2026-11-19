@@ -242,7 +242,7 @@ fn list(dir: &Path, budget: &mut usize) -> io::Result<(BTreeMap<std::ffi::OsStri
 	for entry in rd {
 		let entry = entry?;
 		// tpfs's own working entries (a volume's trash, partial copies) are never synced.
-		if entry.file_name().to_str().is_some_and(|n| n.starts_with(".tpfs-")) {
+		if crate::validate::is_own_name(&entry.file_name()) {
 			continue;
 		}
 		if *budget == 0 {

@@ -119,26 +119,31 @@ impl<'a> Executor<'a> {
 		Self { validator, journal, trash, hook: None }
 	}
 
-	/// Test hook, to simulate another program changing the file system mid-plan or a crash.
-	#[doc(hidden)]
-	pub fn hook(mut self, hook: impl FnMut(usize, Phase) + 'a) -> Self {
+	/// Test hook (feature `test-support`), to simulate another program changing the file system
+	/// mid-plan or a crash.
+	#[cfg(feature = "test-support")]
+	pub fn hook(self, hook: impl FnMut(usize, Phase) + 'a) -> Self {
+		self.set_hook(hook)
+	}
+
+	fn set_hook(mut self, hook: impl FnMut(usize, Phase) + 'a) -> Self {
 		self.hook = Some(Box::new(hook));
 		self
 	}
 
 	/// Progress: called with the number of steps done after each step that changed the disk.
 	pub fn on_step_done(self, mut f: impl FnMut(usize) + 'a) -> Self {
-		self.hook(move |i, phase| {
+		self.set_hook(move |i, phase| {
 			if phase == Phase::AfterApply {
 				f(i + 1)
 			}
 		})
 	}
 
-	/// Test hook that runs only before a step touches the disk.
-	#[doc(hidden)]
+	/// Test hook (feature `test-support`) that runs only before a step touches the disk.
+	#[cfg(feature = "test-support")]
 	pub fn before_apply(self, mut hook: impl FnMut(usize) + 'a) -> Self {
-		self.hook(move |i, phase| {
+		self.set_hook(move |i, phase| {
 			if phase == Phase::BeforeApply {
 				hook(i)
 			}
@@ -169,7 +174,7 @@ impl<'a> Executor<'a> {
 		}
 
 		let batch = new_batch_id();
-		self.journal.append(&Entry::Begin {
+		self.journal.write(&Entry::Begin {
 			batch: batch.clone(),
 			at: now_secs(),
 			source: source.as_str().into(),
@@ -191,11 +196,11 @@ impl<'a> Executor<'a> {
 
 			if let Some(issue) = recheck.into_iter().next() {
 				let rollback_errors = self.revert(&fs, &applied, &batch);
-				self.journal.append(&Entry::Abort { batch })?;
+				self.journal.write(&Entry::Abort { batch })?;
 				return Err(ExecError::Failed { step: i, error: issue.message, rollback_errors });
 			}
 
-			self.journal.append(&Entry::Intent {
+			self.journal.write(&Entry::Intent {
 				batch: batch.clone(),
 				index: i,
 				forward: op.clone(),
@@ -218,7 +223,7 @@ impl<'a> Executor<'a> {
 			let result = {
 				let journal = &mut self.journal;
 				let mut publish = || {
-					journal.append(&Entry::Published { batch: batch.clone(), index: i })?;
+					journal.write(&Entry::Published { batch: batch.clone(), index: i })?;
 					published.set(true);
 					Ok(())
 				};
@@ -235,7 +240,7 @@ impl<'a> Executor<'a> {
 						Op::Copy { to, .. } => normalize(to).and_then(|t| fingerprint(&t)),
 						_ => None,
 					};
-					self.journal.append(&Entry::Done { batch: batch.clone(), index: i, check, mode })?;
+					self.journal.write(&Entry::Done { batch: batch.clone(), index: i, check, mode })?;
 					applied.push(inverse);
 				}
 				Err(error) => {
@@ -248,13 +253,13 @@ impl<'a> Executor<'a> {
 						}
 					}
 					rollback_errors.extend(self.revert(&fs, &applied, &batch));
-					self.journal.append(&Entry::Abort { batch })?;
+					self.journal.write(&Entry::Abort { batch })?;
 					return Err(ExecError::Failed { step: i, error: clean(format!("{op}: {error}")), rollback_errors });
 				}
 			}
 		}
 
-		self.journal.append(&Entry::Commit { batch: batch.clone() })?;
+		self.journal.write(&Entry::Commit { batch: batch.clone() })?;
 		Ok(BatchReport { id: batch, steps: applied.len() })
 	}
 
@@ -275,7 +280,10 @@ impl<'a> Executor<'a> {
 			return Err(ExecError::Undo {
 				batch: b.id.clone(),
 				error: if b.damaged {
-					"its journal records are damaged; fix it by hand (see `tpfs log`)".into()
+					format!(
+						"its journal records are damaged; see `tpfs log`, and if you accept the disk as it is: `tpfs recover --abandon {}`",
+						b.id
+					)
 				} else {
 					"it was interrupted and must be rolled back first (`tpfs recover`)".into()
 				},
@@ -298,11 +306,11 @@ impl<'a> Executor<'a> {
 			self.check_journaled(&step.inverse).map_err(fail)?;
 			self.copy_unchanged(step).map_err(fail)?;
 			self.replay(&fs, &batch.id, "undo", step).map_err(|e| fail(clean(format!("{}: {e}", step.inverse))))?;
-			self.journal.append(&Entry::UndoStep { batch: batch.id.clone(), index: step.index })?;
+			self.journal.write(&Entry::UndoStep { batch: batch.id.clone(), index: step.index })?;
 			reverted += 1;
 		}
 
-		self.journal.append(&Entry::Undo { batch: batch.id.clone() })?;
+		self.journal.write(&Entry::Undo { batch: batch.id.clone() })?;
 		Ok(Some(BatchReport { id: batch.id, steps: reverted }))
 	}
 
@@ -358,7 +366,7 @@ impl<'a> Executor<'a> {
 						Ok(())
 					});
 				}
-				remove_part(&part)?;
+				remove_part(fs, &part)?;
 			}
 			Op::Trash { path } => {
 				let slot = trash_slot(&self.trash, &label, step.index, &n(path));
@@ -371,7 +379,7 @@ impl<'a> Executor<'a> {
 						Ok(())
 					});
 				}
-				remove_part(&part)?;
+				remove_part(fs, &part)?;
 			}
 			Op::Rename { path, new_name } => {
 				let tmp = case_tmp(&n(path), &t);
@@ -386,7 +394,7 @@ impl<'a> Executor<'a> {
 			return Ok(());
 		}
 		let journal = &mut self.journal;
-		let mut publish = || journal.append(&Entry::UndoPublished { batch: batch.to_owned(), index: step.index });
+		let mut publish = || journal.write(&Entry::UndoPublished { batch: batch.to_owned(), index: step.index });
 		apply(&step.inverse, fs, &self.trash, &label, step.index, None, &mut publish)?;
 		// Restore a removed folder's own permissions, not the default ones.
 		#[cfg(unix)]
@@ -424,8 +432,8 @@ impl<'a> Executor<'a> {
 			}
 			if all[i + 1..].iter().any(|later| later.status == BatchStatus::Committed) {
 				report.errors.push(format!(
-					"batch {} was interrupted before newer changes were made; it is not rolled back automatically",
-					b.id
+					"batch {} was interrupted before newer changes were made; it is not rolled back automatically (see `tpfs log`; to accept the disk as it is: `tpfs recover --abandon {}`)",
+					b.id, b.id
 				));
 			} else {
 				batches.push(b.clone());
@@ -437,18 +445,21 @@ impl<'a> Executor<'a> {
 		Ok(report)
 	}
 
-	/// Give up on an interrupted batch without rolling it back: record it as aborted, leaving the
+	/// Give up on an interrupted (or damaged) batch without rolling it back: record it as aborted, leaving the
 	/// disk as it is. For a batch recovery cannot handle (damaged records, or newer changes on top);
 	/// the caller should have shown the user what it did (`tpfs log`).
 	pub fn abandon(&mut self, id: &str) -> Result<(), ExecError> {
 		let batches = self.journal.batches()?;
 		match batches.iter().find(|b| b.id == id) {
-			Some(b) if b.status == BatchStatus::Incomplete => {
-				self.journal.append(&Entry::Abandon { batch: id.to_owned() })?;
+			Some(b) if b.status == BatchStatus::Incomplete || (b.damaged && b.status == BatchStatus::Committed) => {
+				self.journal.write(&Entry::Abandon { batch: id.to_owned() })?;
 				Ok(())
 			}
-			Some(_) => Err(ExecError::Blocked(format!("batch {id} is not interrupted; nothing to abandon"))),
-			None => Err(ExecError::Blocked(format!("no batch {id} in the journal"))),
+			Some(_) => Err(ExecError::Blocked(format!(
+				"batch {} is neither interrupted nor damaged; nothing to abandon",
+				crate::sanitize(id.as_ref())
+			))),
+			None => Err(ExecError::Blocked(format!("no batch {} in the journal", crate::sanitize(id.as_ref())))),
 		}
 	}
 
@@ -498,7 +509,7 @@ impl<'a> Executor<'a> {
 				}
 			}
 			if errors.is_empty() {
-				self.journal.append(&Entry::Abort { batch: batch.id.clone() })?;
+				self.journal.write(&Entry::Abort { batch: batch.id.clone() })?;
 				report.rolled_back.push(batch.id);
 			} else {
 				// Left incomplete: fix the cause and run recover again; finished steps are skipped.
@@ -757,7 +768,7 @@ impl fmt::Display for Fix {
 fn apply_fix(fix: &Fix, fs: &Fs, trash: &Path, batch: &str, index: usize) -> io::Result<()> {
 	match fix {
 		Fix::Op(op) => apply(op, fs, trash, batch, index, None, &mut || Ok(())),
-		Fix::RemovePart(part) => remove_part(part),
+		Fix::RemovePart(part) => remove_part(fs, part),
 		Fix::MergeBack { target, source } => merge_back(fs, target, source, &tag(batch, index), &mut |rest| {
 			apply(&Op::Trash { path: rest.to_path_buf() }, fs, trash, batch, index, None, &mut || Ok(()))
 		}),

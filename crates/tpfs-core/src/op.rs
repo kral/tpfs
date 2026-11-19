@@ -7,7 +7,7 @@ use crate::display::sanitize;
 
 /// One file operation. Paths are absolute; `to` is the full destination path, not a folder to drop into.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "op", rename_all = "lowercase", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum Op {
@@ -33,7 +33,7 @@ pub enum Op {
 /// Unknown fields are rejected: an agent that invents an option such as `force` must learn that it
 /// does not exist, instead of believing it took effect.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Plan {
 	pub ops: Vec<Op>,
@@ -77,10 +77,10 @@ impl Plan {
 		Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 	}
 
-	#[cfg(feature = "schema")]
-	/// JSON Schema of a plan, generated from the Rust types so prompts and code never drift apart.
+	/// JSON Schema of a plan, for prompts and MCP tool definitions. Shipped as a file (no schema
+	/// generator in the binary); a test keeps it equal to what the Rust types generate.
 	pub fn schema() -> serde_json::Value {
-		serde_json::to_value(schemars::schema_for!(Plan)).expect("schema serialises")
+		serde_json::from_str(include_str!("plan.schema.json")).unwrap_or(serde_json::Value::Null)
 	}
 
 	/// Human-readable preview lines with all paths sanitised for safe display.
@@ -110,5 +110,14 @@ impl fmt::Display for Op {
 			Op::Mkdir { path } => write!(f, "MKDIR   {}", s(path)),
 			Op::Rmdir { path } => write!(f, "RMDIR   {}", s(path)),
 		}
+	}
+}
+
+#[cfg(test)]
+mod schema_tests {
+	#[test]
+	fn the_shipped_schema_matches_the_types() {
+		let generated = serde_json::to_value(schemars::schema_for!(super::Plan)).unwrap();
+		assert_eq!(super::Plan::schema(), generated, "regenerate src/plan.schema.json with `tpfs schema`");
 	}
 }

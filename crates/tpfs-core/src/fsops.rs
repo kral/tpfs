@@ -174,17 +174,26 @@ impl Fs {
 		match self.rename_noreplace(from, to) {
 			Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
 				let copied = self.copy_published(from, to, part, publish)?;
-				let left = remove_copied(self, from, &copied)?;
+				let (changed, stuck) = remove_copied(self, from, &copied)?;
 				sync_parent(from);
-				if left.is_empty() {
-					Ok(())
-				} else {
+				if let Some((path, e)) = stuck.first() {
+					Err(io::Error::new(
+						e.kind(),
+						format!(
+							"copied, but {} item(s) of the source could not be removed (e.g. {}: {e}); the move is undone",
+							stuck.len(),
+							path.display()
+						),
+					))
+				} else if let Some(path) = changed.first() {
 					Err(io::Error::other(format!(
 						"{} item(s) changed or appeared in {} during the move and were left there, e.g. {}",
-						left.len(),
+						changed.len(),
 						from.display(),
-						left[0].display()
+						path.display()
 					)))
+				} else {
+					Ok(())
 				}
 			}
 			Ok(()) => {
@@ -218,7 +227,7 @@ impl Fs {
 		let mut copied = Vec::new();
 		if let Err(e) = self.copy_tree(from, part, Path::new(""), &mut copied) {
 			// The partial copy is ours and the source is untouched: drop it.
-			if let Err(r) = remove_part(part) {
+			if let Err(r) = remove_part(self, part) {
 				return Err(io::Error::new(
 					e.kind(),
 					format!("{e}; the partial copy {} could not be removed: {r}", part.display()),
@@ -232,7 +241,7 @@ impl Fs {
 		// fails, the part is left for the caller's clean-up, so that stays true even after a crash.
 		if let Err(e) = publish() {
 			// Nothing recorded: the part is still only ours.
-			remove_part(part)?;
+			remove_part(self, part)?;
 			return Err(e);
 		}
 		self.rename_noreplace(part, to)?;
@@ -383,9 +392,13 @@ impl Copied {
 }
 
 /// Remove from `from` exactly the entries that were copied and have not changed since, children
-/// before parents. Returns what was left in place (changed, new, or a folder that is not empty).
-fn remove_copied(fs: &Fs, from: &Path, copied: &[Copied]) -> io::Result<Vec<PathBuf>> {
+/// before parents. Returns what was left in place: entries that changed (or a folder that got new
+/// entries), and entries that could not be removed, with the reason (e.g. a read-only folder).
+type Left = (Vec<PathBuf>, Vec<(PathBuf, io::Error)>);
+
+fn remove_copied(fs: &Fs, from: &Path, copied: &[Copied]) -> io::Result<Left> {
 	let mut left = Vec::new();
+	let mut stuck = Vec::new();
 	for c in copied.iter().rev() {
 		let path = if c.rel.as_os_str().is_empty() { from.to_path_buf() } else { from.join(&c.rel) };
 		let meta = match std::fs::symlink_metadata(&path) {
@@ -397,12 +410,14 @@ fn remove_copied(fs: &Fs, from: &Path, copied: &[Copied]) -> io::Result<Vec<Path
 			left.push(path);
 			continue;
 		}
-		let removed = if c.dir { fs.rmdir(&path) } else { fs.remove_file(&path) };
-		if removed.is_err() {
-			left.push(path);
+		match if c.dir { fs.rmdir(&path) } else { fs.remove_file(&path) } {
+			Ok(()) => {}
+			// A folder that still holds entries — ones we left, or new ones — changed meanwhile.
+			Err(e) if c.dir && (e.kind() == io::ErrorKind::DirectoryNotEmpty || !left.is_empty()) => left.push(path),
+			Err(e) => stuck.push((path, e)),
 		}
 	}
-	Ok(left)
+	Ok((left, stuck))
 }
 
 /// Make the directory entries of a freshly copied tree durable before it is published.
@@ -414,43 +429,39 @@ fn sync_tree_dirs(root: &Path, copied: &[Copied]) {
 }
 
 /// Delete a partial copy that only tpfs ever saw (its private `part` name). Folders copied with a
-/// read-only mode are made writable first, or the removal would fail and leave the copy behind.
-pub(crate) fn remove_part(part: &Path) -> io::Result<()> {
+/// read-only mode are made writable first (through `fs`, so a folder swapped for a symlink is not
+/// followed), or the removal would fail and leave the copy behind.
+pub(crate) fn remove_part(fs: &Fs, part: &Path) -> io::Result<()> {
 	let m = match std::fs::symlink_metadata(part) {
 		Ok(m) => m,
 		Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
 		Err(e) => return Err(e),
 	};
 	if !m.is_dir() {
-		#[cfg(windows)]
-		if m.permissions().readonly() {
-			let mut p = m.permissions();
-			#[allow(clippy::permissions_set_readonly_false)]
-			p.set_readonly(false);
-			std::fs::set_permissions(part, p)?;
-		}
-		return std::fs::remove_file(part);
+		return fs.remove_file(part);
 	}
-	fn writable(dir: &Path) {
-		if let Ok(m) = std::fs::symlink_metadata(dir)
-			&& m.is_dir()
-		{
-			let mut p = m.permissions();
-			#[cfg(unix)]
-			std::os::unix::fs::PermissionsExt::set_mode(&mut p, 0o700);
-			#[cfg(not(unix))]
-			#[allow(clippy::permissions_set_readonly_false)]
-			p.set_readonly(false);
-			let _ = set_dir_mode(dir, p);
-			if let Ok(rd) = std::fs::read_dir(dir) {
-				for e in rd.flatten() {
-					writable(&e.path());
-				}
-			}
-		}
-	}
-	writable(part);
+	make_writable(fs, part)?;
+	// std's remove_dir_all does not follow symlinks inside the tree.
 	std::fs::remove_dir_all(part)
+}
+
+/// Give every folder of our own tree owner write access (children before nothing else changes).
+fn make_writable(fs: &Fs, dir: &Path) -> io::Result<()> {
+	let m = std::fs::symlink_metadata(dir)?;
+	if !m.is_dir() {
+		return Ok(());
+	}
+	let mut p = m.permissions();
+	#[cfg(unix)]
+	std::os::unix::fs::PermissionsExt::set_mode(&mut p, 0o700);
+	#[cfg(not(unix))]
+	#[allow(clippy::permissions_set_readonly_false)]
+	p.set_readonly(false);
+	fs.set_dir_mode(dir, p)?;
+	for name in fs.list(dir)? {
+		make_writable(fs, &dir.join(name))?;
+	}
+	Ok(())
 }
 
 /// Set a folder's permissions through `fs` (confined on Linux and macOS).
@@ -511,14 +522,20 @@ pub(crate) fn merge_back(
 			continue;
 		}
 		let part = part_path(&src, &format!("{tag}-restore-{i}"));
-		remove_part(&part)?; // a leftover of an earlier, interrupted attempt
+		remove_part(fs, &part)?; // a leftover of an earlier, interrupted attempt
 		fs.move_any(&target.join(rel), &src, &part, &mut || Ok(()))?;
 	}
-	// Folders now empty were fully restored; whatever is left duplicates the source.
+	// Folders now empty were fully restored; whatever is left duplicates the source. It is our own
+	// copy: make its folders writable, or a read-only one could not be moved into the trash.
 	for (rel, _) in entries.iter().rev().filter(|(_, d)| *d) {
 		let _ = fs.rmdir(&target.join(rel));
 	}
-	if crate::path::exists(target) { trash_rest(target) } else { Ok(()) }
+	if crate::path::exists(target) {
+		make_writable(fs, target)?;
+		trash_rest(target)
+	} else {
+		Ok(())
+	}
 }
 
 fn collect(fs: &Fs, path: &Path, rel: &Path, out: &mut Vec<(PathBuf, bool)>) -> io::Result<()> {
@@ -616,6 +633,22 @@ mod confined {
 	#[cfg(target_vendor = "apple")]
 	const NOFOLLOW_ANY: OFlags = OFlags::from_bits_retain(0x2000_0000);
 
+	/// Whether this macOS honours `O_NOFOLLOW_ANY` (11+). Older kernels silently ignore unknown flags,
+	/// which would turn confinement off without a word: probe once with the system's own symlink
+	/// `/tmp` (to `/private/tmp`), which must be refused. Not honoured = treated like a Linux kernel
+	/// without openat2 (refuse, unless TPFS_ALLOW_UNCONFINED=1).
+	#[cfg(target_vendor = "apple")]
+	fn nofollow_any_works() -> bool {
+		static WORKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+		*WORKS.get_or_init(|| {
+			let probe = Path::new("/tmp");
+			if !std::fs::symlink_metadata(probe).is_ok_and(|m| m.file_type().is_symlink()) {
+				return true; // no probe available; the flag is known from macOS 11 on
+			}
+			rustix::fs::open(probe, OFlags::RDONLY | OFlags::DIRECTORY | NOFOLLOW_ANY, Mode::empty()).is_err()
+		})
+	}
+
 	/// Open `rel` below the anchor without following any symlink and without leaving the root:
 	/// `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` on Linux, `O_NOFOLLOW_ANY` on macOS (the path
 	/// is already confined lexically; refusing every symlink keeps it there).
@@ -627,6 +660,9 @@ mod confined {
 		#[cfg(target_vendor = "apple")]
 		{
 			let _ = &anchor.fd;
+			if !nofollow_any_works() {
+				return Err(Errno::NOSYS);
+			}
 			// O_NOFOLLOW_ANY implies O_NOFOLLOW; macOS rejects the two together (EINVAL).
 			rustix::fs::open(anchor.root.join(rel), flags.difference(OFlags::NOFOLLOW) | NOFOLLOW_ANY, Mode::empty())
 		}
@@ -1294,13 +1330,13 @@ mod windows {
 		Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
 		Storage::FileSystem::{
 			BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-			FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, MOVEFILE_WRITE_THROUGH,
-			MoveFileExW, OPEN_EXISTING,
+			FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandle,
+			GetFileInformationByHandleEx, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING,
 		},
 	};
 
-	/// (volume serial, file index): the identity of a file, whatever name reaches it.
-	pub(super) fn file_id(p: &Path) -> Option<(u32, u64)> {
+	/// (volume serial, file id): the identity of a file, whatever name reaches it.
+	pub(super) fn file_id(p: &Path) -> Option<(u64, u128)> {
 		let w = wide(p);
 		// SAFETY: `w` is NUL-terminated and outlives the call; no security attributes or template.
 		let h = unsafe {
@@ -1317,6 +1353,17 @@ mod windows {
 		if h == INVALID_HANDLE_VALUE {
 			return None;
 		}
+		// 128-bit id first (ReFS does not guarantee unique 64-bit indexes).
+		// SAFETY: an all-zero FILE_ID_INFO is a valid value; the buffer has the size passed.
+		let mut id: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+		let ok = unsafe {
+			GetFileInformationByHandleEx(h, FileIdInfo, (&raw mut id).cast(), size_of::<FILE_ID_INFO>() as u32)
+		};
+		if ok != 0 {
+			// SAFETY: `h` was returned by CreateFileW above and is not used after this.
+			unsafe { CloseHandle(h) };
+			return Some((id.VolumeSerialNumber, u128::from_le_bytes(id.FileId.Identifier)));
+		}
 		// SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value of this plain C struct.
 		let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 		// SAFETY: `h` is an open handle and `info` a valid out-pointer; the handle is closed once.
@@ -1324,7 +1371,10 @@ mod windows {
 		// SAFETY: `h` was returned by CreateFileW above and is not used after this.
 		unsafe { CloseHandle(h) };
 		(ok != 0).then(|| {
-			(info.dwVolumeSerialNumber, (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow))
+			(
+				u64::from(info.dwVolumeSerialNumber),
+				u128::from((u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow)),
+			)
 		})
 	}
 
@@ -1507,7 +1557,7 @@ mod tests {
 		fs::create_dir_all(part.join("ro")).unwrap();
 		fs::write(part.join("ro/f"), "f").unwrap();
 		fs::set_permissions(part.join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
-		remove_part(&part).unwrap();
+		remove_part(&Fs::unconfined(), &part).unwrap();
 		assert!(!part.exists());
 	}
 }

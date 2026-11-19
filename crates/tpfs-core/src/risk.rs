@@ -113,26 +113,10 @@ fn is_dir(p: &Path) -> bool {
 	fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
 }
 
-#[cfg(unix)]
+/// Whether moving `from` to `to` crosses file systems (becomes a copy plus a removal).
 fn crosses_devices(from: &Path, to: &Path) -> bool {
-	use std::os::unix::fs::MetadataExt;
-	let dev = |p: &Path| fs::metadata(p).map(|m| m.dev()).ok();
-	let target_dir = normalize(to).and_then(|t| t.parent().map(Path::to_path_buf));
-	match (dev(from), target_dir.and_then(|d| dev(&d))) {
-		(Some(a), Some(b)) => a != b,
-		_ => false,
+	match normalize(to).and_then(|t| t.parent().map(Path::to_path_buf)) {
+		Some(dir) => crate::path::crosses_devices(from, &dir),
+		None => false,
 	}
-}
-
-/// Windows: a different drive or share (path prefix) means a different volume.
-#[cfg(not(unix))]
-fn crosses_devices(from: &Path, to: &Path) -> bool {
-	use std::path::Component;
-	let prefix = |p: &Path| {
-		normalize(p).and_then(|p| match p.components().next() {
-			Some(Component::Prefix(x)) => Some(x.as_os_str().to_ascii_lowercase()),
-			_ => None,
-		})
-	};
-	matches!((prefix(from), prefix(to)), (Some(a), Some(b)) if a != b)
 }

@@ -231,11 +231,12 @@ fn two_way_sync_skips_conflicts_and_undoes_completely() {
 fn tpfs_working_entries_are_never_synced() {
 	let e = Env::new();
 	fs::create_dir_all(e.left.join(".tpfs-trash-1000/batch")).unwrap();
-	e.file(&e.left.join(".tpfs-part-x"), "half", 100);
+	e.file(&e.left.join(".tpfs-part-18e95b2d1cb586a8-0"), "half", 100);
 	e.file(&e.left.join("real.txt"), "r", 100);
+	e.file(&e.left.join(".tpfs-notes.txt"), "the user's own", 100);
 	let cmp = compare(&e.left, &e.right, true).unwrap();
 	let names: Vec<String> = cmp.items.iter().map(|i| i.rel.to_string_lossy().into_owned()).collect();
-	assert_eq!(names, ["real.txt"]);
+	assert_eq!(names, [".tpfs-notes.txt", "real.txt"]);
 }
 
 #[test]

@@ -8,12 +8,12 @@ license.workspace      = true
 repository.workspace   = true
 
 [features]
-# JSON Schema of a plan (`Plan::schema`), for prompts and MCP tool definitions.
-schema = ["dep:schemars"]
+# Hooks for tests of tpfs itself and of its front ends: write journal records by hand, crash a
+# step on purpose. Not for production use.
+test-support = []
 
 [dependencies]
 crc32fast  = { workspace = true }
-schemars   = { workspace = true, optional = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 sha2       = { workspace = true }
@@ -25,6 +25,8 @@ rustix = { workspace = true }
 windows-sys = { workspace = true }
 
 [dev-dependencies]
+schemars = { workspace = true }
+tpfs-core = { path = ".", features = ["test-support"] }
 tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]

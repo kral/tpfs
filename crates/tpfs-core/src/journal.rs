@@ -15,6 +15,7 @@ use crate::op::Op;
 /// rolled back. Undo writes `undo_step` per reverted step and `undo` when the whole batch is reverted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Entry {
 	Begin {
 		batch: String,
@@ -219,10 +220,15 @@ impl Journal {
 		self.corrupt
 	}
 
-	/// Append one record and fsync it. For the executor and for tests that build journals by hand;
-	/// undo and recovery never trust a record to lead outside the roots (see `Executor`).
-	#[doc(hidden)]
+	/// Append a record by hand — for tests (feature `test-support`); the executor writes the journal.
+	#[cfg(feature = "test-support")]
 	pub fn append(&mut self, entry: &Entry) -> io::Result<()> {
+		self.write(entry)
+	}
+
+	/// Append one record and fsync it. Undo and recovery never trust a record to lead outside the
+	/// roots (see `Executor`).
+	pub(crate) fn write(&mut self, entry: &Entry) -> io::Result<()> {
 		let json = serde_json::to_string(entry).map_err(io::Error::other)?;
 		let line = format!("{:08x} {json}\n", crc32fast::hash(json.as_bytes()));
 		self.file.write_all(line.as_bytes())?;

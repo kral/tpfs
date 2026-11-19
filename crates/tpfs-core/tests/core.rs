@@ -407,7 +407,6 @@ fn plan_json_is_tolerant_and_has_a_schema() {
 	assert_eq!(plan.ops[0], Op::Trash { path: "/x".into() });
 	assert_eq!(plan.ops[1], Op::Rename { path: "/a".into(), new_name: "b".into() });
 
-	#[cfg(feature = "schema")]
 	{
 		let schema = Plan::schema().to_string();
 		assert!(schema.contains("rename") && schema.contains("newName"), "{schema}");
@@ -586,7 +585,7 @@ fn plans_cannot_touch_tpfs_state() {
 	for (plan, expect) in [
 		(vec![Op::Trash { path: journal.clone() }], "tpfs's state"),
 		(vec![Op::Copy { from: evil.clone(), to: s.state.join("pending.approved") }], "tpfs's state"),
-		(vec![Op::Mkdir { path: s.root.join(".tpfs-part-x") }], "own working data"),
+		(vec![Op::Mkdir { path: s.root.join(".tpfs-part-18e95b2d1cb586a8-0") }], "own working data"),
 	] {
 		let plan = Plan::new(plan, "");
 		assert!(messages(&v, &plan)[0].contains(expect), "{:?}", messages(&v, &plan));

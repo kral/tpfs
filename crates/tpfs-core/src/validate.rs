@@ -53,9 +53,19 @@ pub struct Validator {
 /// Names tpfs uses for its own work inside user folders: local trash, partial copies, case renames.
 const OWN_PREFIXES: [&str; 3] = [".tpfs-trash-", ".tpfs-part-", ".tpfs-case-"];
 
-/// Whether a path name is one of tpfs's own work names.
+/// Whether a path name is one of tpfs's own work names: `.tpfs-trash-<uid>`, or a partial copy or
+/// case-rename name (`.tpfs-part-<batch>-…`, `.tpfs-case-<batch>-…`). A user's `.tpfs-notes.txt`
+/// is not one.
 pub(crate) fn is_own_name(name: &std::ffi::OsStr) -> bool {
-	name.to_str().is_some_and(|n| OWN_PREFIXES.iter().any(|p| n.starts_with(p)))
+	let Some(n) = name.to_str() else { return false };
+	if let Some(uid) = n.strip_prefix(OWN_PREFIXES[0]) {
+		return !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit());
+	}
+	OWN_PREFIXES[1..].iter().any(|p| {
+		n.strip_prefix(p).is_some_and(|rest| {
+			rest.split('-').next().is_some_and(|b| b.len() >= 8 && b.bytes().all(|c| c.is_ascii_hexdigit()))
+		})
+	})
 }
 
 impl Validator {
@@ -185,7 +195,15 @@ impl Validator {
 				let target = parent.join(new_name);
 				let case_only =
 					source.file_name().map(|n| n.to_string_lossy().to_lowercase()) == Some(new_name.to_lowercase());
-				if target != source && case_only && same_file(&source, &target) && !sim.state.contains_key(&target) {
+				// On a case-insensitive file system the new spelling is not listed as an entry of its
+				// own; a hard link under that spelling (case-sensitive file systems) is.
+				let own_entry = fs::read_dir(parent)
+					.is_ok_and(|rd| rd.filter_map(Result::ok).any(|e| e.file_name() == std::ffi::OsStr::new(new_name)));
+				if target != source
+					&& case_only && !own_entry
+					&& same_file(&source, &target)
+					&& !sim.state.contains_key(&sim_key(&target))
+				{
 					// Only the letter case differs, on a case-insensitive file system (a hard link
 					// under another name is a different entry, and goes the normal way).
 					check_names(&target)?;
@@ -219,7 +237,7 @@ impl Validator {
 				if !sim.exists(parent) {
 					return Err(format!("Parent folder does not exist: {}", show(parent)));
 				}
-				sim.created_dirs.insert(path.clone());
+				sim.created_dirs.insert(sim_key(&path));
 				sim.set(path, true);
 				Ok(())
 			}
@@ -229,7 +247,7 @@ impl Validator {
 					return Err("Cannot remove an allowed root folder.".into());
 				}
 				let on_disk = fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
-				if !sim.exists(&path) || !(on_disk || sim.created_dirs.contains(&path)) {
+				if !sim.exists(&path) || !(on_disk || sim.created_dirs.contains(&sim_key(&path))) {
 					return Err(format!("Not an existing directory: {}", show(&path)));
 				}
 				if !sim.is_empty_dir(&path) {
@@ -265,7 +283,7 @@ impl Validator {
 		if !is_move {
 			check_copyable(&from)?;
 		}
-		if !is_move || crosses_devices(&from, parent) {
+		if !is_move || crate::path::crosses_devices(&from, parent) {
 			sim.reserve_space(&from, parent)?;
 		}
 
@@ -406,11 +424,22 @@ struct Sim {
 	sizes: HashMap<PathBuf, u64>,
 }
 
+/// Windows and macOS (by default) treat names that differ only in letter case as one: so does the
+/// simulator, or two new targets `new.txt` and `NEW.txt` would both pass and the second would fail
+/// half way through the plan.
+fn sim_key(p: &Path) -> PathBuf {
+	if cfg!(any(windows, target_vendor = "apple")) {
+		PathBuf::from(p.as_os_str().to_string_lossy().to_lowercase())
+	} else {
+		p.to_path_buf()
+	}
+}
+
 impl Sim {
 	fn exists(&self, p: &Path) -> bool {
 		// A path removed earlier in the plan takes everything below it with it.
 		for a in p.ancestors() {
-			if let Some(&e) = self.state.get(a) {
+			if let Some(&e) = self.state.get(&sim_key(a)) {
 				if a == p || !e {
 					return e;
 				}
@@ -421,6 +450,7 @@ impl Sim {
 	}
 
 	fn set(&mut self, p: PathBuf, exists: bool) {
+		let p = sim_key(&p);
 		if let Some(parent) = p.parent() {
 			let children = self.added.entry(parent.to_path_buf()).or_default();
 			if exists {
@@ -436,10 +466,10 @@ impl Sim {
 	/// A folder that cannot be read counts as not empty.
 	fn is_empty_dir(&self, dir: &Path) -> bool {
 		let Ok(rd) = fs::read_dir(dir) else {
-			return !exists(dir) && self.added.get(dir).is_none_or(HashSet::is_empty);
+			return !exists(dir) && self.added.get(&sim_key(dir)).is_none_or(HashSet::is_empty);
 		};
 		let on_disk = rd.into_iter().any(|e| e.map_or(true, |e| self.exists(&e.path())));
-		!on_disk && self.added.get(dir).is_none_or(HashSet::is_empty)
+		!on_disk && self.added.get(&sim_key(dir)).is_none_or(HashSet::is_empty)
 	}
 
 	/// Refuse a copy that would not fit, counting everything the plan already writes to that file system.
@@ -499,40 +529,12 @@ fn free_space(dir: &Path) -> Option<(u64, u64)> {
 	// SAFETY: `wide` is NUL-terminated and outlives the call; the out-pointer is a valid u64 and the
 	// two optional out-pointers are null.
 	let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
-	(ok != 0).then(|| (volume_key(existing), free))
+	(ok != 0).then(|| (crate::path::device_of(existing).unwrap_or(0), free))
 }
 
 #[cfg(not(any(unix, windows)))]
 fn free_space(_: &Path) -> Option<(u64, u64)> {
 	None
-}
-
-/// A key for the volume of a Windows path: its drive or share prefix.
-#[cfg(windows)]
-fn volume_key(p: &Path) -> u64 {
-	use std::hash::{Hash, Hasher};
-	let mut h = std::collections::hash_map::DefaultHasher::new();
-	if let Some(std::path::Component::Prefix(pre)) = p.components().next() {
-		pre.as_os_str().to_ascii_uppercase().hash(&mut h);
-	}
-	h.finish()
-}
-
-#[cfg(unix)]
-fn crosses_devices(from: &Path, target_dir: &Path) -> bool {
-	use std::os::unix::fs::MetadataExt;
-	let dev = |p: &Path| p.ancestors().find_map(|a| fs::symlink_metadata(a).ok()).map(|m| m.dev());
-	dev(from) != dev(target_dir)
-}
-
-#[cfg(windows)]
-fn crosses_devices(from: &Path, target_dir: &Path) -> bool {
-	volume_key(from) != volume_key(target_dir)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn crosses_devices(_: &Path, _: &Path) -> bool {
-	false
 }
 
 fn human(bytes: u64) -> String {
