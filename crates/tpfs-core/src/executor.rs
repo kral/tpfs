@@ -937,15 +937,12 @@ fn finish_dir(fs: &Fs, path: &Path, mode: Option<u32>) -> io::Result<()> {
 	Ok(())
 }
 
-/// Give a folder tpfs recreated the permissions it had before its `rmdir`.
+/// Give a folder tpfs recreated the permissions it had before its `rmdir` (Unix: elsewhere no
+/// mode is recorded).
+#[cfg(unix)]
 fn set_mode(fs: &Fs, path: &Path, mode: u32) -> io::Result<()> {
-	#[cfg(unix)]
-	{
-		use std::os::unix::fs::PermissionsExt;
-		crate::fsops::set_dir_mode_at(fs, path, fs::Permissions::from_mode(mode))?;
-	}
-	#[cfg(not(unix))]
-	let _ = (fs, mode);
+	use std::os::unix::fs::PermissionsExt;
+	crate::fsops::set_dir_mode_at(fs, path, fs::Permissions::from_mode(mode))?;
 	// The folder itself was synced through the handle that changed its mode.
 	sync_parent(path);
 	Ok(())
