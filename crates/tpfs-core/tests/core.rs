@@ -300,8 +300,8 @@ fn recover_rolls_back_a_batch_interrupted_by_a_crash() {
 
 	let v = Validator::new(["/"]).unwrap();
 	let report = Executor::new(&v, &mut j, s.trash()).recover().unwrap();
-	assert_eq!(report.rolled_back, vec![batch]);
 	assert!(report.errors.is_empty(), "{:?}", report.errors);
+	assert_eq!(report.rolled_back, vec![batch]);
 	assert_eq!(s.snapshot(), before);
 	assert_eq!(j.batches().unwrap()[0].status, BatchStatus::Aborted);
 }
