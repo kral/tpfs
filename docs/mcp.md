@@ -57,6 +57,8 @@ client starts the server with another `TPFS_HOME`.
    stores it as pending. Nothing changes yet.
 3. The agent shows you the preview and asks you to run `tpfs approve <planId> --home …`.
 4. You review the plan in your terminal and type `yes`, or reject it with `tpfs reject <planId>`.
+   With `tpfs watch` running in a terminal, each plan appears there as it is proposed and you
+   answer `yes`, `no` or Enter (later) without copying its id.
 5. The agent calls `apply_plan`. The plan runs as one batch, journaled like any other.
 6. If needed, the agent calls `undo_last`, or you run `tpfs undo`.
 
@@ -73,7 +75,7 @@ A valid proposal returns:
 ```json
 {
   "digest": "4452696c13e56aed242c4b3321a035cfe2035d8472a8de00cc844b4a77e731a9",
-  "next": "Show the user the preview and ask them to run `tpfs approve 18e97dcdaead317b5f2 --home /home/you/.local/state/tpfs` in a terminal. Then call apply_plan.",
+  "next": "Show the user the preview and ask them to run `tpfs approve 18e97dcdaead317b5f2 --home /home/you/.local/state/tpfs` in a terminal (or to answer it in `tpfs watch`, if it is running). Then call apply_plan.",
   "planId": "18e97dcdaead317b5f2",
   "preview": [
     "MKDIR   /home/you/Downloads/Invoices",

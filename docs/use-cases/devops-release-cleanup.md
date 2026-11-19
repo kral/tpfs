@@ -152,7 +152,7 @@ The agent lists `releases/` with `list_directory` and gets the five folders. It 
 ```json
 {
   "digest": "896ff1be2dd38e89049a7fa43a6644366ef361ce27d095e040ddd36ae2543242",
-  "next": "Show the user the preview and ask them to run `tpfs approve 18e98c9e11e700f1d1 --home /home/deploy/.local/state/tpfs` in a terminal. Then call apply_plan.",
+  "next": "Show the user the preview and ask them to run `tpfs approve 18e98c9e11e700f1d1 --home /home/deploy/.local/state/tpfs` in a terminal (or to answer it in `tpfs watch`, if it is running). Then call apply_plan.",
   "planId": "18e98c9e11e700f1d1",
   "preview": [
     "TRASH   /srv/shop/releases/20261102-0912",

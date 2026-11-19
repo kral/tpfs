@@ -49,6 +49,8 @@ USAGE:
   tpfs pending                                  list plans proposed by agents
   tpfs approve <planId>                         review and approve an agent's plan (interactive)
   tpfs reject <planId>                          discard an agent's plan
+  tpfs watch                                    review agents' plans as they arrive: approve (yes),
+                                                  reject (no) or leave for later (Enter)
   tpfs guard                                    hook for AI agents (Claude Code, Cursor): refuses shell
                                                   commands that move, rename or delete files and points
                                                   the agent to tpfs (reads the tool call on stdin)
@@ -132,6 +134,7 @@ fn allowed(command: &str) -> Option<(&'static [&'static str], usize)> {
 		"mcp" => (&["root", "approval", "home"], 0),
 		"approve" | "reject" => (&["home"], 1),
 		"guard" => (&[], 0),
+		"watch" => (&["home"], 0),
 		"doctor" => (&["home"], 1),
 		_ => return None,
 	})
@@ -616,6 +619,7 @@ fn run(args: Args) -> Res {
 			Ok(ExitCode::SUCCESS)
 		}
 		"approve" => approve(&args),
+		"watch" => watch(&args),
 		"reject" => {
 			let id = plan_id(&args)?;
 			let store = tpfs_mcp::Store::new(&state_dir(&args)?);
@@ -847,16 +851,32 @@ fn approve(args: &Args) -> Res {
 	let id = plan_id(args)?;
 	let store = tpfs_mcp::Store::new(&state_dir(args)?);
 	let pending = find_pending(&store, &id)?;
+	if !show_pending(args, &pending)? {
+		return Ok(rejected(args));
+	}
+	if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+		return Err(cancelled("approval must be given interactively in a terminal"));
+	}
+	if ask("Type 'yes' to let the agent apply exactly this plan: ")? != "yes" {
+		return Err(cancelled("not approved"));
+	}
+	store.approve(&pending).map_err(|e| e.to_string())?;
+	println!("Approved. The agent can now call apply_plan for {id}.");
+	Ok(ExitCode::SUCCESS)
+}
+
+/// Show an agent's pending plan as the person must see it before approving: the steps, the
+/// allowed folders, the risk, the digest and any problems. `false` when it cannot be approved.
+fn show_pending(args: &Args, pending: &tpfs_mcp::Pending) -> Result<bool, Fail> {
 	if pending.plan.digest() != pending.digest {
 		return Err("the stored plan was modified after it was proposed; reject it".into());
 	}
-
 	let validator =
 		Validator::new(&pending.roots).map_err(|e| root_error(&pending.roots, e))?.with_protected([state_dir(args)?]);
 	let issues = validator.validate(&pending.plan);
 	let risk = risk::assess(&pending.plan, Source::Agent);
 
-	println!("Plan {id} proposed by an agent:");
+	println!("Plan {} proposed by an agent:", tpfs_core::sanitize(pending.id.as_ref()));
 	if !pending.plan.reason.is_empty() {
 		println!("  \"{}\"", tpfs_core::sanitize(pending.plan.reason.as_ref()));
 	}
@@ -876,18 +896,60 @@ fn approve(args: &Args) -> Res {
 		for i in &issues {
 			println!("  {i}");
 		}
-		return Ok(rejected(args));
+		return Ok(false);
 	}
+	Ok(true)
+}
 
+/// `tpfs watch`: wait for plans proposed by agents and review each one as it arrives, in this
+/// terminal: approve it (`yes`), reject it (`no`), or leave it for later (Enter). The same
+/// review and the same `yes` as `tpfs approve`, without copying plan ids between terminals.
+fn watch(args: &Args) -> Res {
 	if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-		return Err(cancelled("approval must be given interactively in a terminal"));
+		return Err(cancelled("tpfs watch reviews plans interactively: run it in a terminal"));
 	}
-	if ask("Type 'yes' to let the agent apply exactly this plan: ")? != "yes" {
-		return Err(cancelled("not approved"));
+	let state = state_dir(args)?;
+	tpfs_core::private_dir(&state).map_err(|e| e.to_string())?;
+	let store = tpfs_mcp::Store::new(&state);
+	eprintln!(
+		"Watching for plans proposed by agents (state: {}). Ctrl+C to stop.",
+		tpfs_core::sanitize(state.as_os_str())
+	);
+	let mut seen = std::collections::HashSet::new();
+	loop {
+		let (plans, _) = store.scan().map_err(|e| e.to_string())?;
+		for pending in plans {
+			if !seen.insert(pending.id.clone()) || store.is_approved(&pending) {
+				continue;
+			}
+			let id = tpfs_core::sanitize(pending.id.as_ref());
+			println!();
+			match show_pending(args, &pending) {
+				Ok(true) => {}
+				Ok(false) => {
+					println!("It cannot be approved as it is. `tpfs reject {id}` drops it.");
+					continue;
+				}
+				Err(Fail(_, e)) => {
+					println!("{e}");
+					continue;
+				}
+			}
+			let answer = ask("Type 'yes' to approve exactly this plan, 'no' to reject it, or Enter to decide later: ")?;
+			match answer.as_str() {
+				"yes" => {
+					store.approve(&pending).map_err(|e| e.to_string())?;
+					println!("Approved. The agent can now call apply_plan for {id}.");
+				}
+				"no" | "reject" => {
+					store.remove(&pending.id).map_err(|e| e.to_string())?;
+					println!("Rejected {id}.");
+				}
+				_ => println!("Left pending: `tpfs approve {id}` or `tpfs reject {id}` later."),
+			}
+		}
+		std::thread::sleep(std::time::Duration::from_millis(700));
 	}
-	store.approve(&pending).map_err(|e| e.to_string())?;
-	println!("Approved. The agent can now call apply_plan for {id}.");
-	Ok(ExitCode::SUCCESS)
 }
 
 /// A pending plan by id; an unknown id is a usage error that points to the list.

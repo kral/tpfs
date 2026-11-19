@@ -17,6 +17,7 @@ tpfs mcp --root <dir>... [--approval terminal|client]
 tpfs pending
 tpfs approve <planId>
 tpfs reject <planId>
+tpfs watch
 tpfs guard
 tpfs doctor [<project>]
 ```
@@ -383,3 +384,30 @@ Checks that an agent's setup for `<project>` (default: the current folder) route
 through tpfs: the MCP server with terminal approval, the `tpfs guard` hook, no blanket shell allow
 rule, a private state folder. Exit 0 when nothing failed, 1 otherwise. See
 [Agent setup](agent-setup.md#check-the-setup).
+
+## tpfs watch
+
+```text
+tpfs watch
+```
+
+Waits for plans proposed by agents and shows each one as it arrives, exactly as `tpfs approve`
+does: the steps, the allowed folders, the risk and the digest. Answer `yes` to approve exactly that
+plan, `no` to reject it, or press Enter to leave it pending. Plans that cannot be approved (they
+have problems) are shown with a note. Runs until Ctrl+C. Needs a terminal (exit 4 without one).
+
+```console
+$ tpfs watch
+Watching for plans proposed by agents (state: /home/you/.local/state/tpfs). Ctrl+C to stop.
+
+Plan 18e98f3dd61777bec4a proposed by an agent:
+  "Trash a"
+  TRASH   /home/you/Downloads/a.txt
+Total: 1 operation(s): 1 trash (2 B)
+1 item(s) go to the trash (nothing is deleted; `tpfs undo` puts them back).
+Allowed folders: /home/you/Downloads
+Risk: HIGH — proposed by an agent
+Digest: …
+Type 'yes' to approve exactly this plan, 'no' to reject it, or Enter to decide later: yes
+Approved. The agent can now call apply_plan for 18e98f3dd61777bec4a.
+```

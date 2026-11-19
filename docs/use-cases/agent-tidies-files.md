@@ -89,7 +89,7 @@ should run:
 ```json
 {
   "digest": "4452696c13e56aed242c4b3321a035cfe2035d8472a8de00cc844b4a77e731a9",
-  "next": "Show the user the preview and ask them to run `tpfs approve 18e97e4e998f5b2f2e6 --home /home/you/.local/state/tpfs` in a terminal. Then call apply_plan.",
+  "next": "Show the user the preview and ask them to run `tpfs approve 18e97e4e998f5b2f2e6 --home /home/you/.local/state/tpfs` in a terminal (or to answer it in `tpfs watch`, if it is running). Then call apply_plan.",
   "planId": "18e97e4e998f5b2f2e6",
   "preview": [
     "MKDIR   /home/you/Downloads/Invoices",

@@ -430,3 +430,13 @@ fn guard_refuses_file_deleting_shell_commands() {
 	assert_eq!(code(&o), 0);
 	assert!(o.stdout.is_empty());
 }
+
+/// `tpfs watch` reviews plans in a terminal only: without one it refuses (exit 4) and approves
+/// nothing.
+#[test]
+fn watch_needs_a_terminal() {
+	let tmp = tempfile::TempDir::new().unwrap();
+	let o = tpfs(&tmp.path().join("home"), &["watch"]);
+	assert_eq!(code(&o), 4, "{}", String::from_utf8_lossy(&o.stderr));
+	assert!(String::from_utf8_lossy(&o.stderr).contains("terminal"));
+}

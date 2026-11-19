@@ -297,7 +297,7 @@ impl Server {
 		let pending = self.store.put(&plan, self.validator.roots()).map_err(|e| e.to_string())?;
 		let next = match self.config.approval {
 			Approval::Terminal => format!(
-				"Show the user the preview and ask them to run `{}` in a terminal{}. Then call apply_plan.",
+				"Show the user the preview and ask them to run `{}` in a terminal{} (or to answer it in `tpfs watch`, if it is running). Then call apply_plan.",
 				self.approve_command(&pending.id),
 				SHELL
 			),

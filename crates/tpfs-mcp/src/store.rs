@@ -108,7 +108,8 @@ impl Store {
 				_ => damaged.push(id.to_owned()),
 			}
 		}
-		plans.sort_by_key(|p| p.created);
+		// Ids grow with time: they order plans made within the same second.
+		plans.sort_by(|a, b| (a.created, &a.id).cmp(&(b.created, &b.id)));
 		damaged.sort();
 		Ok((plans, damaged))
 	}

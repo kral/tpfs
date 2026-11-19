@@ -9,7 +9,8 @@ happened. A safe setup has three parts:
    tells the agent to use tpfs instead.
 3. **No blanket "allow every shell command"** rule, which would let commands run unchecked.
 
-Then run `tpfs doctor` to check it.
+Then run `tpfs doctor` to check it, and keep `tpfs watch` open in a terminal while the agent works:
+each plan it proposes appears there for your `yes` or `no`.
 
 ## Claude Code
 
