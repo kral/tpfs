@@ -1068,6 +1068,7 @@ fn apply(
 			// The entry is durable before the record that calls it ours.
 			sync_parent(&part);
 			publish()?;
+			crash_point("mkdir-published")?;
 			fs.rename_noreplace(&part, &path)?;
 			sync_parent(&path);
 			Ok(())
@@ -1513,6 +1514,9 @@ mod tests {
 	#[test]
 	fn a_restore_cut_short_after_a_mode_without_read_finishes() {
 		use std::os::unix::fs::PermissionsExt;
+		if rustix::process::geteuid().is_root() {
+			eprintln!("note: run as root, so the missing read bit is not enforced here (CI runs it unprivileged)");
+		}
 		let tmp = tempfile::TempDir::new().unwrap();
 		let base = crate::path::canonicalize(tmp.path()).unwrap();
 		let root = base.join("root");
@@ -1586,6 +1590,59 @@ mod tests {
 		}
 		assert!(d.is_dir());
 		assert_no_parts(&root);
+	}
+
+	/// A `mkdir` cut short after it was journaled and before its folder was renamed into place:
+	/// recovery removes the private folder and keeps a folder someone else made at the name.
+	#[test]
+	fn a_mkdir_cut_short_before_its_rename_is_rolled_back() {
+		for someone_else in [false, true] {
+			let tmp = tempfile::TempDir::new().unwrap();
+			let base = crate::path::canonicalize(tmp.path()).unwrap();
+			let root = base.join("root");
+			fs::create_dir_all(&root).unwrap();
+			let d = root.join("new");
+			let v = Validator::new([&root]).unwrap();
+			let trash = base.join("state").join("trash");
+			let mut j = Journal::open(base.join("state").join("journal.jsonl")).unwrap();
+			CRASH_AT.with(|c| c.set(Some("mkdir-published")));
+			let result = Executor::new(&v, &mut j, &trash)
+				.execute(&Plan::new(vec![Op::Mkdir { path: d.clone() }], ""), Source::Human);
+			CRASH_AT.with(|c| c.set(None));
+			assert!(result.is_err());
+			assert!(!d.exists());
+			assert_no_parts(&root);
+			// The failure was rolled back at once; build the crashed state again by hand to
+			// recover it as after a real crash: the part made and journaled, not renamed.
+			let b = "18e97de4eaba61d8-3";
+			journal_batch(
+				&mut j,
+				b,
+				vec![
+					Entry::Intent {
+						batch: b.into(),
+						index: 0,
+						forward: Op::Mkdir { path: d.clone() },
+						inverse: Op::Rmdir { path: d.clone() },
+					},
+					Entry::Published { batch: b.into(), index: 0 },
+				],
+			);
+			fs::create_dir(part_path(&d, &tag(b, 0))).unwrap();
+			if someone_else {
+				fs::create_dir(&d).unwrap();
+				fs::write(d.join("theirs"), "T").unwrap();
+			}
+			for _ in 0..2 {
+				let report = Executor::new(&v, &mut j, &trash).recover().unwrap();
+				assert!(report.errors.is_empty(), "{report:?}");
+			}
+			assert_no_parts(&root);
+			assert_eq!(d.exists(), someone_else);
+			if someone_else {
+				assert_eq!(fs::read_to_string(d.join("theirs")).unwrap(), "T");
+			}
+		}
 	}
 
 	/// A private folder an undo made but never journaled (a crash in between) is dropped and the
