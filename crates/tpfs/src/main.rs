@@ -327,7 +327,11 @@ fn run(args: Args) -> Res {
 			}
 			// Not held while the user reads; the batch is checked again when undoing.
 			drop(journal);
-			if let Some(b) = &last {
+			let Some(b) = &last else {
+				println!("Nothing to undo.");
+				return Ok(ExitCode::SUCCESS);
+			};
+			{
 				let steps: Vec<_> = b.steps.iter().filter(|s| s.done && !s.undone).collect();
 				if let Some(approved) = &args.approve {
 					// Non-interactive: name the batch, as `apply` names the plan by its digest.
@@ -342,7 +346,7 @@ fn run(args: Args) -> Res {
 					eprintln!(
 						"Undo batch {} by {} — {} step(s): {}",
 						tpfs_core::sanitize(b.id.as_ref()),
-						tpfs_core::sanitize(b.source.as_ref()),
+						if b.source == "agent" { "an AI agent" } else { "a person" },
 						steps.len(),
 						tpfs_core::sanitize(b.reason.as_ref())
 					);
@@ -366,10 +370,7 @@ fn run(args: Args) -> Res {
 			let (mut journal, trash) = open_state(&args)?;
 			let mut executor = Executor::new(&validator, &mut journal, trash);
 			// Exactly the batch shown and approved: another process may have committed one since.
-			let result = match &last {
-				Some(b) => executor.undo_batch(&b.id),
-				None => executor.undo_last(),
-			};
+			let result = executor.undo_batch(&b.id);
 			match result {
 				Err(ExecError::Undo { error, .. }) if error.contains("no longer the newest batch") => {
 					return Err(cancelled(format!(

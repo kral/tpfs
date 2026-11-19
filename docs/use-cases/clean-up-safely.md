@@ -95,7 +95,7 @@ Batch 18e97ddfa3b51430-6c6a by human: Clean up old downloads
 
 ```console
 $ tpfs undo
-Undo batch 18e97ddfa3b51430-6c6a by human — 3 step(s): Clean up old downloads
+Undo batch 18e97ddfa3b51430-6c6a by a person — 3 step(s): Clean up old downloads
 These changes will be reversed:
   TRASH   /home/you/Downloads/setup.zip
   TRASH   /home/you/Downloads/setup-old.zip

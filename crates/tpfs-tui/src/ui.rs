@@ -464,7 +464,9 @@ fn draw_sync(
 	};
 	let width = (f.area().width as usize).saturating_sub(10).clamp(40, 100);
 	// The direction and key lines always fit: the list gets what is left.
-	let shown = (f.area().height as usize).saturating_sub(16).clamp(1, 14);
+	// Room left inside the dialog (the screen less 2 rows of margin and 2 of border) after its 8
+	// fixed lines: header (3), "more", blank, direction, blank, keys. May be none.
+	let shown = (f.area().height as usize).saturating_sub(2 + 2 + 8).min(14);
 
 	let mut lines = vec![
 		Line::styled(truncate_left(&format!("{l}  {arrow}  {r}"), width), DIALOG.add_modifier(Modifier::BOLD)),
@@ -535,7 +537,7 @@ fn draw_help(f: &mut Frame) {
 		("Shift+F2", "compare & sync the two folders"),
 		("Ins / Space", "mark (also right click)"),
 		("F2", "rename"),
-		("F3 / Enter on a file", "view"),
+		("F3 / Enter (file)", "view"),
 		("F4", "edit in $EDITOR"),
 		(":", "command line (not journaled)"),
 		("letters", "quick search (Esc leaves it)"),
@@ -544,7 +546,7 @@ fn draw_help(f: &mut Frame) {
 		("F7", "make directory"),
 		("F8 / Del", "move to trash"),
 		("F9 / Ctrl+Z", "undo the last change"),
-		("F10 / Ctrl+Q / C", "quit"),
+		("F10 / Ctrl+Q", "quit (also Ctrl+C)"),
 		("Mouse", "click, double click, wheel, F-key bar"),
 	];
 	let mut lines: Vec<Line> = rows

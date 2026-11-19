@@ -336,8 +336,8 @@ impl<'a> Executor<'a> {
 			return Err(ExecError::Undo {
 				batch: expected.to_owned(),
 				error: format!(
-					"it is no longer the newest batch ({} was committed since); nothing was changed",
-					batch.id
+					"it is no longer the newest batch to undo (that is now {}); nothing was changed",
+					crate::sanitize(batch.id.as_ref())
 				),
 			});
 		}
@@ -353,7 +353,7 @@ impl<'a> Executor<'a> {
 		for step in batch.steps.iter().rev().filter(|s| s.done && !s.undone) {
 			let fail = |error: String| ExecError::Undo { batch: batch.id.clone(), error };
 			self.check_journaled(&step.inverse).map_err(fail)?;
-			self.copy_unchanged(step).map_err(fail)?;
+			self.copy_unchanged(step, &batch.id, "undo").map_err(fail)?;
 			self.replay(&fs, &batch.id, "undo", step).map_err(|e| fail(clean(format!("{}: {e}", step.inverse))))?;
 			self.journal.write(&Entry::UndoStep { batch: batch.id.clone(), index: step.index })?;
 			reverted += 1;
@@ -383,11 +383,17 @@ impl<'a> Executor<'a> {
 	}
 
 	/// A copy changed since its batch finished is the user's now: undo and recovery keep it. Not
-	/// once an earlier attempt published its trash copy (`undo_published`): what is left is that
-	/// attempt's half-removed original, and `replay` checks it is all in the trash copy.
-	fn copy_unchanged(&self, step: &crate::journal::Step) -> Result<(), String> {
-		if step.undo_published {
-			return Ok(());
+	/// once an earlier attempt (`what`: undo or recover) published its trash copy: what is left is
+	/// that attempt's half-removed original, and `replay` checks it is all in the trash copy.
+	fn copy_unchanged(&self, step: &crate::journal::Step, batch: &str, what: &str) -> Result<(), String> {
+		if let (true, Op::Copy { to, .. }) = (step.undo_published, &step.forward)
+			&& let Some(to) = normalize(to)
+		{
+			let label = format!("{batch}-{what}");
+			let slot = trash_slot(&self.trash, &label, step.index, &to);
+			if exists(&slot) && !exists(&part_path(&slot, &tag(&label, step.index))) {
+				return Ok(());
+			}
 		}
 		if let (Op::Copy { to, .. }, Some(check)) = (&step.forward, &step.check)
 			&& let Some(to) = normalize(to)
@@ -555,7 +561,7 @@ impl<'a> Executor<'a> {
 				if step.done {
 					let result = self
 						.check_journaled(&step.inverse)
-						.and_then(|()| self.copy_unchanged(step))
+						.and_then(|()| self.copy_unchanged(step, &batch.id, "recover"))
 						.map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))
 						.and_then(|()| self.replay(&fs, &batch.id, "recover", step));
 					match result {
@@ -875,15 +881,17 @@ fn restore_dir(
 				Err(something_there())
 			};
 		}
-		// Private while it is made; its own mode is set while it can still be opened (a mode
-		// without the owner's read bit would not let it be opened again).
+		// Private while it is made and not yet journaled.
 		fs.mkdir_mode(&part, 0o700)?;
 		crash_point("made")?;
-		finish_dir(fs, &part, step.mode)?;
 		sync_parent(&part);
 		journal.write(&Entry::UndoPublished { batch: batch.to_owned(), index: step.index })?;
 		crash_point("journaled")?;
 	}
+	// Ours from here on: its mode is set while it still has the owner's bits to be opened (an
+	// unrecorded part is always 0o700, so it can be removed), and checked first on a rerun.
+	finish_dir(fs, &part, step.mode)?;
+	crash_point("moded")?;
 	match fs.rename_noreplace(&part, path) {
 		Err(_) if exists(path) => return Err(something_there()),
 		r => r?,
@@ -1050,14 +1058,18 @@ fn apply(
 			fs.move_any(&path, &slot, &part_path(&slot, &tag), publish)
 		}
 		Op::Mkdir { path } => {
-			// `mkdir` fails if anything is at the name (atomic, on every file system); once it
-			// succeeded the folder is ours, and `publish` journals that. A crash in between leaves
-			// an empty folder of ours unrecorded — left alone, never someone else's removed.
+			// Made at a private name, journaled, then renamed into place without replacing
+			// anything: a folder at the name is ours exactly when the step is published and its
+			// private name is gone, so recovery never mistakes ours for someone else's or the other
+			// way round (see `cleanup`).
 			let path = n(path)?;
-			fs.mkdir(&path)?;
+			let part = part_path(&path, &tag);
+			fs.mkdir(&part)?;
 			// The entry is durable before the record that calls it ours.
-			sync_parent(&path);
+			sync_parent(&part);
 			publish()?;
+			fs.rename_noreplace(&part, &path)?;
+			sync_parent(&path);
 			Ok(())
 		}
 		Op::Rmdir { path } => {
@@ -1314,6 +1326,34 @@ mod tests {
 		assert_eq!(fs::read_to_string(slot.join("b")).unwrap(), "B");
 	}
 
+	/// An undo of a copy cut short before its trash copy was published still notices a change
+	/// the user made to the copy since.
+	#[test]
+	fn an_unpublished_undo_of_a_copy_still_keeps_a_changed_copy() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let base = crate::path::canonicalize(tmp.path()).unwrap();
+		let root = base.join("root");
+		fs::create_dir_all(root.join("src")).unwrap();
+		fs::write(root.join("src").join("a"), "A").unwrap();
+		let v = Validator::new([&root]).unwrap();
+		let trash = base.join("state").join("trash");
+		let mut j = Journal::open(base.join("state").join("journal.jsonl")).unwrap();
+		let dst = root.join("dst");
+		let id = Executor::new(&v, &mut j, &trash)
+			.execute(&Plan::new(vec![Op::Copy { from: root.join("src"), to: dst.clone() }], ""), Source::Human)
+			.unwrap()
+			.id;
+		let label = format!("{id}-undo");
+		let slot = trash_slot(&trash, &label, 0, &dst);
+		fs::create_dir_all(part_path(&slot, &tag(&label, 0))).unwrap();
+		j.append(&Entry::UndoPublished { batch: id.clone(), index: 0 }).unwrap();
+		fs::write(dst.join("a"), "edited").unwrap();
+		fs::write(dst.join("new"), "N").unwrap();
+		let err = Executor::new(&v, &mut j, &trash).undo_last().unwrap_err();
+		assert!(err.to_string().contains("changed after it was copied"), "{err}");
+		assert_eq!(fs::read_to_string(dst.join("a")).unwrap(), "edited");
+	}
+
 	fn rmdir_batch(base: &Path) -> (Validator, Journal, PathBuf, PathBuf, String) {
 		let root = base.join("root");
 		let d = root.join("shared");
@@ -1373,7 +1413,7 @@ mod tests {
 	/// finishes it with the recorded mode, and nothing is left at a private name.
 	#[test]
 	fn a_crash_anywhere_in_a_folder_restore_is_finished() {
-		for at in ["made", "journaled", "renamed"] {
+		for at in ["made", "journaled", "moded", "renamed"] {
 			// Undo.
 			let tmp = tempfile::TempDir::new().unwrap();
 			let base = crate::path::canonicalize(tmp.path()).unwrap();
@@ -1450,6 +1490,102 @@ mod tests {
 			"a private name was left in {}",
 			dir.display()
 		);
+	}
+
+	fn journal_batch(j: &mut Journal, batch: &str, entries: Vec<Entry>) {
+		j.append(&Entry::Begin {
+			batch: batch.into(),
+			at: 0,
+			source: "human".into(),
+			reason: String::new(),
+			digest: String::new(),
+			v: 1,
+		})
+		.unwrap();
+		for e in entries {
+			j.append(&e).unwrap();
+		}
+	}
+
+	/// A folder whose recorded mode does not let its owner open it: a restore cut short after the
+	/// mode was set still finishes (nothing has to open the folder again).
+	#[cfg(unix)]
+	#[test]
+	fn a_restore_cut_short_after_a_mode_without_read_finishes() {
+		use std::os::unix::fs::PermissionsExt;
+		let tmp = tempfile::TempDir::new().unwrap();
+		let base = crate::path::canonicalize(tmp.path()).unwrap();
+		let root = base.join("root");
+		fs::create_dir_all(&root).unwrap();
+		let d = root.join("locked");
+		let v = Validator::new([&root]).unwrap();
+		let trash = base.join("state").join("trash");
+		let mut j = Journal::open(base.join("state").join("journal.jsonl")).unwrap();
+		let b = "18e97de4eaba61d8-1";
+		journal_batch(
+			&mut j,
+			b,
+			vec![
+				Entry::Intent {
+					batch: b.into(),
+					index: 0,
+					forward: Op::Rmdir { path: d.clone() },
+					inverse: Op::Mkdir { path: d.clone() },
+				},
+				Entry::Mode { batch: b.into(), index: 0, mode: 0o055 },
+				Entry::Done { batch: b.into(), index: 0, check: None, mode: Some(0o055) },
+				Entry::Commit { batch: b.into() },
+			],
+		);
+		CRASH_AT.with(|c| c.set(Some("moded")));
+		assert!(Executor::new(&v, &mut j, &trash).undo_last().is_err());
+		CRASH_AT.with(|c| c.set(None));
+		Executor::new(&v, &mut j, &trash).undo_last().unwrap().unwrap();
+		assert_eq!(fs::symlink_metadata(&d).unwrap().permissions().mode() & 0o777, 0o055);
+		assert_no_parts(&root);
+		fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
+	}
+
+	/// `rmdir x` then `mkdir x` in one batch, cut short after the new folder was made at its
+	/// private name and before it was journaled: recovery drops it and restores the old folder.
+	#[test]
+	fn rmdir_then_mkdir_cut_short_is_rolled_back() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let base = crate::path::canonicalize(tmp.path()).unwrap();
+		let root = base.join("root");
+		fs::create_dir_all(&root).unwrap();
+		let d = root.join("x");
+		let v = Validator::new([&root]).unwrap();
+		let trash = base.join("state").join("trash");
+		let mut j = Journal::open(base.join("state").join("journal.jsonl")).unwrap();
+		let b = "18e97de4eaba61d8-2";
+		journal_batch(
+			&mut j,
+			b,
+			vec![
+				Entry::Intent {
+					batch: b.into(),
+					index: 0,
+					forward: Op::Rmdir { path: d.clone() },
+					inverse: Op::Mkdir { path: d.clone() },
+				},
+				Entry::Mode { batch: b.into(), index: 0, mode: 0o700 },
+				Entry::Done { batch: b.into(), index: 0, check: None, mode: Some(0o700) },
+				Entry::Intent {
+					batch: b.into(),
+					index: 1,
+					forward: Op::Mkdir { path: d.clone() },
+					inverse: Op::Rmdir { path: d.clone() },
+				},
+			],
+		);
+		fs::create_dir(part_path(&d, &tag(b, 1))).unwrap();
+		for _ in 0..2 {
+			let report = Executor::new(&v, &mut j, &trash).recover().unwrap();
+			assert!(report.errors.is_empty(), "{report:?}");
+		}
+		assert!(d.is_dir());
+		assert_no_parts(&root);
 	}
 
 	/// A private folder an undo made but never journaled (a crash in between) is dropped and the

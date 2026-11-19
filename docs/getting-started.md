@@ -120,7 +120,7 @@ State: /home/you/.local/state/tpfs
 
 ```console
 $ tpfs undo
-Undo batch 18e97ddd3e09330c-6c01 by human — 6 step(s): Sort downloads into folders
+Undo batch 18e97ddd3e09330c-6c01 by a person — 6 step(s): Sort downloads into folders
 These changes will be reversed:
   MKDIR   /home/you/Downloads/Invoices
   …
