@@ -190,6 +190,15 @@ impl<'a> Executor<'a> {
 				hook(i, Phase::BeforeApply);
 			}
 
+			// A folder's own permissions, so undoing its removal restores them.
+			let mode = match op {
+				#[cfg(unix)]
+				Op::Rmdir { path } => {
+					use std::os::unix::fs::PermissionsExt;
+					fs::symlink_metadata(path).ok().map(|m| m.permissions().mode() & 0o7777)
+				}
+				_ => None,
+			};
 			let published = std::cell::Cell::new(false);
 			let result = {
 				let journal = &mut self.journal;
@@ -205,11 +214,13 @@ impl<'a> Executor<'a> {
 					if let Some(hook) = &mut self.hook {
 						hook(i, Phase::AfterApply);
 					}
+					// A copy's fingerprint right after it was made: undo reverts later steps first,
+					// so at its own undo the copy is back in exactly this state unless the user changed it.
 					let check = match op {
 						Op::Copy { to, .. } => normalize(to).and_then(|t| fingerprint(&t)),
 						_ => None,
 					};
-					self.journal.append(&Entry::Done { batch: batch.clone(), index: i, check })?;
+					self.journal.append(&Entry::Done { batch: batch.clone(), index: i, check, mode })?;
 					applied.push(inverse);
 				}
 				Err(error) => {
@@ -268,27 +279,75 @@ impl<'a> Executor<'a> {
 		for step in batch.steps.iter().rev().filter(|s| s.done && !s.undone) {
 			let fail = |error: String| ExecError::Undo { batch: batch.id.clone(), error };
 			self.check_journaled(&step.inverse).map_err(fail)?;
-			if let (Op::Copy { to, .. }, Some(check)) = (&step.forward, &step.check)
-				&& let Some(to) = normalize(to)
-				&& exists(&to)
-				&& fingerprint(&to).as_ref() != Some(check)
-			{
-				return Err(fail(format!(
-					"{} was changed after it was copied; it is kept. Move it away (or trash it yourself) and undo again.",
-					crate::sanitize(to.as_os_str())
-				)));
-			}
-			// After a crash between an inverse and its record, the inverse is already applied.
-			if !already_applied(&step.inverse) {
-				apply(&step.inverse, &fs, &self.trash, &format!("{}-undo", batch.id), step.index, None, &mut || Ok(()))
-					.map_err(|e| fail(clean(format!("{}: {e}", step.inverse))))?;
-			}
+			self.copy_unchanged(step).map_err(fail)?;
+			self.replay(&fs, &batch.id, "undo", step).map_err(|e| fail(clean(format!("{}: {e}", step.inverse))))?;
 			self.journal.append(&Entry::UndoStep { batch: batch.id.clone(), index: step.index })?;
 			reverted += 1;
 		}
 
 		self.journal.append(&Entry::Undo { batch: batch.id.clone() })?;
 		Ok(Some(BatchReport { id: batch.id, steps: reverted }))
+	}
+
+	/// A copy changed since its batch finished is the user's now: undo and recovery keep it.
+	fn copy_unchanged(&self, step: &crate::journal::Step) -> Result<(), String> {
+		if let (Op::Copy { to, .. }, Some(check)) = (&step.forward, &step.check)
+			&& let Some(to) = normalize(to)
+			&& exists(&to)
+			&& fingerprint(&to).as_ref() != Some(check)
+		{
+			return Err(format!(
+				"{} was changed after it was copied; it is kept. Move it away (or trash it yourself) and try again.",
+				crate::sanitize(to.as_os_str())
+			));
+		}
+		Ok(())
+	}
+
+	/// Apply a committed step's inverse (undo or recovery), resuming whatever an earlier, interrupted
+	/// attempt left: a partial copy is dropped and redone, a cross-device move whose copy was
+	/// already published is finished, a letter-case rename stuck at its temporary name is completed,
+	/// and an inverse that already took effect is skipped.
+	fn replay(&mut self, fs: &Fs, batch: &str, what: &str, step: &crate::journal::Step) -> io::Result<()> {
+		let label = format!("{batch}-{what}");
+		let t = tag(&label, step.index);
+		let n = |p: &Path| normalize(p).unwrap_or_else(|| p.to_path_buf());
+		match &step.inverse {
+			Op::Move { to, .. } => remove_part(&part_path(&n(to), &t))?,
+			Op::Trash { path } => {
+				let slot = trash_slot(&self.trash, &label, step.index, &n(path));
+				remove_part(&part_path(&slot, &t))?;
+			}
+			Op::Rename { path, new_name } => {
+				let tmp = case_tmp(&n(path), &t);
+				if exists(&tmp) {
+					fs.rename_noreplace(&tmp, &n(path).with_file_name(new_name))?;
+					return Ok(());
+				}
+			}
+			_ => {}
+		}
+		if let Op::Move { from, to } = &step.inverse
+			&& step.undo_published
+			&& exists(&n(from))
+			&& exists(&n(to))
+		{
+			// The copy reached its place; what is left at the old place duplicates it.
+			return apply(&Op::Trash { path: n(from) }, fs, &self.trash, &label, step.index, None, &mut || Ok(()));
+		}
+		if already_applied(&step.inverse) {
+			return Ok(());
+		}
+		let journal = &mut self.journal;
+		let mut publish = || journal.append(&Entry::UndoPublished { batch: batch.to_owned(), index: step.index });
+		apply(&step.inverse, fs, &self.trash, &label, step.index, None, &mut publish)?;
+		// Restore a removed folder's own permissions, not the default ones.
+		#[cfg(unix)]
+		if let (Op::Mkdir { path }, Some(mode)) = (&step.inverse, step.mode) {
+			use std::os::unix::fs::PermissionsExt;
+			crate::fsops::set_dir_mode_at(fs, &n(path), fs::Permissions::from_mode(mode))?;
+		}
+		Ok(())
 	}
 
 	/// A journaled operation replayed by undo or recovery must stay where tpfs may act: below the
@@ -353,12 +412,18 @@ impl<'a> Executor<'a> {
 			}
 			let mut errors = Vec::new();
 			for step in batch.steps.iter().rev() {
-				let fixes = if step.done {
-					if already_applied(&step.inverse) { vec![] } else { vec![Fix::Op(step.inverse.clone())] }
-				} else {
-					cleanup(&step.forward, &step.inverse, &tag(&batch.id, step.index), step.published)
-				};
-				for fix in fixes {
+				if step.done {
+					let result = self
+						.check_journaled(&step.inverse)
+						.and_then(|()| self.copy_unchanged(step))
+						.map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))
+						.and_then(|()| self.replay(&fs, &batch.id, "recover", step));
+					if let Err(e) = result {
+						errors.push(clean(format!("{}: {e}", step.inverse)));
+					}
+					continue;
+				}
+				for fix in cleanup(&step.forward, &step.inverse, &tag(&batch.id, step.index), step.published) {
 					let result = match &fix {
 						Fix::Op(op) => {
 							self.check_journaled(op).map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))
@@ -441,7 +506,13 @@ fn fingerprint(path: &Path) -> Option<String> {
 	fn walk(path: &Path, rel: &Path, h: &mut Sha256, budget: &mut usize) -> Option<()> {
 		*budget = budget.checked_sub(1)?;
 		let m = fs::symlink_metadata(path).ok()?;
-		let mtime = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+		// Folder times are left out: adding and removing entries (by later steps and their undo)
+		// changes them without changing anything the user made.
+		let mtime = if m.is_dir() {
+			0
+		} else {
+			m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos())
+		};
 		h.update(format!("{}\0{}\0{}\0{mtime}\n", rel.display(), m.is_dir(), if m.is_dir() { 0 } else { m.len() }));
 		if m.is_dir() {
 			let mut names: Vec<_> = fs::read_dir(path).ok()?.filter_map(|e| e.ok().map(|e| e.file_name())).collect();

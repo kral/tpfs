@@ -294,7 +294,7 @@ fn recover_rolls_back_a_batch_interrupted_by_a_crash() {
 	})
 	.unwrap();
 	fs::create_dir(&dir).unwrap();
-	j.append(&Entry::Done { batch: batch.clone(), index: 0, check: None }).unwrap();
+	j.append(&Entry::Done { batch: batch.clone(), index: 0, check: None, mode: None }).unwrap();
 	j.append(&Entry::Intent {
 		batch: batch.clone(),
 		index: 1,
@@ -512,7 +512,7 @@ fn recover_last_only_touches_an_interrupted_newest_batch() {
 		})
 		.unwrap();
 		fs::create_dir(&dir).unwrap();
-		j.append(&Entry::Done { batch: id.into(), index: 0, check: None }).unwrap();
+		j.append(&Entry::Done { batch: id.into(), index: 0, check: None, mode: None }).unwrap();
 	};
 	crashed(&mut j, "old");
 	let v = Validator::new([&s.root]).unwrap();
@@ -538,7 +538,7 @@ fn recover_last_only_touches_an_interrupted_newest_batch() {
 	})
 	.unwrap();
 	fs::create_dir(&newer).unwrap();
-	j.append(&Entry::Done { batch: "n".into(), index: 0, check: None }).unwrap();
+	j.append(&Entry::Done { batch: "n".into(), index: 0, check: None, mode: None }).unwrap();
 	j.append(&Entry::Commit { batch: "n".into() }).unwrap();
 
 	let r = Executor::new(&v, &mut j, s.trash()).recover_last().unwrap();
@@ -730,7 +730,7 @@ fn recover_is_idempotent_and_retryable() {
 		inverse,
 	})
 	.unwrap();
-	j.append(&Entry::Done { batch: "x".into(), index: 0, check: None }).unwrap();
+	j.append(&Entry::Done { batch: "x".into(), index: 0, check: None, mode: None }).unwrap();
 	drop(j);
 	fs::rename(&a, s.root.join("b.txt")).unwrap();
 	// Something now sits where the file has to go back: recovery cannot finish yet.
@@ -803,7 +803,7 @@ fn damage_inside_a_batch_stops_automatic_recovery() {
 	bytes.extend_from_slice(b"garbage that was an intent\n");
 	fs::write(&path, bytes).unwrap();
 	let mut j = s.journal();
-	j.append(&Entry::Done { batch: "x".into(), index: 0, check: None }).unwrap();
+	j.append(&Entry::Done { batch: "x".into(), index: 0, check: None, mode: None }).unwrap();
 	fs::rename(&a, &b).unwrap(); // whatever the lost step did
 
 	assert!(j.batches().unwrap()[0].damaged);
@@ -884,4 +884,110 @@ fn a_lost_commit_or_begin_is_damage_not_a_reason_to_roll_back_or_skip() {
 
 fn path_of(s: &Sandbox) -> PathBuf {
 	s.state.join("journal.jsonl")
+}
+
+#[test]
+fn undo_finishes_what_an_interrupted_undo_started() {
+	// A move whose undo crashed after the copy back was published, with the far side half removed.
+	let s = Sandbox::new();
+	let dir = s.dir("dir");
+	fs::write(dir.join("a"), "A").unwrap();
+	fs::write(dir.join("b"), "B").unwrap();
+	let away = s.root.join("away");
+	let id = run(&s, vec![Op::Move { from: dir.clone(), to: away.clone() }]);
+	// The interrupted undo: the copy is back at `dir`, `away` lost one entry already.
+	fs::create_dir(&dir).unwrap();
+	fs::write(dir.join("a"), "A").unwrap();
+	fs::write(dir.join("b"), "B").unwrap();
+	fs::remove_file(away.join("b")).unwrap();
+	let mut j = s.journal();
+	j.append(&Entry::UndoPublished { batch: id.clone(), index: 0 }).unwrap();
+	drop(j);
+
+	assert_eq!(undo(&s).unwrap().unwrap().steps, 1);
+	assert!(!away.exists());
+	assert_eq!(fs::read_to_string(dir.join("b")).unwrap(), "B");
+}
+
+#[test]
+fn undo_drops_a_stale_partial_copy_and_completes_a_stuck_case_rename() {
+	let s = Sandbox::new();
+	let a = s.file("a.txt", "A");
+	let id = run(&s, vec![Op::Rename { path: a.clone(), new_name: "renamed.txt".into() }]);
+	// An earlier undo stopped between the two renames of a letter-case style rename.
+	let tmp = s.root.join(format!(".tpfs-case-{id}-undo-0"));
+	fs::rename(s.root.join("renamed.txt"), &tmp).unwrap();
+	assert_eq!(undo(&s).unwrap().unwrap().steps, 1);
+	assert_eq!(fs::read_to_string(&a).unwrap(), "A");
+	assert!(!tmp.exists());
+
+	let s = Sandbox::new();
+	let a = s.file("a.txt", "A");
+	let b = s.root.join("b.txt");
+	let id = run(&s, vec![Op::Move { from: a.clone(), to: b.clone() }]);
+	fs::write(s.root.join(format!(".tpfs-part-{id}-undo-0")), "half a copy").unwrap();
+	assert_eq!(undo(&s).unwrap().unwrap().steps, 1);
+	assert!(a.exists() && !s.root.join(format!(".tpfs-part-{id}-undo-0")).exists());
+}
+
+#[test]
+fn a_plan_may_change_its_own_copy_and_still_be_undone() {
+	let s = Sandbox::new();
+	let src = s.dir("src");
+	fs::write(src.join("f"), "f").unwrap();
+	let x = s.file("x.txt", "x");
+	let copy = s.root.join("copy");
+	run(
+		&s,
+		vec![
+			Op::Copy { from: src, to: copy.clone() },
+			Op::Mkdir { path: copy.join("sub") },
+			Op::Move { from: x.clone(), to: copy.join("x.txt") },
+		],
+	);
+	assert_eq!(undo(&s).unwrap().unwrap().steps, 3);
+	assert!(!copy.exists() && x.exists());
+}
+
+#[test]
+fn recover_keeps_a_copy_edited_after_the_crash() {
+	let s = Sandbox::new();
+	let a = s.file("a.txt", "A");
+	let b = s.root.join("b.txt");
+	fs::copy(&a, &b).unwrap();
+	let mut j = s.journal();
+	j.append(&Entry::Begin {
+		batch: "x".into(),
+		at: 0,
+		source: "human".into(),
+		reason: String::new(),
+		digest: String::new(),
+		v: 1,
+	})
+	.unwrap();
+	j.append(&Entry::Intent {
+		batch: "x".into(),
+		index: 0,
+		forward: Op::Copy { from: a.clone(), to: b.clone() },
+		inverse: Op::Trash { path: b.clone() },
+	})
+	.unwrap();
+	j.append(&Entry::Done { batch: "x".into(), index: 0, check: None, mode: None }).unwrap();
+	j.append(&Entry::Check { batch: "x".into(), index: 0, check: "fingerprint of the original copy".into() }).unwrap();
+	fs::write(&b, "edited after the crash").unwrap();
+	let report = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
+	assert!(report.errors.iter().any(|e| e.contains("changed")), "{report:?}");
+	assert_eq!(fs::read_to_string(&b).unwrap(), "edited after the crash");
+}
+
+#[test]
+#[cfg(unix)]
+fn undoing_a_folder_removal_restores_its_permissions() {
+	use std::os::unix::fs::PermissionsExt;
+	let s = Sandbox::new();
+	let d = s.dir("private");
+	fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
+	run(&s, vec![Op::Rmdir { path: d.clone() }]);
+	undo(&s).unwrap().unwrap();
+	assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o700);
 }

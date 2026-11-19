@@ -385,6 +385,11 @@ pub(crate) fn remove_part(part: &Path) -> io::Result<()> {
 	std::fs::remove_dir_all(part)
 }
 
+/// Set a folder's permissions through `fs` (confined on Linux).
+pub(crate) fn set_dir_mode_at(fs: &Fs, dir: &Path, perms: std::fs::Permissions) -> io::Result<()> {
+	fs.set_dir_mode(dir, perms)
+}
+
 /// Set a directory's permissions through a handle opened without following a final symlink, so
 /// a symlink swapped in for it cannot redirect the change to another file.
 fn set_dir_mode(dir: &Path, perms: std::fs::Permissions) -> io::Result<()> {
