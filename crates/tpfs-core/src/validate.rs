@@ -413,7 +413,8 @@ fn check_names(path: &Path) -> Result<(), String> {
 /// A folder where another file system is mounted cannot be moved or trashed (the kernel refuses,
 /// and copying it into a trash on its own volume would copy it into itself): refused up front.
 fn refuse_mount_point(path: &Path) -> Result<(), String> {
-	let refuse = || {
+	#[cfg_attr(not(unix), allow(unused_variables))]
+	let refuse = || -> Result<(), String> {
 		Err(format!(
 			"{} is a mount point or a separate file system (another disk, a share, a subvolume); work on what is inside it",
 			show(path)
