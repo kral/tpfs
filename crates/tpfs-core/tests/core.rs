@@ -298,7 +298,7 @@ fn recover_rolls_back_a_batch_interrupted_by_a_crash() {
 	fs::rename(&a, &moved).unwrap();
 	let _ = b;
 
-	let v = Validator::new(["/"]).unwrap();
+	let v = Validator::new(tpfs_core::system_roots()).unwrap();
 	let report = Executor::new(&v, &mut j, s.trash()).recover().unwrap();
 	assert!(report.errors.is_empty(), "{:?}", report.errors);
 	assert_eq!(report.rolled_back, vec![batch]);

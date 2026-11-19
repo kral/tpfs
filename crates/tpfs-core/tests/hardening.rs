@@ -170,7 +170,7 @@ fn crash_at_every_step_is_recovered() {
 			panic::set_hook(default_hook);
 			assert!(crashed.is_err(), "no crash at step {crash_at} {phase:?}");
 
-			let v = Validator::new(["/"]).unwrap();
+			let v = Validator::new(tpfs_core::system_roots()).unwrap();
 			let mut j = s.journal();
 			let report = Executor::new(&v, &mut j, s.state.join("trash")).recover().unwrap();
 			assert!(report.errors.is_empty(), "step {crash_at} {phase:?}: {:?}", report.errors);
@@ -222,7 +222,7 @@ fn trash_stays_on_the_same_file_system() {
 	assert!(local.is_dir(), "the file was not trashed on its own file system");
 	assert!(!trash.join(&batch.id).exists());
 
-	Executor::new(&Validator::new(["/"]).unwrap(), &mut j, &trash).undo_last().unwrap().unwrap();
+	Executor::new(&Validator::new(tpfs_core::system_roots()).unwrap(), &mut j, &trash).undo_last().unwrap().unwrap();
 	assert_eq!(fs::read_to_string(&file).unwrap(), "N");
 }
 
@@ -264,7 +264,7 @@ fn recover_leaves_a_target_that_is_not_ours() {
 	assert!(crashed.is_err());
 
 	fs::write(&foreign, "someone else's").unwrap();
-	let v = Validator::new(["/"]).unwrap();
+	let v = Validator::new(tpfs_core::system_roots()).unwrap();
 	let mut j = s.journal();
 	let report = Executor::new(&v, &mut j, s.state.join("trash")).recover().unwrap();
 	assert!(report.errors.is_empty(), "{:?}", report.errors);
