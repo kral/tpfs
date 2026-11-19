@@ -39,14 +39,17 @@ impl Fs {
 		}
 	}
 
-	/// Rename that fails with `AlreadyExists` instead of replacing the target.
+	/// Rename that fails with `AlreadyExists` instead of replacing the target, atomically where the
+	/// platform can: `renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on macOS,
+	/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows. Only a file system without such
+	/// support (some network and FUSE file systems) falls back to check-then-rename.
 	pub(crate) fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
 		#[cfg(target_os = "linux")]
 		if let Some(result) = linux::rename(&self.anchors, from, to) {
 			return result;
 		}
 
-		#[cfg(target_os = "linux")]
+		#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 		{
 			use rustix::{
 				fs::{CWD, RenameFlags, renameat_with},
@@ -59,10 +62,44 @@ impl Fs {
 			}
 		}
 
-		if fs::symlink_metadata(to).is_ok() {
-			return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("target exists: {}", to.display())));
+		#[cfg(windows)]
+		{
+			windows::move_noreplace(from, to)
 		}
-		fs::rename(from, to)
+		#[cfg(not(windows))]
+		{
+			if fs::symlink_metadata(to).is_ok() {
+				return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("target exists: {}", to.display())));
+			}
+			fs::rename(from, to)
+		}
+	}
+
+	/// Remove a file or symlink (never a directory), confined like the other operations.
+	pub(crate) fn remove_file(&self, path: &Path) -> io::Result<()> {
+		#[cfg(target_os = "linux")]
+		if let Some(result) = linux::unlink(&self.anchors, path) {
+			return result;
+		}
+		fs::remove_file(path)
+	}
+
+	/// Names in a directory, read through a confined descriptor where possible, so a directory
+	/// swapped for a symlink is not followed out of the root.
+	fn list(&self, dir: &Path) -> io::Result<Vec<std::ffi::OsString>> {
+		#[cfg(target_os = "linux")]
+		if let Some(result) = linux::list(&self.anchors, dir) {
+			return result;
+		}
+		fs::read_dir(dir)?.map(|e| e.map(|e| e.file_name())).collect()
+	}
+
+	fn symlink(&self, target: &Path, path: &Path) -> io::Result<()> {
+		#[cfg(target_os = "linux")]
+		if let Some(result) = linux::symlink(&self.anchors, target, path) {
+			return result;
+		}
+		make_symlink(target, path)
 	}
 
 	/// Move a file, directory or symlink. Within a file system this is one no-replace rename.
@@ -82,7 +119,7 @@ impl Fs {
 		match self.rename_noreplace(from, to) {
 			Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
 				let copied = self.copy_published(from, to, part, publish)?;
-				let left = remove_copied(from, &copied)?;
+				let left = remove_copied(self, from, &copied)?;
 				sync_parent(from);
 				if left.is_empty() {
 					Ok(())
@@ -139,8 +176,8 @@ impl Fs {
 	}
 
 	/// Copy a file, directory (recursively) or symlink (as a symlink), recording what was copied.
-	/// Never overwrites. A top-level file inside a root is read and created through confined
-	/// descriptors; the inside of a copied directory is walked by path.
+	/// Never overwrites. On Linux every entry under a root, at any depth, is listed, read and
+	/// created through descriptors confined to that root.
 	fn copy_tree(&self, from: &Path, to: &Path, rel: &Path, copied: &mut Vec<Copied>) -> io::Result<()> {
 		let meta = fs::symlink_metadata(from)?;
 		let ft = meta.file_type();
@@ -158,14 +195,12 @@ impl Fs {
 		} else if ft.is_dir() {
 			self.mkdir(to)?;
 			copied.push(Copied::of(rel, &meta));
-			for entry in fs::read_dir(from)? {
-				let entry = entry?;
-				let name = entry.file_name();
-				Fs::unconfined().copy_tree(&entry.path(), &to.join(&name), &rel.join(&name), copied)?;
+			for name in self.list(from)? {
+				self.copy_tree(&from.join(&name), &to.join(&name), &rel.join(&name), copied)?;
 			}
 			return fs::set_permissions(to, meta.permissions());
 		} else if ft.is_symlink() {
-			copy_symlink(from, to)?;
+			self.symlink(&fs::read_link(from)?, to)?;
 		} else {
 			return Err(io::Error::new(io::ErrorKind::Unsupported, format!("special file: {}", from.display())));
 		}
@@ -206,13 +241,16 @@ fn copy_stream(mut src: File, mut dst: File, from: &Path, meta: &fs::Metadata) -
 }
 
 #[cfg(unix)]
-fn copy_symlink(from: &Path, to: &Path) -> io::Result<()> {
-	std::os::unix::fs::symlink(fs::read_link(from)?, to)
+fn make_symlink(target: &Path, path: &Path) -> io::Result<()> {
+	std::os::unix::fs::symlink(target, path)
 }
 
 #[cfg(not(unix))]
-fn copy_symlink(from: &Path, _: &Path) -> io::Result<()> {
-	Err(io::Error::new(io::ErrorKind::Unsupported, format!("symlink: {}", from.display())))
+fn make_symlink(_: &Path, path: &Path) -> io::Result<()> {
+	Err(io::Error::new(
+		io::ErrorKind::Unsupported,
+		format!("copying a symlink is not supported here: {}", path.display()),
+	))
 }
 
 /// One entry copied by `copy_tree`, as the source looked when it was read.
@@ -235,11 +273,11 @@ impl Copied {
 
 /// Remove from `from` exactly the entries that were copied and have not changed since, children
 /// before parents. Returns what was left in place (changed, new, or a folder that is not empty).
-fn remove_copied(from: &Path, copied: &[Copied]) -> io::Result<Vec<PathBuf>> {
+fn remove_copied(fs: &Fs, from: &Path, copied: &[Copied]) -> io::Result<Vec<PathBuf>> {
 	let mut left = Vec::new();
 	for c in copied.iter().rev() {
 		let path = if c.rel.as_os_str().is_empty() { from.to_path_buf() } else { from.join(&c.rel) };
-		let meta = match fs::symlink_metadata(&path) {
+		let meta = match std::fs::symlink_metadata(&path) {
 			Ok(m) => m,
 			Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
 			Err(e) => return Err(e),
@@ -248,7 +286,7 @@ fn remove_copied(from: &Path, copied: &[Copied]) -> io::Result<Vec<PathBuf>> {
 			left.push(path);
 			continue;
 		}
-		let removed = if c.dir { fs::remove_dir(&path) } else { fs::remove_file(&path) };
+		let removed = if c.dir { fs.rmdir(&path) } else { fs.remove_file(&path) };
 		if removed.is_err() {
 			left.push(path);
 		}
@@ -452,6 +490,45 @@ mod linux {
 		})())
 	}
 
+	pub(super) fn unlink(anchors: &[Anchor], path: &Path) -> Option<io::Result<()>> {
+		Some(locate(anchors, path)?.and_then(|(fd, name)| Ok(unlinkat(&fd, name, AtFlags::empty())?)))
+	}
+
+	pub(super) fn symlink(anchors: &[Anchor], target: &Path, path: &Path) -> Option<io::Result<()>> {
+		Some(locate(anchors, path)?.and_then(|(fd, name)| Ok(rustix::fs::symlinkat(target, &fd, name)?)))
+	}
+
+	/// List a directory opened beneath its root without following symlinks.
+	pub(super) fn list(anchors: &[Anchor], dir: &Path) -> Option<io::Result<Vec<std::ffi::OsString>>> {
+		use std::os::unix::ffi::OsStrExt;
+		let anchor = anchors.iter().filter(|a| dir.starts_with(&a.root)).max_by_key(|a| a.root.as_os_str().len())?;
+		let rel = dir.strip_prefix(&anchor.root).ok()?;
+		let rel = if rel.as_os_str().is_empty() { Path::new(".") } else { rel };
+		let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+		let fd = match openat2(&anchor.fd, rel, flags, Mode::empty(), RESOLVE) {
+			Ok(fd) => fd,
+			Err(Errno::NOSYS) => return None,
+			Err(Errno::LOOP | Errno::XDEV) => {
+				return Some(Err(io::Error::new(
+					io::ErrorKind::PermissionDenied,
+					format!("refused: {} goes through a symlink or leaves the allowed folder", dir.display()),
+				)));
+			}
+			Err(e) => return Some(Err(e.into())),
+		};
+		Some((|| {
+			let mut names = Vec::new();
+			for entry in rustix::fs::Dir::read_from(&fd)? {
+				let entry = entry?;
+				let name = entry.file_name().to_bytes();
+				if name != b"." && name != b".." {
+					names.push(OsStr::from_bytes(name).to_os_string());
+				}
+			}
+			Ok(names)
+		})())
+	}
+
 	pub(super) fn mkdir(anchors: &[Anchor], path: &Path) -> Option<io::Result<()>> {
 		Some(locate(anchors, path)?.and_then(|(fd, name)| Ok(mkdirat(&fd, name, Mode::from_raw_mode(0o777))?)))
 	}
@@ -482,6 +559,26 @@ mod linux {
 		let dst = openat(dfd, dname, create, Mode::from_raw_mode(meta.permissions().mode() & 0o7777))?;
 
 		Ok(Some((File::from(src), File::from(dst))))
+	}
+}
+
+#[cfg(windows)]
+mod windows {
+	use std::{io, os::windows::ffi::OsStrExt, path::Path};
+
+	use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+	fn wide(p: &Path) -> Vec<u16> {
+		p.as_os_str().encode_wide().chain(Some(0)).collect()
+	}
+
+	/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` (fails with ERROR_ALREADY_EXISTS) and without
+	/// `MOVEFILE_COPY_ALLOWED` (another volume fails with ERROR_NOT_SAME_DEVICE = CrossesDevices).
+	pub(super) fn move_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+		let (from, to) = (wide(from), wide(to));
+		// SAFETY: both buffers are NUL-terminated UTF-16 strings that outlive the call.
+		let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+		if ok == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 	}
 }
 
@@ -573,5 +670,27 @@ mod tests {
 		assert_eq!(fs::read_to_string(source.join("sub/b")).unwrap(), "B");
 		assert_eq!(rest, std::slice::from_ref(&target), "the stale duplicate goes to the trash, not away");
 		assert!(target.join("a").exists());
+	}
+
+	/// What the recursive copy does below the top level: every nested entry is listed and created
+	/// through the root's descriptor, so a folder swapped for a symlink mid-copy is not followed.
+	#[test]
+	fn nested_copy_steps_are_confined() {
+		let t = tempfile::TempDir::new().unwrap();
+		let base = crate::path::canonicalize(t.path()).unwrap();
+		let (root, outside) = (base.join("root"), base.join("outside"));
+		fs::create_dir_all(root.join("src")).unwrap();
+		fs::write(root.join("src/a"), "a").unwrap();
+		fs::create_dir_all(outside.join("x")).unwrap();
+		std::os::unix::fs::symlink(&outside, root.join("swapped")).unwrap();
+		let fs_ = Fs::confined(std::slice::from_ref(&root));
+
+		// Creating a nested entry under the swapped folder is refused…
+		let err = fs_.copy_tree(&root.join("src/a"), &root.join("swapped/x/a"), Path::new("a"), &mut Vec::new());
+		assert!(err.is_err());
+		assert!(!outside.join("x/a").exists(), "wrote outside the root");
+		// …and so is listing through it.
+		assert!(fs_.list(&root.join("swapped/x")).is_err());
+		assert_eq!(fs_.list(&root.join("src")).unwrap(), ["a"]);
 	}
 }
