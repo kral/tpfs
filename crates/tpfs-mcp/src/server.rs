@@ -187,6 +187,10 @@ impl Server {
 		let mut total = 0usize;
 		let mut entries: Vec<(bool, String, u64)> = Vec::new();
 		for e in fs::read_dir(&dir).map_err(|e| format!("{}: {e}", show(&dir)))?.filter_map(Result::ok) {
+			// tpfs's own working entries (local trash, partial copies) are not the agent's business.
+			if e.file_name().to_str().is_some_and(|n| n.starts_with(".tpfs-")) {
+				continue;
+			}
 			total += 1;
 			if entries.len() < SCAN {
 				let meta = fs::symlink_metadata(e.path()).ok();

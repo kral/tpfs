@@ -157,7 +157,9 @@ fn rejects_paths_through_symlinks() {
 fn refuses_to_copy_special_files() {
 	let s = Sandbox::new();
 	let fifo = s.root.join("pipe");
-	assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+	// mknodat, not a `mkfifo` process: a forked child briefly holds other tests' journal locks.
+	rustix::fs::mknodat(rustix::fs::CWD, &fifo, rustix::fs::FileType::Fifo, rustix::fs::Mode::from_raw_mode(0o600), 0)
+		.unwrap();
 	let m = messages(&s.validator(), &Plan::new(vec![Op::Copy { from: fifo, to: s.root.join("copy") }], ""));
 	assert!(m.len() == 1 && m[0].contains("Special"), "{m:?}");
 }
@@ -779,4 +781,16 @@ fn damage_inside_a_batch_stops_automatic_recovery() {
 	let report = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
 	assert!(report.rolled_back.is_empty() && report.errors[0].contains("damaged"), "{report:?}");
 	assert!(b.exists(), "nothing is guessed");
+}
+
+#[test]
+fn preview_and_risk_see_the_path_that_is_acted_on() {
+	let s = Sandbox::new();
+	s.dir("Photos");
+	s.dir("tmp");
+	let sneaky = s.root.join("tmp").join("..").join("Photos");
+	let plan = Plan::new(vec![Op::Trash { path: sneaky }], "");
+	let line = &plan.preview()[0];
+	assert!(!line.contains("..") && line.ends_with("Photos"), "{line}");
+	assert_eq!(tpfs_core::risk::assess(&plan, Source::Human).level, tpfs_core::risk::Level::High);
 }

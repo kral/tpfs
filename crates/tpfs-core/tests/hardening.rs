@@ -271,8 +271,12 @@ fn recover_leaves_a_target_that_is_not_ours() {
 	assert_eq!(fs::read_to_string(&foreign).unwrap(), "someone else's");
 }
 
+/// Without spawning a process: a child forked by another test would briefly inherit open journal
+/// descriptors and hold their lock.
+#[cfg(unix)]
 fn mkfifo(p: &Path) {
-	assert!(std::process::Command::new("mkfifo").arg(p).status().unwrap().success());
+	use rustix::fs::{CWD, FileType, Mode, mknodat};
+	mknodat(CWD, p, FileType::Fifo, Mode::from_raw_mode(0o600), 0).unwrap();
 }
 
 /// A regular file swapped for a FIFO after validation must not make the copy block forever,

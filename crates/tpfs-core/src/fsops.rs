@@ -473,6 +473,21 @@ mod linux {
 		}
 	}
 
+	/// Without `openat2` (Linux < 5.6, or a seccomp filter in a container) operations cannot be
+	/// confined against symlinks swapped in after validation. tpfs refuses to run them then, unless
+	/// the user accepts the weaker guarantee with `TPFS_ALLOW_UNCONFINED=1`.
+	fn unconfined_ok() -> bool {
+		std::env::var_os("TPFS_ALLOW_UNCONFINED").is_some_and(|v| v == "1")
+	}
+
+	fn no_openat2() -> io::Error {
+		io::Error::new(
+			io::ErrorKind::Unsupported,
+			"this kernel has no openat2, so tpfs cannot confine operations to the allowed folders; \
+			 set TPFS_ALLOW_UNCONFINED=1 to proceed without that protection",
+		)
+	}
+
 	const RESOLVE: ResolveFlags =
 		ResolveFlags::BENEATH.union(ResolveFlags::NO_SYMLINKS).union(ResolveFlags::NO_MAGICLINKS);
 
@@ -486,7 +501,8 @@ mod linux {
 
 		match openat2(&anchor.fd, parent, OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty(), RESOLVE) {
 			Ok(fd) => Some(Ok((fd, name))),
-			Err(Errno::NOSYS) => None,
+			Err(Errno::NOSYS) if unconfined_ok() => None,
+			Err(Errno::NOSYS) => Some(Err(no_openat2())),
 			Err(Errno::LOOP | Errno::XDEV) => Some(Err(io::Error::new(
 				io::ErrorKind::PermissionDenied,
 				format!("refused: {} goes through a symlink or leaves the allowed folder", path.display()),
@@ -548,7 +564,8 @@ mod linux {
 		let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
 		let fd = match openat2(&anchor.fd, rel, flags, Mode::empty(), RESOLVE) {
 			Ok(fd) => fd,
-			Err(Errno::NOSYS) => return None,
+			Err(Errno::NOSYS) if unconfined_ok() => return None,
+			Err(Errno::NOSYS) => return Some(Err(no_openat2())),
 			Err(Errno::LOOP | Errno::XDEV) => {
 				return Some(Err(io::Error::new(
 					io::ErrorKind::PermissionDenied,

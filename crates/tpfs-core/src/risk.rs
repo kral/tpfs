@@ -25,6 +25,9 @@ pub struct Risk {
 }
 
 pub fn assess(plan: &Plan, source: Source) -> Risk {
+	// Judge the paths the executor will act on (`a/tmp/../Photos` is `a/Photos`).
+	let normalized = plan.normalized();
+	let plan = &normalized;
 	let mut level = Level::Low;
 	let mut reasons = Vec::new();
 	let mut raise = |l: Level, why: String| {
