@@ -17,6 +17,8 @@ tpfs mcp --root <dir>... [--approval terminal|client]
 tpfs pending
 tpfs approve <planId>
 tpfs reject <planId>
+tpfs guard
+tpfs doctor [<project>]
 ```
 
 Every command also takes `--home <dir>` (see [Global options](#global-options)). A flag a command

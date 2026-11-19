@@ -420,7 +420,9 @@ fn guard_refuses_file_deleting_shell_commands() {
 		child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
 		child.wait_with_output().unwrap()
 	};
-	let o = run(r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf tests/ patches/ plan/ ~/"}}"#);
+	let o = run(
+		r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf tests/ patches/ plan/ ~/"}}"#,
+	);
 	assert_eq!(code(&o), 0);
 	let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
 	assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
