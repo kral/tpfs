@@ -158,7 +158,7 @@ impl<'a> Executor<'a> {
 			.batches()?
 			.into_iter()
 			.rev()
-			.find(|b| b.status != BatchStatus::Aborted && b.status != BatchStatus::Undone)
+			.find(|b| !matches!(b.status, BatchStatus::Aborted | BatchStatus::Undone | BatchStatus::Abandoned))
 			.filter(|b| b.status == BatchStatus::Incomplete)
 		{
 			return Err(ExecError::Blocked(format!(
@@ -266,8 +266,10 @@ impl<'a> Executor<'a> {
 	/// be reachable without symlinks below the validator's roots, or in the trash.
 	pub fn undo_last(&mut self) -> Result<Option<BatchReport>, ExecError> {
 		let batches = self.journal.batches()?;
-		if let Some(b) =
-			batches.iter().rev().find(|b| b.status != BatchStatus::Aborted && b.status != BatchStatus::Undone)
+		if let Some(b) = batches
+			.iter()
+			.rev()
+			.find(|b| !matches!(b.status, BatchStatus::Aborted | BatchStatus::Undone | BatchStatus::Abandoned))
 			&& b.status == BatchStatus::Incomplete
 		{
 			return Err(ExecError::Undo {
@@ -347,10 +349,29 @@ impl<'a> Executor<'a> {
 		let t = tag(&label, step.index);
 		let n = |p: &Path| normalize(p).unwrap_or_else(|| p.to_path_buf());
 		match &step.inverse {
-			Op::Move { to, .. } => remove_part(&part_path(&n(to), &t))?,
+			Op::Move { from, to } => {
+				let part = part_path(&n(to), &t);
+				if step.undo_published && !exists(&part) && exists(&n(from)) && exists(&n(to)) {
+					// An earlier attempt published its copy (the part is gone, renamed into place):
+					// what is left at the old place duplicates it.
+					return apply(&Op::Trash { path: n(from) }, fs, &self.trash, &label, step.index, None, &mut || {
+						Ok(())
+					});
+				}
+				remove_part(&part)?;
+			}
 			Op::Trash { path } => {
 				let slot = trash_slot(&self.trash, &label, step.index, &n(path));
-				remove_part(&part_path(&slot, &t))?;
+				let part = part_path(&slot, &t);
+				if step.undo_published && !exists(&part) && exists(&slot) && exists(&n(path)) {
+					// An earlier attempt got the item into its trash slot and stopped while removing
+					// the original: what is left duplicates it; it goes to a trash slot of its own.
+					let rest = format!("{label}-rest");
+					return apply(&Op::Trash { path: n(path) }, fs, &self.trash, &rest, step.index, None, &mut || {
+						Ok(())
+					});
+				}
+				remove_part(&part)?;
 			}
 			Op::Rename { path, new_name } => {
 				let tmp = case_tmp(&n(path), &t);
@@ -360,16 +381,6 @@ impl<'a> Executor<'a> {
 				}
 			}
 			_ => {}
-		}
-		// The copy reached its place if the journal says so — or if a crash came between publishing
-		// it and recording that, in which case both sides hold the same tree (copies keep times).
-		if let Op::Move { from, to } = &step.inverse
-			&& exists(&n(from))
-			&& exists(&n(to))
-			&& (step.undo_published || fingerprint(&n(from)).is_some_and(|f| fingerprint(&n(to)) == Some(f)))
-		{
-			// The copy reached its place; what is left at the old place duplicates it.
-			return apply(&Op::Trash { path: n(from) }, fs, &self.trash, &label, step.index, None, &mut || Ok(()));
 		}
 		if already_applied(&step.inverse) {
 			return Ok(());
@@ -433,7 +444,7 @@ impl<'a> Executor<'a> {
 		let batches = self.journal.batches()?;
 		match batches.iter().find(|b| b.id == id) {
 			Some(b) if b.status == BatchStatus::Incomplete => {
-				self.journal.append(&Entry::Abort { batch: id.to_owned() })?;
+				self.journal.append(&Entry::Abandon { batch: id.to_owned() })?;
 				Ok(())
 			}
 			Some(_) => Err(ExecError::Blocked(format!("batch {id} is not interrupted; nothing to abandon"))),
@@ -681,6 +692,10 @@ fn apply(
 			};
 			let parent = slot.parent().ok_or_else(|| io::Error::other("trash slot without a parent"))?;
 			fs::create_dir_all(parent)?;
+			// Make the new slot folders durable: trash/<batch> in trash, <index> in trash/<batch>.
+			if let Some(batch_dir) = parent.parent() {
+				sync_parent(batch_dir);
+			}
 			sync_parent(parent);
 			fs.move_any(&path, &slot, &part_path(&slot, &tag), publish)
 		}
@@ -761,9 +776,9 @@ fn cleanup(forward: &Op, inverse: &Op, tag: &str, published: bool) -> Vec<Fix> {
 			let to = n(to);
 			let part = part_path(&to, tag);
 			if exists(&part) {
+				// Not renamed into place: whatever is at `to` is someone else's.
 				fixes.push(Fix::RemovePart(part));
-			}
-			if published && exists(&to) {
+			} else if published && exists(&to) {
 				fixes.push(Fix::Op(Op::Trash { path: to }));
 			}
 		}

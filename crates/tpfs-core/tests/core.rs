@@ -1268,19 +1268,38 @@ fn recovery_records_after_a_torn_tail_are_not_damage() {
 }
 
 #[test]
-fn undo_finishes_a_move_back_whose_publish_was_not_recorded() {
-	// A crash between publishing the copy back and journaling that: both trees are complete.
+fn undo_redoes_a_move_back_that_was_recorded_but_not_yet_renamed() {
+	// The record "about to publish" is written before the rename: a crash in between leaves the
+	// complete copy under its part name, and the original untouched.
 	let s = Sandbox::new();
 	let dir = s.dir("dir");
 	fs::write(dir.join("a"), "A").unwrap();
 	let away = s.root.join("away");
-	run(&s, vec![Op::Move { from: dir.clone(), to: away.clone() }]);
-	fs::create_dir(&dir).unwrap();
-	fs::copy(away.join("a"), dir.join("a")).unwrap();
-	let t = fs::metadata(away.join("a")).unwrap().modified().unwrap();
-	fs::File::options().write(true).open(dir.join("a")).unwrap().set_modified(t).unwrap();
+	let id = run(&s, vec![Op::Move { from: dir.clone(), to: away.clone() }]);
+	let part = s.root.join(format!(".tpfs-part-{id}-undo-0"));
+	fs::create_dir(&part).unwrap();
+	fs::write(part.join("a"), "A").unwrap();
+	let mut j = s.journal();
+	j.append(&Entry::UndoPublished { batch: id.clone(), index: 0 }).unwrap();
+	drop(j);
 	assert_eq!(undo(&s).unwrap().unwrap().steps, 1);
-	assert!(!away.exists() && dir.join("a").exists());
+	assert!(!away.exists() && !part.exists());
+	assert_eq!(fs::read_to_string(dir.join("a")).unwrap(), "A");
+}
+
+#[test]
+fn undo_never_trusts_a_look_alike_at_the_old_place() {
+	// Someone plants a file with the same size and time where the moved one came from: undo must
+	// refuse, not trash the user's real file and keep the planted one.
+	let s = Sandbox::new();
+	let a = s.file("report.txt", "real numbers");
+	let b = s.root.join("mine.txt");
+	run(&s, vec![Op::Move { from: a.clone(), to: b.clone() }]);
+	fs::write(&a, "EVIL numbers").unwrap();
+	let t = fs::metadata(&b).unwrap().modified().unwrap();
+	fs::File::options().write(true).open(&a).unwrap().set_modified(t).unwrap();
+	assert!(undo(&s).is_err());
+	assert_eq!(fs::read_to_string(&b).unwrap(), "real numbers");
 }
 
 #[test]

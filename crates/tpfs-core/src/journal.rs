@@ -48,13 +48,13 @@ pub enum Entry {
 		index: usize,
 		check: String,
 	},
-	/// Undo or recovery published the copy of a step's cross-device inverse move.
+	/// Undo or recovery is about to rename the copy of a step's cross-device inverse move into place.
 	UndoPublished {
 		batch: String,
 		index: usize,
 	},
-	/// A copy built under a private name was published at its target: from here on the target is
-	/// ours (written between `intent` and `done` by steps that copy).
+	/// A copy built under a private name is about to be renamed into place (written right before the
+	/// rename, between `intent` and `done`). With the part name gone afterwards, the target is ours.
 	Published {
 		batch: String,
 		index: usize,
@@ -63,6 +63,10 @@ pub enum Entry {
 		batch: String,
 	},
 	Abort {
+		batch: String,
+	},
+	/// An interrupted batch the user gave up on: its changes were left on disk as they were.
+	Abandon {
 		batch: String,
 	},
 	UndoStep {
@@ -85,6 +89,7 @@ impl Entry {
 			| Entry::UndoPublished { batch, .. }
 			| Entry::Commit { batch }
 			| Entry::Abort { batch }
+			| Entry::Abandon { batch }
 			| Entry::UndoStep { batch, .. }
 			| Entry::Undo { batch } => batch,
 		}
@@ -99,6 +104,8 @@ pub enum BatchStatus {
 	Committed,
 	Aborted,
 	Undone,
+	/// Given up on by the user (`tpfs recover --abandon`): not rolled back, changes left as they were.
+	Abandoned,
 }
 
 /// A batch reconstructed from the journal.
@@ -286,10 +293,12 @@ impl Journal {
 		let mut suspect: Vec<String> = Vec::new();
 		for e in self.records()? {
 			let Some(e) = e else {
-				for b in batches.iter().filter(|b| b.status == BatchStatus::Incomplete) {
-					if !suspect.contains(&b.id) {
-						suspect.push(b.id.clone());
-					}
+				// Only the batch being written when the damage happened (the newest) can have lost
+				// a record to it; an older interrupted batch is not affected by later damage.
+				if let Some(b) = batches.last().filter(|b| b.status == BatchStatus::Incomplete)
+					&& !suspect.contains(&b.id)
+				{
+					suspect.push(b.id.clone());
 				}
 				continue;
 			};
@@ -382,6 +391,7 @@ impl Journal {
 				}
 				Entry::Commit { .. } => b.status = BatchStatus::Committed,
 				Entry::Abort { .. } => b.status = BatchStatus::Aborted,
+				Entry::Abandon { .. } => b.status = BatchStatus::Abandoned,
 				Entry::Undo { .. } => b.status = BatchStatus::Undone,
 				Entry::Begin { .. } => {}
 			}

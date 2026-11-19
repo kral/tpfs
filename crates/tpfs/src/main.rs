@@ -34,8 +34,8 @@ USAGE:
   tpfs log                                      list recorded batches
   tpfs recover                                  roll back batches interrupted by a crash
                 [--abandon <batch>]               give up on one recovery cannot handle (damaged, or
-                                                  older than newer changes): marks it rolled back and
-                                                  changes nothing on disk; see `tpfs log` first
+                                                  older than newer changes): records it as abandoned
+                                                  and changes nothing on disk; see `tpfs log` first
 
   tpfs mcp --root <dir>... [--approval terminal|client]
                                                   MCP server on stdio for AI agents (agents propose,
@@ -346,6 +346,7 @@ fn run(args: Args) -> Res {
 					BatchStatus::Aborted => "rolled back",
 					BatchStatus::Undone => "undone",
 					BatchStatus::Incomplete => "INCOMPLETE (run `tpfs recover`)",
+					BatchStatus::Abandoned => "abandoned (changes left on disk)",
 					_ => "unknown",
 				};
 				let status = if b.damaged { "DAMAGED (see the journal)" } else { status };

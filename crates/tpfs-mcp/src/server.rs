@@ -439,6 +439,7 @@ fn status_word(s: BatchStatus, damaged: bool) -> &'static str {
 		BatchStatus::Aborted => "rolled back",
 		BatchStatus::Undone => "undone",
 		BatchStatus::Incomplete => "interrupted",
+		BatchStatus::Abandoned => "abandoned",
 		_ => "unknown",
 	}
 }

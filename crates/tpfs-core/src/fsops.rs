@@ -77,7 +77,7 @@ impl Fs {
 			return result;
 		}
 
-		#[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
+		#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 		{
 			use rustix::{
 				fs::{CWD, RenameFlags, renameat_with},
@@ -196,7 +196,8 @@ impl Fs {
 		}
 	}
 
-	/// Copy `from` to `to` through `part`: the copy only ever appears at `to` complete.
+	/// Copy `from` to `to` through `part`: the copy only ever appears at `to` complete. `publish` runs
+	/// right before the part is renamed into place (see `copy_published`).
 	pub(crate) fn copy_to(
 		&self,
 		from: &Path,
@@ -215,12 +216,7 @@ impl Fs {
 		publish: &mut dyn FnMut() -> io::Result<()>,
 	) -> io::Result<Vec<Copied>> {
 		let mut copied = Vec::new();
-		let result = self.copy_tree(from, part, Path::new(""), &mut copied);
-		let result = result.and_then(|()| {
-			sync_tree_dirs(part, &copied);
-			self.rename_noreplace(part, to)
-		});
-		if let Err(e) = result {
+		if let Err(e) = self.copy_tree(from, part, Path::new(""), &mut copied) {
 			// The partial copy is ours and the source is untouched: drop it.
 			if let Err(r) = remove_part(part) {
 				return Err(io::Error::new(
@@ -230,8 +226,17 @@ impl Fs {
 			}
 			return Err(e);
 		}
+		sync_tree_dirs(part, &copied);
+		// Journal "publishing" *before* the rename: afterwards the part name tells what happened —
+		// still there, the rename did not happen; gone, the copy at `to` is ours. If the rename
+		// fails, the part is left for the caller's clean-up, so that stays true even after a crash.
+		if let Err(e) = publish() {
+			// Nothing recorded: the part is still only ours.
+			remove_part(part)?;
+			return Err(e);
+		}
+		self.rename_noreplace(part, to)?;
 		sync_parent(to);
-		publish()?;
 		Ok(copied)
 	}
 
@@ -1399,7 +1404,8 @@ mod tests {
 
 		// Publishing fails (as if the journal could not be written): no target, no part.
 		let err = Fs::unconfined().copy_to(&from, &to, &part, &mut || {
-			assert!(to.join("sub").is_dir() && !part.exists());
+			// Recorded right before the rename: the complete copy is still under its part name.
+			assert!(part.join("sub").is_dir() && !to.exists());
 			Err(io::Error::other("journal full"))
 		});
 		assert!(err.is_err());

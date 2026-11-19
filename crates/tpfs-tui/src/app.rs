@@ -520,10 +520,11 @@ impl App {
 
 	/// Show what Undo would revert and ask first: the newest batch may not be this session's.
 	fn undo(&mut self) {
-		let batch = self
-			.journal()
-			.and_then(|mut j| j.batches().map_err(|e| e.to_string()))
-			.map(|b| b.into_iter().rev().find(|b| b.status != BatchStatus::Aborted && b.status != BatchStatus::Undone));
+		let batch = self.journal().and_then(|mut j| j.batches().map_err(|e| e.to_string())).map(|b| {
+			b.into_iter()
+				.rev()
+				.find(|b| !matches!(b.status, BatchStatus::Aborted | BatchStatus::Undone | BatchStatus::Abandoned))
+		});
 		match batch {
 			Err(e) => self.status = format!("Undo failed: {e}"),
 			Ok(None) => self.status = "Nothing to undo.".into(),
