@@ -36,6 +36,16 @@ pub struct Plan {
 	pub reason: String,
 }
 
+impl Op {
+	/// The paths this operation names (for `rename`, the path being renamed).
+	pub fn paths(&self) -> Vec<&std::path::Path> {
+		match self {
+			Op::Move { from, to } | Op::Copy { from, to } => vec![from, to],
+			Op::Rename { path, .. } | Op::Trash { path } | Op::Mkdir { path } | Op::Rmdir { path } => vec![path],
+		}
+	}
+}
+
 impl Plan {
 	pub fn new(ops: Vec<Op>, reason: impl Into<String>) -> Self {
 		Self { ops, reason: reason.into() }

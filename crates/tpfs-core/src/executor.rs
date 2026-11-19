@@ -34,6 +34,8 @@ pub enum ExecError {
 	Rejected(Vec<Issue>),
 	/// A step failed; the steps before it were rolled back (errors listed if rollback was incomplete).
 	Failed { step: usize, error: String, rollback_errors: Vec<String> },
+	/// Undo of `batch` stopped; the steps reverted so far stay reverted and `undo` resumes there.
+	Undo { batch: String, error: String },
 	/// The journal could not be written; execution stopped before touching the disk further.
 	Journal(io::Error),
 }
@@ -57,6 +59,7 @@ impl fmt::Display for ExecError {
 				step + 1,
 				rollback_errors.join("; ")
 			),
+			ExecError::Undo { batch, error } => write!(f, "cannot undo batch {batch}: {error}"),
 			ExecError::Journal(e) => write!(f, "journal error: {e}"),
 		}
 	}
@@ -188,7 +191,11 @@ impl<'a> Executor<'a> {
 					if let Some(hook) = &mut self.hook {
 						hook(i, Phase::AfterApply);
 					}
-					self.journal.append(&Entry::Done { batch: batch.clone(), index: i })?;
+					let check = match op {
+						Op::Copy { to, .. } => normalize(to).and_then(|t| fingerprint(&t)),
+						_ => None,
+					};
+					self.journal.append(&Entry::Done { batch: batch.clone(), index: i, check })?;
 					applied.push(inverse);
 				}
 				Err(error) => {
@@ -213,35 +220,65 @@ impl<'a> Executor<'a> {
 
 	/// Revert the most recent committed batch (made by anyone — a human or an agent).
 	/// Returns `None` when there is nothing to undo. Partially undone batches resume where they stopped.
+	///
+	/// Refuses while a newer batch is interrupted (it has to be recovered first), and stops — keeping
+	/// the user's data — when a copy was changed after it was made. Every journaled path must still
+	/// be reachable without symlinks below the validator's roots, or in the trash.
 	pub fn undo_last(&mut self) -> Result<Option<BatchReport>, ExecError> {
-		let Some(batch) = self.journal.batches()?.into_iter().rev().find(|b| b.status == BatchStatus::Committed) else {
+		let batches = self.journal.batches()?;
+		if let Some(b) =
+			batches.iter().rev().find(|b| b.status != BatchStatus::Aborted && b.status != BatchStatus::Undone)
+			&& b.status == BatchStatus::Incomplete
+		{
+			return Err(ExecError::Undo {
+				batch: b.id.clone(),
+				error: "it was interrupted and must be rolled back first (`tpfs recover`)".into(),
+			});
+		}
+		let Some(batch) = batches.into_iter().rev().find(|b| b.status == BatchStatus::Committed) else {
 			return Ok(None);
 		};
 
-		let mut errors = Vec::new();
+		let fs = Fs::confined(self.validator.roots());
+		let mut reverted = 0;
 		for step in batch.steps.iter().rev().filter(|s| s.done && !s.undone) {
-			match apply(
-				&step.inverse,
-				&Fs::unconfined(),
-				&self.trash,
-				&format!("{}-undo", batch.id),
-				step.index,
-				None,
-				&mut || Ok(()),
-			) {
-				Ok(()) => self.journal.append(&Entry::UndoStep { batch: batch.id.clone(), index: step.index })?,
-				Err(e) => {
-					errors.push(format!("{}: {e}", step.inverse));
-					break; // keep strict reverse order; the user can retry after fixing the cause
-				}
+			let fail = |error: String| ExecError::Undo { batch: batch.id.clone(), error };
+			self.check_journaled(&step.inverse).map_err(fail)?;
+			if let (Op::Copy { to, .. }, Some(check)) = (&step.forward, &step.check)
+				&& let Some(to) = normalize(to)
+				&& exists(&to)
+				&& fingerprint(&to).as_ref() != Some(check)
+			{
+				return Err(fail(format!(
+					"{} was changed after it was copied; it is kept. Move it away (or trash it yourself) and undo again.",
+					crate::sanitize(to.as_os_str())
+				)));
 			}
+			// After a crash between an inverse and its record, the inverse is already applied.
+			if !already_applied(&step.inverse) {
+				apply(&step.inverse, &fs, &self.trash, &format!("{}-undo", batch.id), step.index, None, &mut || Ok(()))
+					.map_err(|e| fail(format!("{}: {e}", step.inverse)))?;
+			}
+			self.journal.append(&Entry::UndoStep { batch: batch.id.clone(), index: step.index })?;
+			reverted += 1;
 		}
 
-		if !errors.is_empty() {
-			return Err(ExecError::Failed { step: 0, error: "undo stopped".into(), rollback_errors: errors });
-		}
 		self.journal.append(&Entry::Undo { batch: batch.id.clone() })?;
-		Ok(Some(BatchReport { id: batch.id, steps: batch.steps.len() }))
+		Ok(Some(BatchReport { id: batch.id, steps: reverted }))
+	}
+
+	/// A journaled operation replayed by undo or recovery must stay where tpfs may act: below the
+	/// validator's roots without symlinks, or in a trash. A forged or stale journal entry pointing
+	/// through a planted symlink is refused instead of followed.
+	fn check_journaled(&self, op: &Op) -> Result<(), String> {
+		for p in op.paths() {
+			let Some(p) = normalize(p) else { return Err(format!("journaled path is not absolute: {}", op)) };
+			let in_trash =
+				p.starts_with(&self.trash) || p.components().any(|c| crate::validate::is_trash_name(c.as_os_str()));
+			let checked = if in_trash { Ok(p) } else { self.validator.check_path(&p) };
+			checked?;
+		}
+		Ok(())
 	}
 
 	/// Roll back batches that were interrupted (begun but never committed or aborted).
@@ -261,23 +298,35 @@ impl<'a> Executor<'a> {
 
 	fn recover_batches(&mut self, batches: Vec<crate::journal::BatchView>) -> Result<RecoveryReport, ExecError> {
 		let mut report = RecoveryReport::default();
+		let fs = Fs::confined(self.validator.roots());
 		for batch in batches {
+			let mut errors = Vec::new();
 			for step in batch.steps.iter().rev() {
 				let fixes = if step.done {
-					vec![Fix::Op(step.inverse.clone())]
+					if already_applied(&step.inverse) { vec![] } else { vec![Fix::Op(step.inverse.clone())] }
 				} else {
 					cleanup(&step.forward, &step.inverse, &tag(&batch.id, step.index), step.published)
 				};
 				for fix in fixes {
-					if let Err(e) =
-						apply_fix(&fix, &Fs::unconfined(), &self.trash, &format!("{}-recover", batch.id), step.index)
-					{
-						report.errors.push(format!("{fix}: {e}"));
+					let result = match &fix {
+						Fix::Op(op) => {
+							self.check_journaled(op).map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))
+						}
+						_ => Ok(()),
+					}
+					.and_then(|()| apply_fix(&fix, &fs, &self.trash, &format!("{}-recover", batch.id), step.index));
+					if let Err(e) = result {
+						errors.push(format!("{fix}: {e}"));
 					}
 				}
 			}
-			self.journal.append(&Entry::Abort { batch: batch.id.clone() })?;
-			report.rolled_back.push(batch.id);
+			if errors.is_empty() {
+				self.journal.append(&Entry::Abort { batch: batch.id.clone() })?;
+				report.rolled_back.push(batch.id);
+			} else {
+				// Left incomplete: fix the cause and run recover again; finished steps are skipped.
+				report.errors.extend(errors);
+			}
 		}
 		Ok(report)
 	}
@@ -311,6 +360,47 @@ impl<'a> Executor<'a> {
 			Op::Rmdir { path } => Op::Mkdir { path: n(path) },
 		}
 	}
+}
+
+/// Whether `op` (an inverse) has already taken effect, so replaying it after a crash is skipped.
+fn already_applied(op: &Op) -> bool {
+	let n = |p: &Path| normalize(p).unwrap_or_else(|| p.to_path_buf());
+	match op {
+		Op::Move { from, to } => !exists(&n(from)) && exists(&n(to)),
+		Op::Trash { path } => !exists(&n(path)),
+		Op::Rmdir { path } => !exists(&n(path)),
+		Op::Mkdir { path } => n(path).is_dir(),
+		Op::Rename { path, new_name } => {
+			let path = n(path);
+			!exists(&path) && exists(&path.with_file_name(new_name))
+		}
+		Op::Copy { .. } => false,
+	}
+}
+
+/// A compact description of what a copy produced (names, kinds, sizes, modification times), so
+/// undo can tell whether someone changed it since.
+fn fingerprint(path: &Path) -> Option<String> {
+	use sha2::{Digest, Sha256};
+	fn walk(path: &Path, rel: &Path, h: &mut Sha256, budget: &mut usize) -> Option<()> {
+		*budget = budget.checked_sub(1)?;
+		let m = fs::symlink_metadata(path).ok()?;
+		let mtime = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+		h.update(format!("{}\0{}\0{}\0{mtime}\n", rel.display(), m.is_dir(), if m.is_dir() { 0 } else { m.len() }));
+		if m.is_dir() {
+			let mut names: Vec<_> = fs::read_dir(path).ok()?.filter_map(|e| e.ok().map(|e| e.file_name())).collect();
+			names.sort();
+			for name in names {
+				walk(&path.join(&name), &rel.join(&name), h, budget)?;
+			}
+		}
+		Some(())
+	}
+	let mut h = Sha256::new();
+	// Very large trees are not fingerprinted (undo then trashes them, which is still undoable).
+	let mut budget = 100_000;
+	walk(path, Path::new(""), &mut h, &mut budget)?;
+	Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Private tag of one step, used for its in-progress names.

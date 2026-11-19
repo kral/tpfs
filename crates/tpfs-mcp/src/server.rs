@@ -260,8 +260,8 @@ impl Server {
 			}
 			Some(_) => {}
 		}
-		let undo_all = Validator::new(tpfs_core::system_roots()).map_err(|e| e.to_string())?;
-		let report = Executor::new(&undo_all, &mut journal, self.config.state.join("trash"))
+		// Confined to the agent's roots: a symlink planted since cannot redirect the undo.
+		let report = Executor::new(&self.validator, &mut journal, self.config.state.join("trash"))
 			.undo_last()
 			.map_err(|e| e.to_string())?;
 		Ok(match report {

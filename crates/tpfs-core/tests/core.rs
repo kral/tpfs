@@ -287,7 +287,7 @@ fn recover_rolls_back_a_batch_interrupted_by_a_crash() {
 	})
 	.unwrap();
 	fs::create_dir(&dir).unwrap();
-	j.append(&Entry::Done { batch: batch.clone(), index: 0 }).unwrap();
+	j.append(&Entry::Done { batch: batch.clone(), index: 0, check: None }).unwrap();
 	j.append(&Entry::Intent {
 		batch: batch.clone(),
 		index: 1,
@@ -500,7 +500,7 @@ fn recover_last_only_touches_an_interrupted_newest_batch() {
 		})
 		.unwrap();
 		fs::create_dir(&dir).unwrap();
-		j.append(&Entry::Done { batch: id.into(), index: 0 }).unwrap();
+		j.append(&Entry::Done { batch: id.into(), index: 0, check: None }).unwrap();
 	};
 	crashed(&mut j, "old");
 	// something newer happened after the interrupted batch
@@ -596,4 +596,122 @@ fn state_folder_must_be_private() {
 	fs::set_permissions(&ok, fs::Permissions::from_mode(0o700)).unwrap();
 	std::os::unix::fs::symlink(real.join("x"), ok.join("journal.jsonl")).unwrap();
 	assert!(Journal::open(ok.join("journal.jsonl")).is_err());
+}
+
+fn run(s: &Sandbox, ops: Vec<Op>) -> String {
+	let mut j = s.journal();
+	Executor::new(&s.validator(), &mut j, s.trash()).execute(&Plan::new(ops, ""), Source::Human).unwrap().id
+}
+
+fn undo(s: &Sandbox) -> Result<Option<tpfs_core::BatchReport>, ExecError> {
+	let mut j = s.journal();
+	Executor::new(&s.validator(), &mut j, s.trash()).undo_last()
+}
+
+#[test]
+fn undo_keeps_a_copy_that_was_changed_since() {
+	let s = Sandbox::new();
+	let a = s.file("report.txt", "v1");
+	let b = s.root.join("backup.txt");
+	run(&s, vec![Op::Copy { from: a, to: b.clone() }]);
+	std::thread::sleep(std::time::Duration::from_millis(20));
+	fs::write(&b, "edited by the user").unwrap();
+
+	let err = undo(&s).unwrap_err();
+	assert!(matches!(err, ExecError::Undo { .. }) && err.to_string().contains("changed"), "{err}");
+	assert_eq!(fs::read_to_string(&b).unwrap(), "edited by the user");
+
+	// Once the user moved it away, undo completes.
+	fs::rename(&b, s.root.join("mine.txt")).unwrap();
+	assert_eq!(undo(&s).unwrap().unwrap().steps, 1);
+}
+
+#[test]
+fn undo_waits_for_an_interrupted_newer_batch() {
+	let s = Sandbox::new();
+	run(&s, vec![Op::Mkdir { path: s.root.join("older") }]);
+	let mut j = s.journal();
+	j.append(&Entry::Begin {
+		batch: "x".into(),
+		at: 0,
+		source: "human".into(),
+		reason: String::new(),
+		digest: String::new(),
+	})
+	.unwrap();
+	drop(j);
+	let err = undo(&s).unwrap_err();
+	assert!(err.to_string().contains("recover"), "{err}");
+	assert!(s.root.join("older").is_dir(), "the older batch must not be undone instead");
+}
+
+#[test]
+fn undo_resumes_after_a_crash_between_an_inverse_and_its_record() {
+	let s = Sandbox::new();
+	let a = s.file("a.txt", "A");
+	let d = s.root.join("d");
+	run(&s, vec![Op::Mkdir { path: d.clone() }, Op::Move { from: a.clone(), to: d.join("a.txt") }]);
+	// The crash: the last step's inverse ran, its undo_step record was never written.
+	fs::rename(d.join("a.txt"), &a).unwrap();
+	assert_eq!(undo(&s).unwrap().unwrap().steps, 2);
+	assert!(a.exists() && !d.exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn undo_does_not_follow_a_planted_symlink() {
+	let s = Sandbox::new();
+	let src = s.file("f", "f");
+	let sub = s.dir("sub");
+	run(&s, vec![Op::Copy { from: src, to: sub.join("precious") }]);
+	let outside = s.root.parent().unwrap().join("outside");
+	fs::create_dir(&outside).unwrap();
+	fs::write(outside.join("precious"), "not tpfs's").unwrap();
+	fs::rename(&sub, s.root.join("sub-real")).unwrap();
+	std::os::unix::fs::symlink(&outside, &sub).unwrap();
+
+	assert!(undo(&s).is_err());
+	assert_eq!(fs::read_to_string(outside.join("precious")).unwrap(), "not tpfs's");
+}
+
+#[test]
+fn recover_is_idempotent_and_retryable() {
+	let s = Sandbox::new();
+	let a = s.file("a.txt", "A");
+	let mut j = s.journal();
+	let inverse = Op::Move { from: s.root.join("b.txt"), to: a.clone() };
+	j.append(&Entry::Begin {
+		batch: "x".into(),
+		at: 0,
+		source: "human".into(),
+		reason: String::new(),
+		digest: String::new(),
+	})
+	.unwrap();
+	j.append(&Entry::Intent {
+		batch: "x".into(),
+		index: 0,
+		forward: Op::Move { from: a.clone(), to: s.root.join("b.txt") },
+		inverse,
+	})
+	.unwrap();
+	j.append(&Entry::Done { batch: "x".into(), index: 0, check: None }).unwrap();
+	drop(j);
+	fs::rename(&a, s.root.join("b.txt")).unwrap();
+	// Something now sits where the file has to go back: recovery cannot finish yet.
+	fs::write(&a, "blocker").unwrap();
+
+	let v = s.validator();
+	let mut j = s.journal();
+	let report = Executor::new(&v, &mut j, s.trash()).recover().unwrap();
+	assert!(!report.errors.is_empty() && report.rolled_back.is_empty());
+	assert_eq!(j.batches().unwrap()[0].status, BatchStatus::Incomplete);
+
+	fs::remove_file(&a).unwrap();
+	for _ in 0..2 {
+		let report = Executor::new(&v, &mut j, s.trash()).recover().unwrap();
+		assert!(report.errors.is_empty(), "{:?}", report.errors);
+	}
+	assert_eq!(fs::read_to_string(&a).unwrap(), "A");
+	assert_eq!(j.batches().unwrap()[0].status, BatchStatus::Aborted);
 }

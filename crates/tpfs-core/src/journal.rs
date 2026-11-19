@@ -32,6 +32,9 @@ pub enum Entry {
 	Done {
 		batch: String,
 		index: usize,
+		/// For copies: a fingerprint of the result, so undo can tell whether it was changed since.
+		#[serde(default, skip_serializing_if = "Option::is_none")]
+		check: Option<String>,
 	},
 	/// A copy built under a private name was published at its target: from here on the target is
 	/// ours (written between `intent` and `done` by steps that copy).
@@ -97,6 +100,8 @@ pub struct Step {
 	pub done: bool,
 	/// The step's copy reached its target (see [`Entry::Published`]).
 	pub published: bool,
+	/// See [`Entry::Done`].
+	pub check: Option<String>,
 	pub undone: bool,
 }
 
@@ -239,11 +244,20 @@ impl Journal {
 			let Some(b) = batches.iter_mut().rev().find(|b| b.id == e.batch()) else { continue };
 			match e {
 				Entry::Intent { index, forward, inverse, .. } => {
-					b.steps.push(Step { index, forward, inverse, done: false, published: false, undone: false });
+					b.steps.push(Step {
+						index,
+						forward,
+						inverse,
+						done: false,
+						published: false,
+						check: None,
+						undone: false,
+					});
 				}
-				Entry::Done { index, .. } => {
+				Entry::Done { index, check, .. } => {
 					if let Some(s) = step_mut(&mut b.steps, index) {
 						s.done = true;
+						s.check = check;
 					}
 				}
 				Entry::Published { index, .. } => {
