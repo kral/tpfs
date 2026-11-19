@@ -1797,3 +1797,25 @@ fn undoing_rmdir_stops_over_a_filled_folder_on_every_os() {
 	let mut j = s.journal();
 	assert_eq!(j.batches().unwrap().into_iter().find(|b| b.id == id).unwrap().status, BatchStatus::Committed);
 }
+
+/// A forged journal step whose inverse renames to a path, not a name, is refused by undo.
+#[test]
+fn a_forged_rename_to_a_path_is_refused() {
+	let s = Sandbox::new();
+	let a = s.file("a.txt", "A");
+	let mut j = s.journal();
+	begin(&mut j, "f");
+	j.append(&Entry::Intent {
+		batch: "f".into(),
+		index: 0,
+		forward: Op::Rename { path: s.root.join("x"), new_name: "a.txt".into() },
+		inverse: Op::Rename { path: a.clone(), new_name: "../escaped.txt".into() },
+	})
+	.unwrap();
+	j.append(&Entry::Done { batch: "f".into(), index: 0, check: None, mode: None }).unwrap();
+	j.append(&Entry::Commit { batch: "f".into() }).unwrap();
+	drop(j);
+	assert!(undo(&s).is_err());
+	assert!(a.exists());
+	assert!(!s.root.parent().unwrap().join("escaped.txt").exists());
+}

@@ -195,10 +195,15 @@ impl Validator {
 				let target = parent.join(new_name);
 				// On a case-insensitive file system the new spelling is not listed as an entry of its
 				// own; a hard link under that spelling (case-sensitive file systems) is.
-				let own_entry = || {
-					fs::read_dir(parent).is_ok_and(|rd| {
-						rd.filter_map(Result::ok).any(|e| e.file_name() == std::ffi::OsStr::new(new_name))
-					})
+				let mut own_entry = || {
+					sim.names
+						.entry(parent.to_path_buf())
+						.or_insert_with(|| {
+							fs::read_dir(parent)
+								.map(|rd| rd.filter_map(Result::ok).map(|e| e.file_name()).collect())
+								.unwrap_or_default()
+						})
+						.contains(std::ffi::OsStr::new(new_name))
 				};
 				let old_name = source.file_name().map(|n| n.to_string_lossy().to_lowercase());
 				let case_only = target != source && old_name == Some(new_name.to_lowercase());
@@ -476,6 +481,11 @@ struct Sim {
 	reserved: HashMap<u64, u64>,
 	/// Tree sizes already measured in this plan.
 	sizes: HashMap<PathBuf, u64>,
+	/// Entries left to measure for the whole plan: past it, sizes are not checked (the executor
+	/// still stops cleanly when a disk fills up).
+	size_budget: Option<usize>,
+	/// Exact entry names of folders read for the case-only rename check, one read per folder.
+	names: HashMap<PathBuf, HashSet<std::ffi::OsString>>,
 }
 
 /// Windows and macOS (by default) treat names that differ only in letter case as one: so does the
@@ -532,7 +542,8 @@ impl Sim {
 		let needed = match self.sizes.get(from) {
 			Some(&n) => n,
 			None => {
-				let n = tree_size(from);
+				let budget = self.size_budget.get_or_insert(1_000_000);
+				let Some(n) = tree_size(from, budget) else { return Ok(()) };
 				self.sizes.insert(from.to_path_buf(), n);
 				n
 			}
@@ -551,16 +562,23 @@ impl Sim {
 	}
 }
 
-/// Logical size of a file or directory tree (symlinks count as nothing).
-fn tree_size(path: &Path) -> u64 {
-	let Ok(meta) = fs::symlink_metadata(path) else { return 0 };
-	if meta.is_dir() {
-		fs::read_dir(path).map(|rd| rd.filter_map(Result::ok).map(|e| tree_size(&e.path())).sum()).unwrap_or(0)
-	} else if meta.is_file() {
-		meta.len()
-	} else {
-		0
+/// Logical size of a file or directory tree (symlinks count as nothing), within a budget of
+/// entries shared by the whole plan; `None` once it runs out.
+fn tree_size(path: &Path, budget: &mut usize) -> Option<u64> {
+	let mut total = 0u64;
+	let mut stack = vec![path.to_path_buf()];
+	while let Some(p) = stack.pop() {
+		*budget = budget.checked_sub(1)?;
+		let Ok(meta) = fs::symlink_metadata(&p) else { continue };
+		if meta.is_dir() {
+			if let Ok(rd) = fs::read_dir(&p) {
+				stack.extend(rd.filter_map(Result::ok).map(|e| e.path()));
+			}
+		} else if meta.is_file() {
+			total = total.saturating_add(meta.len());
+		}
 	}
+	Some(total)
 }
 
 /// (file system id, bytes free to the user) for the file system holding `dir`.

@@ -415,3 +415,18 @@ fn approval_is_bound_to_the_approved_digest() {
 	assert!(err, "{v}");
 	assert!(a.exists() && b.exists());
 }
+
+/// An approval file planted as a symlink is refused, and its target is not written.
+#[cfg(unix)]
+#[test]
+fn an_approval_symlink_is_refused() {
+	let mut f = Fixture::new(Approval::Terminal);
+	fs::write(f.root.join("a.txt"), "A").unwrap();
+	let id = f.propose(json!({ "ops": [{ "op": "trash", "path": f.root.join("a.txt") }] }));
+	let victim = f.root.join("victim.txt");
+	fs::write(&victim, "keep").unwrap();
+	std::os::unix::fs::symlink(&victim, f.state.join("pending").join(format!("{id}.approved"))).unwrap();
+	let store = f.server.store().clone();
+	assert!(store.approve(&store.get(&id).unwrap()).is_err());
+	assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+}
