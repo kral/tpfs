@@ -252,6 +252,26 @@ fn one_way_and_mirror_syncs_are_idempotent() {
 	}
 }
 
+/// A two-way sync, run again, plans nothing; only a real conflict (both sides changed) stays
+/// skipped.
+#[test]
+fn two_way_syncs_are_idempotent() {
+	let e = Env::new();
+	e.file(&e.left.join("only-left.txt"), "l", 100);
+	e.file(&e.right.join("only-right.txt"), "r", 100);
+	e.file(&e.left.join("newer-left.txt"), "new", 100); // age in seconds: younger
+	e.file(&e.right.join("newer-left.txt"), "old", 200);
+	e.run(SyncOptions { direction: Direction::Both, mirror: false });
+	let cmp = compare(&e.left, &e.right, true).unwrap();
+	let again = sync_plan(&e.left, &e.right, &cmp, SyncOptions { direction: Direction::Both, mirror: false });
+	assert!(again.plan.ops.is_empty(), "{:?}", again.plan.preview());
+	assert!(again.skipped.is_empty(), "{:?}", again.skipped.iter().map(|k| &k.why).collect::<Vec<_>>());
+	for side in [&e.left, &e.right] {
+		assert_eq!(fs::read_to_string(side.join("newer-left.txt")).unwrap(), "new");
+		assert!(side.join("only-left.txt").exists() && side.join("only-right.txt").exists());
+	}
+}
+
 /// An unmounted or missing source is not an empty one, and a mirror from an empty source plans
 /// nothing: either would trash the whole target.
 #[test]

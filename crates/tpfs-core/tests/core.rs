@@ -1046,9 +1046,34 @@ fn undo_works_with_a_symlinked_state_folder() {
 
 #[test]
 fn a_journaled_path_that_only_looks_like_a_trash_is_still_checked() {
+	for planted in [".tpfs-trash-x".to_owned(), own_trash_name()] {
+		a_planted_trash_is_not_trusted(&planted);
+	}
+}
+
+/// This user's per-file-system trash name (Unix), which a planted folder may copy.
+fn own_trash_name() -> String {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::MetadataExt;
+		let probe = tempfile::NamedTempFile::new().unwrap();
+		format!(".tpfs-trash-{}", fs::metadata(probe.path()).unwrap().uid())
+	}
+	#[cfg(not(unix))]
+	".tpfs-trash-0".to_owned()
+}
+
+/// A folder with the trash's name outside the roots, but not private (0o755): a journaled path
+/// into it is checked like any other, and nothing is made there.
+fn a_planted_trash_is_not_trusted(name: &str) {
 	let s = Sandbox::new();
 	let outside = s.root.parent().unwrap().join("outside");
-	fs::create_dir_all(outside.join(".tpfs-trash-x")).unwrap();
+	fs::create_dir_all(outside.join(name)).unwrap();
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		fs::set_permissions(outside.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+	}
 	let mut j = s.journal();
 	j.append(&Entry::Begin {
 		batch: "x".into(),
@@ -1059,7 +1084,7 @@ fn a_journaled_path_that_only_looks_like_a_trash_is_still_checked() {
 		v: 1,
 	})
 	.unwrap();
-	let target = outside.join(".tpfs-trash-x").join("planted");
+	let target = outside.join(name).join("planted");
 	j.append(&Entry::Intent {
 		batch: "x".into(),
 		index: 0,

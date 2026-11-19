@@ -1370,6 +1370,81 @@ mod tests {
 		}
 	}
 
+	/// What changed on disk after validation is caught by each step's own re-check, even where no
+	/// file system call would refuse it: a disk mounted at a later step's path stops the batch,
+	/// and the earlier steps are rolled back.
+	#[test]
+	fn each_step_is_checked_again_just_before_it_runs() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let base = crate::path::canonicalize(tmp.path()).unwrap();
+		let root = base.join("root");
+		let m = root.join("m");
+		fs::create_dir_all(&m).unwrap();
+		let v = Validator::new([&root]).unwrap();
+		let trash = base.join("state").join("trash");
+		let mut j = Journal::open(base.join("state").join("journal.jsonl")).unwrap();
+		let mounted = m.clone();
+		let err = Executor::new(&v, &mut j, &trash)
+			.hook(move |i, p| {
+				if i == 0 && p == Phase::AfterApply {
+					crate::validate::FAKE_MOUNT.with(|f| *f.borrow_mut() = Some(mounted.clone()));
+				}
+			})
+			.execute(
+				&Plan::new(vec![Op::Mkdir { path: root.join("a") }, Op::Trash { path: m.clone() }], ""),
+				Source::Human,
+			)
+			.unwrap_err();
+		crate::validate::FAKE_MOUNT.with(|f| *f.borrow_mut() = None);
+		assert!(matches!(&err, ExecError::Failed { step: 1, .. }) && err.to_string().contains("mount point"), "{err}");
+		assert!(m.is_dir() && !root.join("a").exists());
+	}
+
+	/// A resumed undo of a move whose copy back was published: what is left at the moved-to place
+	/// goes to the trash only if all of it is in the copy; a file there of another size is not.
+	#[test]
+	fn a_resumed_undo_of_a_move_keeps_a_different_leftover() {
+		for same in [true, false] {
+			let tmp = tempfile::TempDir::new().unwrap();
+			let base = crate::path::canonicalize(tmp.path()).unwrap();
+			let root = base.join("root");
+			fs::create_dir_all(root.join("dir")).unwrap();
+			fs::write(root.join("dir").join("f"), "F").unwrap();
+			let v = Validator::new([&root]).unwrap();
+			let trash = base.join("state").join("trash");
+			let mut j = Journal::open(base.join("state").join("journal.jsonl")).unwrap();
+			let away = root.join("away");
+			let id = Executor::new(&v, &mut j, &trash)
+				.execute(&Plan::new(vec![Op::Move { from: root.join("dir"), to: away.clone() }], ""), Source::Human)
+				.unwrap()
+				.id;
+			// The interrupted undo: its copy back published at `dir`, `away` not yet removed.
+			fs::create_dir(root.join("dir")).unwrap();
+			fs::write(root.join("dir").join("f"), "F").unwrap();
+			let m = fs::metadata(away.join("f")).unwrap();
+			fs::File::options()
+				.write(true)
+				.open(root.join("dir").join("f"))
+				.unwrap()
+				.set_modified(m.modified().unwrap())
+				.unwrap();
+			if !same {
+				fs::write(away.join("f"), "a different, longer content").unwrap();
+			}
+			j.append(&Entry::UndoPublished { batch: id.clone(), index: 0 }).unwrap();
+			let result = Executor::new(&v, &mut j, &trash).undo_last();
+			if same {
+				result.unwrap().unwrap();
+				assert!(!away.exists());
+			} else {
+				let err = result.unwrap_err();
+				assert!(err.to_string().contains("exist"), "{err}");
+				assert_eq!(fs::read_to_string(away.join("f")).unwrap(), "a different, longer content");
+			}
+			assert_eq!(fs::read_to_string(root.join("dir").join("f")).unwrap(), "F");
+		}
+	}
+
 	/// An undo of a copy cut short before its trash copy was published still notices a change
 	/// the user made to the copy since.
 	#[test]
@@ -1469,8 +1544,12 @@ mod tests {
 			#[cfg(unix)]
 			if let Ok(m) = fs::symlink_metadata(&d) {
 				use std::os::unix::fs::PermissionsExt;
-				// Never wider than the recorded mode while in place.
+				// Never wider than the recorded mode while in place, and already that mode once
+				// it is in place (it was set at the private name).
 				assert_eq!(m.permissions().mode() & 0o777 & !0o755, 0, "{at}");
+				if at == "renamed" {
+					assert_eq!(m.permissions().mode() & 0o777, 0o755, "{at}");
+				}
 			}
 			Executor::new(&v, &mut j, &trash).undo_last().unwrap().unwrap();
 			assert!(Executor::new(&v, &mut j, &trash).undo_last().unwrap().is_none(), "{at}");

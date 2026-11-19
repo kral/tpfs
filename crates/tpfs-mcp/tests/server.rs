@@ -111,6 +111,25 @@ fn approval_is_void_if_the_plan_is_modified() {
 	assert!(a.exists() && b.exists());
 }
 
+/// In client mode the client's confirmation is the approval, but of the plan as proposed: one
+/// rewritten on disk since is refused (its digest no longer matches), and nothing is changed.
+#[test]
+fn client_mode_refuses_a_plan_rewritten_after_it_was_proposed() {
+	let mut f = Fixture::new(Approval::Client);
+	let a = f.root.join("a.txt");
+	let b = f.root.join("b.txt");
+	fs::write(&a, "A").unwrap();
+	fs::write(&b, "B").unwrap();
+	let id = f.propose(json!({ "ops": [{ "op": "trash", "path": a }] }));
+	let file = f.state.join("pending").join(format!("{id}.json"));
+	let tampered = fs::read_to_string(&file).unwrap().replace("a.txt", "b.txt");
+	fs::write(&file, tampered).unwrap();
+	let (v, err) = f.tool("apply_plan", json!({ "planId": id }));
+	assert!(err && v.to_string().contains("modified"), "{v}");
+	assert!(a.exists() && b.exists());
+	assert!(!file.exists(), "the tampered plan is dropped");
+}
+
 #[test]
 fn client_mode_trusts_the_clients_confirmation() {
 	let mut f = Fixture::new(Approval::Client);
