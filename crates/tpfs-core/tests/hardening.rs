@@ -270,3 +270,39 @@ fn recover_leaves_a_target_that_is_not_ours() {
 	assert!(report.errors.is_empty(), "{:?}", report.errors);
 	assert_eq!(fs::read_to_string(&foreign).unwrap(), "someone else's");
 }
+
+fn mkfifo(p: &Path) {
+	assert!(std::process::Command::new("mkfifo").arg(p).status().unwrap().success());
+}
+
+/// A regular file swapped for a FIFO after validation must not make the copy block forever,
+/// and a FIFO inside a copied folder must not be read.
+#[cfg(unix)]
+#[test]
+fn copies_never_read_through_fifos() {
+	let s = Sandbox::new();
+	let f = s.root.join("data.bin");
+	fs::write(&f, "data").unwrap();
+	let plan = Plan::new(vec![Op::Copy { from: f.clone(), to: s.root.join("copy.bin") }], "");
+	let swap = f.clone();
+	let v = s.validator();
+	let mut j = s.journal();
+	let err = Executor::new(&v, &mut j, s.state.join("trash"))
+		.before_apply(move |_| {
+			fs::remove_file(&swap).unwrap();
+			mkfifo(&swap);
+		})
+		.execute(&plan, Source::Human)
+		.unwrap_err();
+	assert!(matches!(err, ExecError::Failed { .. }), "{err}");
+	assert!(!s.root.join("copy.bin").exists());
+
+	let dir = s.root.join("dir");
+	fs::create_dir(&dir).unwrap();
+	fs::write(dir.join("ok.txt"), "ok").unwrap();
+	mkfifo(&dir.join("pipe"));
+	let plan = Plan::new(vec![Op::Copy { from: dir.clone(), to: s.root.join("dir-copy") }], "");
+	let err = Executor::new(&v, &mut j, s.state.join("trash")).execute(&plan, Source::Human).unwrap_err();
+	assert!(err.to_string().contains("special file"), "{err}");
+	assert!(!s.root.join("dir-copy").exists(), "the partial copy is removed");
+}

@@ -358,7 +358,10 @@ fn check_names(path: &Path) -> Result<(), String> {
 fn check_copyable(path: &Path) -> Result<(), String> {
 	let Ok(meta) = fs::symlink_metadata(path) else { return Ok(()) };
 	let ft = meta.file_type();
-	if ft.is_file() || ft.is_dir() || ft.is_symlink() {
+	if cfg!(windows) && ft.is_symlink() {
+		// Creating symlinks needs a privilege on Windows; refuse up front, not half way.
+		Err(format!("Copying a symlink or junction is not supported on Windows: {}", show(path)))
+	} else if ft.is_file() || ft.is_dir() || ft.is_symlink() {
 		Ok(())
 	} else {
 		Err(format!("Special files (FIFO, socket, device) cannot be copied: {}", show(path)))
@@ -374,8 +377,12 @@ fn show(p: &Path) -> String {
 #[derive(Default)]
 struct Sim {
 	state: HashMap<PathBuf, bool>,
+	/// Entries the plan makes exist, by parent folder (for `rmdir` checks in constant time).
+	added: HashMap<PathBuf, HashSet<PathBuf>>,
 	created_dirs: HashSet<PathBuf>,
 	reserved: HashMap<u64, u64>,
+	/// Tree sizes already measured in this plan.
+	sizes: HashMap<PathBuf, u64>,
 }
 
 impl Sim {
@@ -393,21 +400,38 @@ impl Sim {
 	}
 
 	fn set(&mut self, p: PathBuf, exists: bool) {
+		if let Some(parent) = p.parent() {
+			let children = self.added.entry(parent.to_path_buf()).or_default();
+			if exists {
+				children.insert(p.clone());
+			} else {
+				children.remove(&p);
+			}
+		}
 		self.state.insert(p, exists);
 	}
 
 	/// Empty after the operations so far: no entry on disk that still exists, none added by the plan.
+	/// A folder that cannot be read counts as not empty.
 	fn is_empty_dir(&self, dir: &Path) -> bool {
-		let on_disk =
-			fs::read_dir(dir).map(|rd| rd.filter_map(Result::ok).any(|e| self.exists(&e.path()))).unwrap_or(false);
-		let added = self.state.iter().any(|(p, &e)| e && p.parent() == Some(dir));
-		!on_disk && !added
+		let Ok(rd) = fs::read_dir(dir) else {
+			return !exists(dir) && self.added.get(dir).is_none_or(HashSet::is_empty);
+		};
+		let on_disk = rd.into_iter().any(|e| e.map_or(true, |e| self.exists(&e.path())));
+		!on_disk && self.added.get(dir).is_none_or(HashSet::is_empty)
 	}
 
 	/// Refuse a copy that would not fit, counting everything the plan already writes to that file system.
 	fn reserve_space(&mut self, from: &Path, target_dir: &Path) -> Result<(), String> {
 		let Some((dev, free)) = free_space(target_dir) else { return Ok(()) };
-		let needed = tree_size(from);
+		let needed = match self.sizes.get(from) {
+			Some(&n) => n,
+			None => {
+				let n = tree_size(from);
+				self.sizes.insert(from.to_path_buf(), n);
+				n
+			}
+		};
 		let total = self.reserved.entry(dev).or_default();
 		*total = total.saturating_add(needed);
 		if *total > free {
@@ -434,7 +458,8 @@ fn tree_size(path: &Path) -> u64 {
 	}
 }
 
-#[cfg(target_os = "linux")]
+/// (file system id, bytes free to the user) for the file system holding `dir`.
+#[cfg(unix)]
 fn free_space(dir: &Path) -> Option<(u64, u64)> {
 	use std::os::unix::fs::MetadataExt;
 	let existing = dir.ancestors().find(|a| a.exists())?;
@@ -443,9 +468,33 @@ fn free_space(dir: &Path) -> Option<(u64, u64)> {
 	Some((dev, st.f_bavail.saturating_mul(st.f_frsize)))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn free_space(dir: &Path) -> Option<(u64, u64)> {
+	use std::os::windows::ffi::OsStrExt;
+	use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+	let existing = dir.ancestors().find(|a| a.exists())?;
+	let wide: Vec<u16> = existing.as_os_str().encode_wide().chain(Some(0)).collect();
+	let mut free: u64 = 0;
+	// SAFETY: `wide` is NUL-terminated and outlives the call; the out-pointer is a valid u64 and the
+	// two optional out-pointers are null.
+	let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
+	(ok != 0).then(|| (volume_key(existing), free))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn free_space(_: &Path) -> Option<(u64, u64)> {
 	None
+}
+
+/// A key for the volume of a Windows path: its drive or share prefix.
+#[cfg(windows)]
+fn volume_key(p: &Path) -> u64 {
+	use std::hash::{Hash, Hasher};
+	let mut h = std::collections::hash_map::DefaultHasher::new();
+	if let Some(std::path::Component::Prefix(pre)) = p.components().next() {
+		pre.as_os_str().to_ascii_uppercase().hash(&mut h);
+	}
+	h.finish()
 }
 
 #[cfg(unix)]
@@ -455,7 +504,12 @@ fn crosses_devices(from: &Path, target_dir: &Path) -> bool {
 	dev(from) != dev(target_dir)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn crosses_devices(from: &Path, target_dir: &Path) -> bool {
+	volume_key(from) != volume_key(target_dir)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn crosses_devices(_: &Path, _: &Path) -> bool {
 	false
 }

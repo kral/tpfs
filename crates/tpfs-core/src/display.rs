@@ -23,9 +23,35 @@ pub fn sanitize(name: &OsStr) -> String {
 	out
 }
 
+/// Control characters, line/paragraph separators, and invisible format characters (Unicode
+/// category Cf: bidi controls, zero-width characters, tags…) that make a name look different from
+/// what it is.
 fn is_dangerous(ch: char) -> bool {
 	ch.is_control()
-		|| matches!(ch, '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+		|| matches!(
+			ch,
+			'\u{ad}'
+				| '\u{600}'..='\u{605}'
+				| '\u{61c}'
+				| '\u{6dd}'
+				| '\u{70f}'
+				| '\u{890}'..='\u{891}'
+				| '\u{8e2}'
+				| '\u{180e}'
+				| '\u{200b}'..='\u{200f}'
+				| '\u{2028}'..='\u{202e}'
+				| '\u{2060}'..='\u{2064}'
+				| '\u{2066}'..='\u{206f}'
+				| '\u{feff}'
+				| '\u{fff9}'..='\u{fffb}'
+				| '\u{110bd}'
+				| '\u{110cd}'
+				| '\u{13430}'..='\u{1343f}'
+				| '\u{1bca0}'..='\u{1bca3}'
+				| '\u{1d173}'..='\u{1d17a}'
+				| '\u{e0001}'
+				| '\u{e0020}'..='\u{e007f}'
+		)
 }
 
 #[cfg(test)]
@@ -45,5 +71,13 @@ mod tests {
 	fn escapes_invalid_utf8() {
 		use std::os::unix::ffi::OsStrExt;
 		assert_eq!(sanitize(OsStr::from_bytes(b"caf\xe9")), "caf\\xe9");
+	}
+
+	#[test]
+	fn invisible_characters_are_shown() {
+		for name in ["a\u{200b}b", "a\u{2028}b", "a\u{feff}b", "a\u{e0041}b", "a\u{ad}b"] {
+			let shown = sanitize(OsStr::new(name));
+			assert!(shown.contains("\\u{"), "{name:?} -> {shown}");
+		}
 	}
 }

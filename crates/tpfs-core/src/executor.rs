@@ -605,13 +605,14 @@ fn cleanup(forward: &Op, inverse: &Op, tag: &str, published: bool) -> Vec<Fix> {
 }
 
 /// Where `path` goes when trashed. Prefer a trash directory on the same file system, so trashing is a
-/// rename and not a copy: `<mount point>/.tpfs-trash-<uid>` (Linux), else the global trash.
+/// rename and not a copy: `<mount point>/.tpfs-trash-<uid>` (Unix), else the global trash (Windows:
+/// trashing on another drive copies to the home drive first).
 fn trash_slot(trash: &Path, batch: &str, index: usize, path: &Path) -> PathBuf {
 	let base = local_trash(trash, path).unwrap_or_else(|| trash.to_path_buf());
 	base.join(batch).join(index.to_string()).join(path.file_name().unwrap_or_else(|| "root".as_ref()))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn local_trash(trash: &Path, path: &Path) -> Option<PathBuf> {
 	use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
@@ -639,7 +640,7 @@ fn local_trash(trash: &Path, path: &Path) -> Option<PathBuf> {
 	(m.is_dir() && m.uid() == uid && m.permissions().mode() & 0o077 == 0).then_some(dir)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn local_trash(_: &Path, _: &Path) -> Option<PathBuf> {
 	None
 }

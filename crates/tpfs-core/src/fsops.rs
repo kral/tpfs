@@ -81,6 +81,16 @@ impl Fs {
 		if let Some(result) = linux::unlink(&self.anchors, path) {
 			return result;
 		}
+		#[cfg(windows)]
+		if let Ok(m) = fs::symlink_metadata(path)
+			&& m.permissions().readonly()
+		{
+			// Windows refuses to delete a read-only file; the copy already carries the attribute.
+			let mut p = m.permissions();
+			#[allow(clippy::permissions_set_readonly_false)]
+			p.set_readonly(false);
+			fs::set_permissions(path, p)?;
+		}
 		fs::remove_file(path)
 	}
 
@@ -185,11 +195,12 @@ impl Fs {
 		if ft.is_file() {
 			#[cfg(target_os = "linux")]
 			if let Some((src, dst)) = linux::open_copy_pair(&self.anchors, from, to, &meta)? {
+				check_regular(&src, from)?;
 				copy_stream(src, dst, from, &meta)?;
 				copied.push(Copied::of(rel, &meta));
 				return Ok(());
 			}
-			let src = File::open(from)?;
+			let src = open_regular(from)?;
 			let dst = OpenOptions::new().write(true).create_new(true).open(to)?;
 			copy_stream(src, dst, from, &meta)?;
 		} else if ft.is_dir() {
@@ -251,6 +262,29 @@ fn make_symlink(_: &Path, path: &Path) -> io::Result<()> {
 		io::ErrorKind::Unsupported,
 		format!("copying a symlink is not supported here: {}", path.display()),
 	))
+}
+
+/// Open a file for copying, refusing anything that is not a regular file *now* (a FIFO swapped in
+/// after validation would block forever; a device could be read endlessly). Never blocks on open.
+fn open_regular(path: &Path) -> io::Result<File> {
+	#[cfg(unix)]
+	let file = {
+		use rustix::fs::{Mode, OFlags};
+		let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+		File::from(rustix::fs::open(path, flags, Mode::empty())?)
+	};
+	#[cfg(not(unix))]
+	let file = File::open(path)?;
+	check_regular(&file, path)?;
+	Ok(file)
+}
+
+fn check_regular(file: &File, path: &Path) -> io::Result<()> {
+	if file.metadata()?.is_file() {
+		Ok(())
+	} else {
+		Err(io::Error::new(io::ErrorKind::Unsupported, format!("not a regular file (anymore): {}", path.display())))
+	}
 }
 
 /// One entry copied by `copy_tree`, as the source looked when it was read.
@@ -393,7 +427,14 @@ pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
 			_ => false,
 		}
 	}
-	#[cfg(not(unix))]
+	#[cfg(windows)]
+	{
+		match (windows::file_id(a), windows::file_id(b)) {
+			(Some(x), Some(y)) => x == y,
+			_ => false,
+		}
+	}
+	#[cfg(not(any(unix, windows)))]
 	{
 		let _ = (a, b);
 		false
@@ -552,7 +593,8 @@ mod linux {
 		}
 
 		let (sfd, sname) = side(&src, from);
-		let src = openat(sfd, sname, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?;
+		let src =
+			openat(sfd, sname, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())?;
 
 		let (dfd, dname) = side(&dst, to);
 		let create = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
@@ -566,7 +608,43 @@ mod linux {
 mod windows {
 	use std::{io, os::windows::ffi::OsStrExt, path::Path};
 
-	use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+	use windows_sys::Win32::{
+		Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+		Storage::FileSystem::{
+			BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+			FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, MOVEFILE_WRITE_THROUGH,
+			MoveFileExW, OPEN_EXISTING,
+		},
+	};
+
+	/// (volume serial, file index): the identity of a file, whatever name reaches it.
+	pub(super) fn file_id(p: &Path) -> Option<(u32, u64)> {
+		let w = wide(p);
+		// SAFETY: `w` is NUL-terminated and outlives the call; no security attributes or template.
+		let h = unsafe {
+			CreateFileW(
+				w.as_ptr(),
+				0,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				std::ptr::null(),
+				OPEN_EXISTING,
+				FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+				std::ptr::null_mut(),
+			)
+		};
+		if h == INVALID_HANDLE_VALUE {
+			return None;
+		}
+		// SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value of this plain C struct.
+		let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		// SAFETY: `h` is an open handle and `info` a valid out-pointer; the handle is closed once.
+		let ok = unsafe { GetFileInformationByHandle(h, &mut info) };
+		// SAFETY: `h` was returned by CreateFileW above and is not used after this.
+		unsafe { CloseHandle(h) };
+		(ok != 0).then(|| {
+			(info.dwVolumeSerialNumber, (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow))
+		})
+	}
 
 	fn wide(p: &Path) -> Vec<u16> {
 		p.as_os_str().encode_wide().chain(Some(0)).collect()
