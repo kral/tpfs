@@ -193,15 +193,18 @@ impl Validator {
 				self.holds_state(&source)?;
 				let parent = source.parent().ok_or("Cannot rename a file system root.")?;
 				let target = parent.join(new_name);
-				let case_only =
-					source.file_name().map(|n| n.to_string_lossy().to_lowercase()) == Some(new_name.to_lowercase());
 				// On a case-insensitive file system the new spelling is not listed as an entry of its
 				// own; a hard link under that spelling (case-sensitive file systems) is.
-				let own_entry = fs::read_dir(parent)
-					.is_ok_and(|rd| rd.filter_map(Result::ok).any(|e| e.file_name() == std::ffi::OsStr::new(new_name)));
+				let own_entry = || {
+					fs::read_dir(parent).is_ok_and(|rd| {
+						rd.filter_map(Result::ok).any(|e| e.file_name() == std::ffi::OsStr::new(new_name))
+					})
+				};
+				let case_only = source.file_name().map(|n| n.to_string_lossy().to_lowercase())
+					== Some(new_name.to_lowercase())
+					&& !own_entry();
 				if target != source
-					&& case_only && !own_entry
-					&& same_file(&source, &target)
+					&& case_only && same_file(&source, &target)
 					&& !sim.state.contains_key(&sim_key(&target))
 				{
 					// Only the letter case differs, on a case-insensitive file system (a hard link
