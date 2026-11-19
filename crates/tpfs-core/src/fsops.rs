@@ -601,8 +601,14 @@ fn remove_copied(fs: &Fs, from: &Path, copied: &[Copied]) -> io::Result<Left> {
 		}
 	}
 	for (dir, perms) in opened {
-		if crate::path::exists(&dir) {
-			let _ = fs.set_dir_mode(&dir, perms);
+		if crate::path::exists(&dir)
+			&& let Err(e) = fs.set_dir_mode(&dir, perms)
+		{
+			let e = io::Error::new(
+				e.kind(),
+				format!("its mode could not be put back after it was opened for writing: {e}"),
+			);
+			stuck.push((dir, e));
 		}
 	}
 	Ok((left, stuck))

@@ -324,7 +324,7 @@ impl<'a> Executor<'a> {
 				error: if b.damaged {
 					format!(
 						"its journal records are damaged; see `tpfs log`, and if you accept the disk as it is: `tpfs recover --abandon {}`",
-						b.id
+						crate::sanitize(b.id.as_ref())
 					)
 				} else {
 					"it was interrupted and must be rolled back first (`tpfs recover`)".into()
