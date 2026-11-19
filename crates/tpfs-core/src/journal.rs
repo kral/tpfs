@@ -103,6 +103,7 @@ pub enum BatchStatus {
 
 /// A batch reconstructed from the journal.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct BatchView {
 	pub id: String,
 	pub at: u64,
@@ -117,6 +118,7 @@ pub struct BatchView {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Step {
 	pub index: usize,
 	pub forward: Op,

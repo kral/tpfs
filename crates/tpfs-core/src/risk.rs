@@ -20,6 +20,7 @@ pub enum Level {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Risk {
 	pub level: Level,
 	pub reasons: Vec<String>,

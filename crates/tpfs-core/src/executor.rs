@@ -78,12 +78,14 @@ impl From<io::Error> for ExecError {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct BatchReport {
 	pub id: String,
 	pub steps: usize,
 }
 
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct RecoveryReport {
 	pub rolled_back: Vec<String>,
 	pub errors: Vec<String>,
