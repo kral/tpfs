@@ -86,7 +86,8 @@ editor tool), file contents edited in place, and anything outside the file syste
 services). It is the safe path for moving, copying, renaming and removing files; give the agent
 that path instead of a shell for those jobs.
 
-See the [DevOps case study](use-cases/devops-release-cleanup.md) for the full flow on a real task.
+See [the incidents replayed through tpfs](use-cases/case-study-agent-cleanup-incidents.md) and the
+[DevOps case study](use-cases/devops-release-cleanup.md) for the full flow on real tasks.
 
 ## Sources
 
