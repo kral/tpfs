@@ -150,6 +150,7 @@ impl<'a> Executor<'a> {
 			source: source.as_str().into(),
 			reason: plan.reason.clone(),
 			digest: plan.digest(),
+			v: 1,
 		})?;
 
 		let fs = Fs::confined(self.validator.roots());
@@ -239,6 +240,12 @@ impl<'a> Executor<'a> {
 			return Ok(None);
 		};
 
+		if batch.damaged {
+			return Err(ExecError::Undo {
+				batch: batch.id,
+				error: "its journal records are damaged; undo it by hand from `tpfs log`".into(),
+			});
+		}
 		let fs = Fs::confined(self.validator.roots());
 		let mut reverted = 0;
 		for step in batch.steps.iter().rev().filter(|s| s.done && !s.undone) {
@@ -299,7 +306,14 @@ impl<'a> Executor<'a> {
 	fn recover_batches(&mut self, batches: Vec<crate::journal::BatchView>) -> Result<RecoveryReport, ExecError> {
 		let mut report = RecoveryReport::default();
 		let fs = Fs::confined(self.validator.roots());
-		for batch in batches {
+		// Newest first: an older batch's inverses assume the later ones were undone already.
+		for batch in batches.into_iter().rev() {
+			if batch.damaged {
+				report
+					.errors
+					.push(format!("batch {}: journal records are damaged; not rolled back automatically", batch.id));
+				continue;
+			}
 			let mut errors = Vec::new();
 			for step in batch.steps.iter().rev() {
 				let fixes = if step.done {

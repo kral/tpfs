@@ -277,6 +277,7 @@ fn recover_rolls_back_a_batch_interrupted_by_a_crash() {
 		source: "human".into(),
 		reason: "crash".into(),
 		digest: String::new(),
+		v: 1,
 	})
 	.unwrap();
 	j.append(&Entry::Intent {
@@ -490,6 +491,7 @@ fn recover_last_only_touches_an_interrupted_newest_batch() {
 			source: "human".into(),
 			reason: "crash".into(),
 			digest: String::new(),
+			v: 1,
 		})
 		.unwrap();
 		j.append(&Entry::Intent {
@@ -637,6 +639,7 @@ fn undo_waits_for_an_interrupted_newer_batch() {
 		source: "human".into(),
 		reason: String::new(),
 		digest: String::new(),
+		v: 1,
 	})
 	.unwrap();
 	drop(j);
@@ -686,6 +689,7 @@ fn recover_is_idempotent_and_retryable() {
 		source: "human".into(),
 		reason: String::new(),
 		digest: String::new(),
+		v: 1,
 	})
 	.unwrap();
 	j.append(&Entry::Intent {
@@ -744,4 +748,35 @@ fn windows_rejects_names_it_would_misread() {
 		let plan = Plan::new(vec![Op::Copy { from: a.clone(), to: s.root.join(name) }], "");
 		assert!(!messages(&s.validator(), &plan).is_empty(), "{name} was accepted");
 	}
+}
+
+#[test]
+fn damage_inside_a_batch_stops_automatic_recovery() {
+	let s = Sandbox::new();
+	let a = s.file("a.txt", "A");
+	let b = s.root.join("b.txt");
+	let mut j = s.journal();
+	j.append(&Entry::Begin {
+		batch: "x".into(),
+		at: 0,
+		source: "human".into(),
+		reason: String::new(),
+		digest: String::new(),
+		v: 1,
+	})
+	.unwrap();
+	drop(j);
+	// An intent was lost to damage; a later record of the batch survived.
+	let path = s.state.join("journal.jsonl");
+	let mut bytes = fs::read(&path).unwrap();
+	bytes.extend_from_slice(b"garbage that was an intent\n");
+	fs::write(&path, bytes).unwrap();
+	let mut j = s.journal();
+	j.append(&Entry::Done { batch: "x".into(), index: 0, check: None }).unwrap();
+	fs::rename(&a, &b).unwrap(); // whatever the lost step did
+
+	assert!(j.batches().unwrap()[0].damaged);
+	let report = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
+	assert!(report.rolled_back.is_empty() && report.errors[0].contains("damaged"), "{report:?}");
+	assert!(b.exists(), "nothing is guessed");
 }

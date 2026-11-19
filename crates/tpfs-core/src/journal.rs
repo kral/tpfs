@@ -22,6 +22,9 @@ pub enum Entry {
 		source: String,
 		reason: String,
 		digest: String,
+		/// Record format version; a batch written by a newer tpfs is not replayed by this one.
+		#[serde(default = "format_v1", skip_serializing_if = "is_v1")]
+		v: u32,
 	},
 	Intent {
 		batch: String,
@@ -89,6 +92,10 @@ pub struct BatchView {
 	pub source: String,
 	pub reason: String,
 	pub status: BatchStatus,
+	/// An unreadable journal line sits inside this batch (later records of it follow the damage), or
+	/// it was written by a newer format: its steps are not known for sure, so undo and recovery
+	/// refuse it instead of guessing.
+	pub damaged: bool,
 	pub steps: Vec<Step>,
 }
 
@@ -125,7 +132,12 @@ impl Journal {
 		options.create(true).append(true).read(true);
 		#[cfg(unix)]
 		std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+		let created = !path.exists();
 		let file = options.open(&path)?;
+		if created {
+			// The journal's own directory entry must survive a power loss too.
+			crate::fsops::sync_parent(&path);
+		}
 
 		match file.try_lock() {
 			Ok(()) => {}
@@ -179,6 +191,11 @@ impl Journal {
 	}
 
 	pub fn entries(&mut self) -> io::Result<Vec<Entry>> {
+		Ok(self.records()?.into_iter().flatten().collect())
+	}
+
+	/// Every line in order: `None` for an unreadable one.
+	fn records(&mut self) -> io::Result<Vec<Option<Entry>>> {
 		// Read through the locked handle itself: on Windows the lock is mandatory, so a second
 		// handle could not read the file. Appends still go to the end regardless of the position.
 		let mut file = &self.file;
@@ -205,22 +222,25 @@ impl Journal {
 					}
 				}
 				self.corrupt += 1;
+				out.push(None);
 				continue;
 			}
 			// Invalid UTF-8 (e.g. a torn write cutting a multi-byte character) is a corrupt line,
 			// not a reason to make the whole journal unreadable.
 			let Ok(line) = std::str::from_utf8(&buf) else {
 				self.corrupt += 1;
+				out.push(None);
 				continue;
 			};
 			let line = line.trim_end_matches(['\n', '\r']);
 			if line.trim().is_empty() {
 				continue;
 			}
-			match parse_line(line) {
-				Some(e) => out.push(e),
-				None => self.corrupt += 1,
+			let entry = parse_line(line);
+			if entry.is_none() {
+				self.corrupt += 1;
 			}
+			out.push(entry);
 		}
 		Ok(out)
 	}
@@ -228,20 +248,36 @@ impl Journal {
 	/// All batches in journal order.
 	pub fn batches(&mut self) -> io::Result<Vec<BatchView>> {
 		let mut batches: Vec<BatchView> = Vec::new();
-		for e in self.entries()? {
-			if let Entry::Begin { batch, at, source, reason, .. } = &e {
+		// Batches that were open when an unreadable line appeared.
+		let mut suspect: Vec<String> = Vec::new();
+		for e in self.records()? {
+			let Some(e) = e else {
+				suspect.extend(batches.iter().filter(|b| b.status == BatchStatus::Incomplete).map(|b| b.id.clone()));
+				continue;
+			};
+			if let Entry::Begin { batch, at, source, reason, v, .. } = &e {
 				batches.push(BatchView {
 					id: batch.clone(),
 					at: *at,
 					source: source.clone(),
 					reason: reason.clone(),
 					status: BatchStatus::Incomplete,
+					damaged: *v > FORMAT,
 					steps: Vec::new(),
 				});
 				continue;
 			}
 
 			let Some(b) = batches.iter_mut().rev().find(|b| b.id == e.batch()) else { continue };
+			// Execution records after the damage: one of this batch's own records may be lost.
+			// (A torn last line followed only by recovery's `abort` is the normal crash case.)
+			if suspect.contains(&b.id)
+				&& matches!(
+					e,
+					Entry::Intent { .. } | Entry::Done { .. } | Entry::Published { .. } | Entry::Commit { .. }
+				) {
+				b.damaged = true;
+			}
 			match e {
 				Entry::Intent { index, forward, inverse, .. } => {
 					b.steps.push(Step {
@@ -287,6 +323,17 @@ fn step_mut(steps: &mut [Step], index: usize) -> Option<&mut Step> {
 		return steps.get_mut(index);
 	}
 	steps.iter_mut().find(|s| s.index == index)
+}
+
+/// Journal record format written by this version.
+const FORMAT: u32 = 1;
+
+fn format_v1() -> u32 {
+	1
+}
+
+fn is_v1(v: &u32) -> bool {
+	*v == 1
 }
 
 /// Longest journal line accepted. A record holds at most two operations and a reason, so anything
