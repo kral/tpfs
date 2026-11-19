@@ -270,7 +270,14 @@ impl Validator {
 			return Err(format!("Source does not exist: {}", show(&from)));
 		}
 		if sim.exists(&to) {
-			return Err(format!("Target already exists: {}", show(&to)));
+			// The usual slip: naming the destination folder instead of the full new path.
+			let hint = match (to.is_dir(), from.file_name()) {
+				(true, Some(name)) => {
+					format!(" ('to' is the full new path: to put it inside that folder, use {})", show(&to.join(name)))
+				}
+				_ => String::new(),
+			};
+			return Err(format!("Target already exists: {}{hint}", show(&to)));
 		}
 		let parent = to.parent().ok_or("Target cannot be a file system root.")?;
 		if !sim.exists(parent) {

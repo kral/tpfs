@@ -205,10 +205,13 @@ impl Server {
 		let path = args.get("path").and_then(Value::as_str).ok_or("'path' is required")?;
 		let limit = match args.get("limit") {
 			None | Some(Value::Null) => 500,
-			Some(v) => match v.as_u64() {
-				Some(n @ 1..=5000) => n as usize,
-				_ => return Err("'limit' must be an integer from 1 to 5000".into()),
-			},
+			// 5.0 is an integer in JSON Schema terms; some clients send numbers as floats.
+			Some(v) => {
+				match v.as_u64().or_else(|| v.as_f64().filter(|f| f.fract() == 0.0 && *f >= 0.0).map(|f| f as u64)) {
+					Some(n @ 1..=5000) => n as usize,
+					_ => return Err("'limit' must be an integer from 1 to 5000".into()),
+				}
+			}
 		};
 		let dir = self.validator.check_path(Path::new(path))?;
 		// check_path allows a symlink as the last component (operations act on the link itself);
@@ -275,6 +278,7 @@ impl Server {
 				"issueCount": all,
 				"preview": shown,
 				"previewTruncated": preview.len() > 20,
+				"stepCount": plan.ops.len(),
 			}));
 		}
 

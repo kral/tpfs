@@ -94,7 +94,8 @@ fn command_help(command: &str) -> Option<String> {
 	let mut inside = false;
 	for line in USAGE.lines() {
 		if line.starts_with("  tpfs ") {
-			inside = line.starts_with(&start) && line[start.len()..].chars().next().is_none_or(|c| c == ' ');
+			let ui = command == "ui" && line.starts_with("  tpfs [ui]");
+			inside = ui || (line.starts_with(&start) && line[start.len()..].chars().next().is_none_or(|c| c == ' '));
 		} else if !line.starts_with("    ") {
 			inside = false;
 		}
@@ -317,8 +318,8 @@ fn run(args: Args) -> Res {
 			let last = batches.into_iter().rev().find(|b| b.status == BatchStatus::Committed);
 			if let Some(b) = last.as_ref().filter(|b| b.damaged) {
 				return Err(format!(
-					"batch {} has damaged journal records; it cannot be undone automatically — undo it by hand from `tpfs log`",
-					tpfs_core::sanitize(b.id.as_ref())
+					"batch {id} has damaged journal records; it cannot be undone automatically. See its steps with `tpfs log {id}`, undo by hand what you need, then `tpfs recover --abandon {id}` to move past it",
+					id = tpfs_core::sanitize(b.id.as_ref())
 				)
 				.into());
 			}
@@ -373,6 +374,34 @@ fn run(args: Args) -> Res {
 			let (mut journal, _) = open_state(&args)?;
 			eprintln!("State: {}", tpfs_core::sanitize(state_dir(&args)?.as_os_str()));
 			let batches = journal.batches().map_err(|e| e.to_string())?;
+			// `tpfs log <batch>`: every step of one batch, what it did and how it is undone.
+			if let Some(id) = args.plan.as_deref().and_then(|p| p.to_str()) {
+				let b = batches
+					.iter()
+					.find(|b| b.id == id)
+					.ok_or_else(|| usage(format!("no batch {} in the journal", tpfs_core::sanitize(id.as_ref()))))?;
+				println!(
+					"Batch {} by {}{}: {}",
+					tpfs_core::sanitize(b.id.as_ref()),
+					tpfs_core::sanitize(b.source.as_ref()),
+					if b.damaged { " (journal records damaged: the list may be incomplete)" } else { "" },
+					tpfs_core::sanitize(b.reason.as_ref())
+				);
+				for st in &b.steps {
+					let state = if st.undone {
+						"undone"
+					} else if st.done {
+						"done"
+					} else if st.failed {
+						"failed"
+					} else {
+						"started"
+					};
+					println!("  #{:<4} {state:<8} {}", st.index + 1, st.forward.normalized());
+					println!("         undo:    {}", st.inverse.normalized());
+				}
+				return Ok(ExitCode::SUCCESS);
+			}
 			if batches.is_empty() {
 				println!("No batches recorded.");
 			}
@@ -385,7 +414,11 @@ fn run(args: Args) -> Res {
 					BatchStatus::Abandoned => "abandoned (changes left on disk)",
 					_ => "unknown",
 				};
-				let status = if b.damaged { "DAMAGED (see the journal)" } else { status };
+				let status = match b.status {
+					BatchStatus::Abandoned => status,
+					_ if b.damaged => "DAMAGED (see `tpfs log <batch>`)",
+					_ => status,
+				};
 				println!(
 					"{}  {:<6} {:<10} {} step(s)  {}",
 					tpfs_core::sanitize(b.id.as_ref()),
@@ -404,8 +437,21 @@ fn run(args: Args) -> Res {
 			let (mut journal, trash) = open_state(&args)?;
 			let validator = any_validator(&args, &mut journal)?;
 			if let Some(id) = &args.abandon {
+				let shown = tpfs_core::sanitize(id.as_ref());
+				match journal.batches().map_err(|e| e.to_string())?.iter().find(|b| b.id == *id) {
+					None => return Err(usage(format!("no batch {shown} in the journal (see `tpfs log`)"))),
+					Some(b)
+						if !(b.status == BatchStatus::Incomplete
+							|| (b.damaged && b.status == BatchStatus::Committed)) =>
+					{
+						return Err(usage(format!(
+							"batch {shown} is neither interrupted nor damaged; nothing to abandon"
+						)));
+					}
+					_ => {}
+				}
 				if io::stdin().is_terminal() && io::stderr().is_terminal() {
-					let answer = ask(&format!("Abandon batch {id}? Its changes stay on disk as they are. [y/N] "))?;
+					let answer = ask(&format!("Abandon batch {shown}? Its changes stay on disk as they are. [y/N] "))?;
 					if !answer.eq_ignore_ascii_case("y") {
 						return Err(cancelled("cancelled; nothing was changed"));
 					}
@@ -414,7 +460,7 @@ fn run(args: Args) -> Res {
 					ExecError::Blocked(m) if m.starts_with("no batch") => usage(format!("{m} (see `tpfs log`)")),
 					e => e.to_string().into(),
 				})?;
-				println!("Abandoned batch {id}; its changes were left as they are.");
+				println!("Abandoned batch {shown}; its changes were left as they are.");
 				return Ok(ExitCode::SUCCESS);
 			}
 			let report = Executor::new(&validator, &mut journal, trash).recover().map_err(|e| e.to_string())?;
@@ -475,7 +521,8 @@ fn run(args: Args) -> Res {
 }
 
 fn check(args: &Args, apply: bool) -> Res {
-	let plan = read_plan(args.plan.as_deref().ok_or_else(|| usage("missing plan file (use - for stdin)"))?)?;
+	let plan = read_plan(args.plan.as_deref().ok_or_else(|| usage("missing plan file (use - for stdin)"))?)
+		.map_err(|e| if e.starts_with("not a valid plan") { Fail(3, e) } else { e.into() })?;
 	if args.roots.is_empty() {
 		return Err(usage("at least one --root <dir> is required"));
 	}
@@ -494,10 +541,7 @@ fn check(args: &Args, apply: bool) -> Res {
 		validator = validator.with_max_ops(n);
 	}
 
-	let Some((digest, level)) = present(&validator, &plan, args.source) else {
-		eprintln!("tpfs {}: plan rejected (see the problems above); nothing was changed", args.command);
-		return Ok(ExitCode::from(3));
-	};
+	let Some((digest, level)) = present(&validator, &plan, args.source) else { return Ok(rejected(args)) };
 	if !apply {
 		println!("OK — the plan is valid.");
 		return Ok(ExitCode::SUCCESS);
@@ -553,6 +597,12 @@ fn print_preview(plan: &Plan) {
 	}
 }
 
+/// Exit 3, saying so on stderr (the problems themselves were listed on stdout).
+fn rejected(args: &Args) -> ExitCode {
+	eprintln!("tpfs {}: plan rejected (see the problems above); nothing was changed", args.command);
+	ExitCode::from(3)
+}
+
 /// The same words as the commander's confirmation.
 fn level_word(level: Level) -> &'static str {
 	match level {
@@ -577,7 +627,7 @@ fn execute(args: &Args, validator: &Validator, plan: &Plan, (mut journal, trash)
 			for i in &issues {
 				eprintln!("  {i}");
 			}
-			Ok(ExitCode::from(3))
+			Ok(rejected(args))
 		}
 		Err(e) => Err(e.to_string().into()),
 	}
@@ -625,7 +675,7 @@ fn sync(args: &Args) -> Res {
 	}
 
 	let validator = Validator::new([&source, &target]).map_err(|e| e.to_string())?.with_protected([state_dir(args)?]);
-	let Some((digest, level)) = present(&validator, &sp.plan, args.source) else { return Ok(ExitCode::from(3)) };
+	let Some((digest, level)) = present(&validator, &sp.plan, args.source) else { return Ok(rejected(args)) };
 	if !args.do_apply && args.approve.is_none() {
 		println!("Dry run. Apply with --apply, or non-interactively with --approve {digest}");
 		return Ok(ExitCode::SUCCESS);
@@ -705,7 +755,7 @@ fn approve(args: &Args) -> Res {
 		for i in &issues {
 			println!("  {i}");
 		}
-		return Ok(ExitCode::from(3));
+		return Ok(rejected(args));
 	}
 
 	if !io::stdin().is_terminal() || !io::stderr().is_terminal() {

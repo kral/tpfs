@@ -318,11 +318,7 @@ impl App {
 		}
 		let issues = self.validator().validate(&plan);
 		let risk = risk::assess(&plan, Source::Human);
-		let summary = format!(
-			"Total: {}\nDigest: {}",
-			tpfs_core::risk::totals_line(&plan, " · "),
-			plan.digest().get(..12).unwrap_or_default()
-		);
+		let summary = format!("Total: {}\nDigest: {}", tpfs_core::risk::totals_line(&plan, " · "), plan.digest());
 		self.dialog = Some(Dialog::Confirm { plan, risk, issues, offset: 0, fits: false, seen_all: false, summary });
 	}
 

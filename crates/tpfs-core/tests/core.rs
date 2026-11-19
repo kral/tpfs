@@ -1608,3 +1608,74 @@ fn recovery_never_replays_a_step_it_recorded() {
 	assert_eq!(fs::read_to_string(&a).unwrap(), "ORIGINAL", "the restored original was trashed");
 	assert!(!s.trash().exists() || fs::read_dir(s.trash()).unwrap().next().is_none());
 }
+
+/// When a step's inverse fails, recovery stops there: older inverses assume it ran.
+#[test]
+fn recovery_stops_at_a_step_it_cannot_roll_back() {
+	let s = Sandbox::new();
+	let (a, b, c) = (s.root.join("a"), s.root.join("b"), s.root.join("c"));
+	fs::write(&c, "ORIGINAL").unwrap(); // after move a->b, move b->c
+	let mut j = s.journal();
+	begin(&mut j, "z");
+	for (i, from, to) in [(0, &a, &b), (1, &b, &c)] {
+		j.append(&Entry::Intent {
+			batch: "z".into(),
+			index: i,
+			forward: Op::Move { from: from.clone(), to: to.clone() },
+			inverse: Op::Move { from: to.clone(), to: from.clone() },
+		})
+		.unwrap();
+		j.append(&Entry::Done { batch: "z".into(), index: i, check: None, mode: None }).unwrap();
+	}
+	fs::write(&b, "USER").unwrap(); // someone else creates b before recovery
+	let first = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
+	assert_eq!(first.errors.len(), 1, "{first:?}");
+	assert!(!a.exists(), "an older step was rolled back over the conflict");
+	assert_eq!(fs::read_to_string(&b).unwrap(), "USER");
+	fs::rename(&b, s.root.join("user-b")).unwrap();
+	let second = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
+	assert!(second.errors.is_empty(), "{second:?}");
+	assert_eq!(fs::read_to_string(&a).unwrap(), "ORIGINAL");
+	assert_eq!(fs::read_to_string(s.root.join("user-b")).unwrap(), "USER");
+}
+
+/// A record lost while undoing an older batch (the newest one was undone already) is noticed.
+#[test]
+fn a_record_lost_while_undoing_an_older_batch_is_noticed() {
+	let s = Sandbox::new();
+	let older = run(&s, vec![Op::Mkdir { path: s.root.join("d") }, Op::Mkdir { path: s.root.join("e") }]);
+	run(&s, vec![Op::Mkdir { path: s.root.join("n") }]);
+	undo(&s).unwrap(); // the newer batch is undone
+	let mut j = s.journal();
+	j.append(&Entry::UndoStep { batch: older.clone(), index: 1 }).unwrap();
+	drop(j);
+	corrupt_line(&s);
+	let mut j = s.journal();
+	j.append(&Entry::UndoStep { batch: older.clone(), index: 0 }).unwrap();
+	let b = j.batches().unwrap().into_iter().find(|b| b.id == older).unwrap();
+	assert!(b.damaged, "the lost undo record of the older batch went unnoticed");
+}
+
+/// A copy whose publishing rename was refused (someone else created the target): the step is
+/// recorded as failed before its part is removed, so a crash in between never makes recovery
+/// take the other program's file for tpfs's copy.
+#[test]
+fn a_refused_publish_is_recorded_before_its_part_goes() {
+	let s = Sandbox::new();
+	let a = s.file("a.txt", "A");
+	let b = s.root.join("b.txt");
+	let rb = b.clone();
+	let v = s.validator();
+	let mut j = s.journal();
+	let err = Executor::new(&v, &mut j, s.trash())
+		.before_apply(move |_| fs::write(&rb, "THEIRS").unwrap())
+		.execute(&Plan::new(vec![Op::Copy { from: a, to: b.clone() }], ""), Source::Human)
+		.unwrap_err();
+	assert!(matches!(err, ExecError::Failed { step: 0, .. }), "{err}");
+	let batch = j.batches().unwrap().pop().unwrap();
+	assert!(batch.steps[0].failed, "the failed step is recorded");
+	// Recovering again (as after a crash) leaves the other program's file alone.
+	let report = Executor::new(&v, &mut j, s.trash()).recover().unwrap();
+	assert!(report.errors.is_empty(), "{report:?}");
+	assert_eq!(fs::read_to_string(&b).unwrap(), "THEIRS");
+}

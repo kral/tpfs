@@ -45,6 +45,8 @@ pub(crate) struct Fs {
 	/// Roots that have no anchor (it could not be opened, or this platform has none): operations
 	/// below them are refused, or — with `TPFS_ALLOW_UNCONFINED=1` — re-checked for links right before.
 	unanchored: Vec<PathBuf>,
+	/// Private folders (trash) that could not be opened safely or are not private: never used.
+	refused: Vec<PathBuf>,
 }
 
 impl Fs {
@@ -55,6 +57,7 @@ impl Fs {
 			#[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
 			anchors: Vec::new(),
 			unanchored: Vec::new(),
+			refused: Vec::new(),
 		}
 	}
 
@@ -63,15 +66,16 @@ impl Fs {
 	/// be owned by the user and closed to everyone else — else it gets no anchor and is refused.
 	pub(crate) fn confined_with_private(roots: &[PathBuf], private: &[PathBuf]) -> Self {
 		let mut fs = Self::confined(roots);
-		#[cfg(unix)]
+		#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 		for p in private {
+			// A private folder that fails the check is refused whatever TPFS_ALLOW_UNCONFINED says.
 			match confined::Anchor::open(p).filter(confined::Anchor::is_private) {
 				Some(a) => fs.anchors.push(a),
-				None => fs.unanchored.push(p.clone()),
+				None => fs.refused.push(p.clone()),
 			}
 		}
-		#[cfg(not(unix))]
-		fs.unanchored.extend(private.iter().cloned());
+		#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+		fs.refused.extend(private.iter().cloned());
 		fs
 	}
 
@@ -87,17 +91,26 @@ impl Fs {
 					None => unanchored.push(r.clone()),
 				}
 			}
-			Self { anchors, unanchored }
+			Self { anchors, unanchored, refused: Vec::new() }
 		}
 		#[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
 		{
-			Self { unanchored: roots.to_vec() }
+			Self { unanchored: roots.to_vec(), refused: Vec::new() }
 		}
 	}
 
 	/// Refuse a path whose closest root has no anchor (fail closed). With `TPFS_ALLOW_UNCONFINED=1`
 	/// the path is instead re-checked for links right before the operation (a small window remains).
 	fn guard(&self, path: &Path) -> io::Result<()> {
+		if let Some(p) = self.refused.iter().find(|p| path.starts_with(p)) {
+			return Err(io::Error::new(
+				io::ErrorKind::PermissionDenied,
+				format!(
+					"refused: {} is not a private folder of yours (another owner, open to others, or a link)",
+					crate::sanitize(p.as_os_str())
+				),
+			));
+		}
 		let deepest = |roots: &mut dyn Iterator<Item = &Path>| {
 			roots.filter(|r| path.starts_with(r)).map(|r| r.as_os_str().len()).max()
 		};
@@ -788,12 +801,17 @@ mod confined {
 		}
 		#[cfg(target_vendor = "apple")]
 		{
-			let _ = &anchor.fd;
 			if !nofollow_any_works() {
 				return Err(Errno::NOSYS);
 			}
-			// O_NOFOLLOW_ANY implies O_NOFOLLOW; macOS rejects the two together (EINVAL).
-			rustix::fs::open(anchor.root.join(rel), flags.difference(OFlags::NOFOLLOW) | NOFOLLOW_ANY, Mode::empty())
+			// Relative to the anchor's own descriptor, so the operation stays bound to the folder that
+			// was opened and checked even if its path is taken over by another folder. Only plain
+			// names may follow (no `..`), and no symlink anywhere (O_NOFOLLOW_ANY; it implies
+			// O_NOFOLLOW, and macOS rejects the two together with EINVAL).
+			if !rel.components().all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
+				return Err(Errno::XDEV);
+			}
+			rustix::fs::openat(&anchor.fd, rel, flags.difference(OFlags::NOFOLLOW) | NOFOLLOW_ANY, Mode::empty())
 		}
 	}
 

@@ -307,11 +307,15 @@ impl Journal {
 		// Batches that were open when an unreadable line appeared, until the next readable record:
 		// (id, whether it was committed — then an undo of it may have lost a record).
 		let mut suspect: Vec<(String, bool)> = Vec::new();
+		// The batch of the last readable record: the one being written when damage appears (an
+		// undo may be writing an older batch than the newest one).
+		let mut writing: Option<String> = None;
 		for e in self.records()? {
 			let Some(e) = e else {
-				// Only the batch being written when the damage happened (the newest) can have lost
-				// a record to it; an older batch is not affected by later damage.
-				if let Some(b) = batches.last()
+				// Only the batch being written when the damage happened can have lost a record to it;
+				// an older batch is not affected by later damage.
+				let current = writing.as_ref().and_then(|id| index.get(id)).and_then(|&i| batches.get(i));
+				if let Some(b) = current.or(batches.last())
 					&& matches!(b.status, BatchStatus::Incomplete | BatchStatus::Committed)
 					&& !suspect.iter().any(|(id, _)| *id == b.id)
 				{
@@ -346,6 +350,7 @@ impl Journal {
 					suspect.clear();
 				}
 			}
+			writing = Some(e.batch().to_owned());
 			if let Entry::Begin { batch, at, source, reason, v, .. } = &e {
 				index.insert(batch.clone(), batches.len());
 				batches.push(BatchView {

@@ -229,7 +229,7 @@ fn hostile_plan_files_print_no_terminal_controls() {
 	let plan = base.join("evil.json");
 	fs::write(&plan, "{\"ops\":[{\"op\":\"\\u001b]52;c;eA==\\u0007\\u202eOK\"}]}").unwrap();
 	let o = tpfs(&base.join("home"), &["check", plan.to_str().unwrap(), "--root", base.to_str().unwrap()]);
-	assert_eq!(code(&o), 1, "{}", String::from_utf8_lossy(&o.stderr));
+	assert_eq!(code(&o), 3, "{}", String::from_utf8_lossy(&o.stderr));
 	let err = String::from_utf8(o.stderr).unwrap();
 	assert!(!err.trim_end().chars().any(|c| c.is_control() || c == '\u{202e}'), "{err:?}");
 }

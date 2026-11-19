@@ -356,3 +356,37 @@ fn parse_errors_carry_no_terminal_controls() {
 	let text = v["error"].as_str().unwrap();
 	assert!(!text.chars().any(|c| c.is_control() || c == '\u{202e}'), "{text:?}");
 }
+
+#[cfg(unix)]
+#[test]
+fn listing_reports_symlinks_and_takes_float_limits() {
+	let mut f = Fixture::new(Approval::Terminal);
+	std::os::unix::fs::symlink("/etc", f.root.join("link")).unwrap();
+	let (v, err) = f.tool("list_directory", json!({ "path": f.root, "limit": 5.0 }));
+	assert!(!err, "{v}");
+	assert_eq!(v["entries"][0], json!({ "name": "link", "type": "symlink" }), "{v}");
+}
+
+#[test]
+fn empty_plans_are_refused_and_the_schema_says_so() {
+	let mut f = Fixture::new(Approval::Terminal);
+	let tools = f.rpc("tools/list", json!({}));
+	let propose = tools["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "propose_plan").unwrap();
+	assert_eq!(propose["inputSchema"]["properties"]["plan"]["properties"]["ops"]["minItems"], 1);
+	let (v, err) = f.tool("propose_plan", json!({ "plan": { "ops": [] } }));
+	assert!(err, "{v}");
+	assert!(v.to_string().contains("empty"), "{v}");
+}
+
+#[test]
+fn moving_onto_a_folder_explains_the_full_path() {
+	let mut f = Fixture::new(Approval::Terminal);
+	fs::write(f.root.join("a.txt"), "A").unwrap();
+	fs::create_dir(f.root.join("sub")).unwrap();
+	let (v, err) = f.tool(
+		"propose_plan",
+		json!({ "plan": { "ops": [{ "op": "move", "from": f.root.join("a.txt"), "to": f.root.join("sub") }] } }),
+	);
+	assert!(err, "{v}");
+	assert!(v.to_string().contains("full new path"), "{v}");
+}

@@ -186,7 +186,7 @@ impl<'a> Executor<'a> {
 		// Act on the paths as validated: spelled the way the file system spells them, under a root,
 		// with no symlink on the way (the confined calls refuse any other spelling).
 		let resolved = self.resolve_plan(plan);
-		let fs = self.fs();
+		let fs = self.fs(&resolved.ops);
 		let mut applied: Vec<Op> = Vec::new();
 		for (i, op) in resolved.ops.iter().enumerate() {
 			// Re-check this step against the disk as it is right now: earlier steps are already
@@ -254,12 +254,21 @@ impl<'a> Executor<'a> {
 						Fix::Conflict { .. } => false,
 						_ => true,
 					};
-					for fix in cleanup(op, &inverse, &tag(&batch, i), published.get()).into_iter().filter(ours) {
-						if let Err(e) = apply_fix(&fix, &fs, &self.trash, &format!("{batch}-recover"), i) {
+					let fixes: Vec<Fix> =
+						cleanup(op, &inverse, &tag(&batch, i), published.get()).into_iter().filter(ours).collect();
+					// A part that was not renamed into place is the proof that the target is not ours. Say the
+					// step failed *before* removing it: once it is gone, "published and no part" would
+					// read as "the target is ours" to a recovery after a crash right here.
+					let only_parts = fixes.iter().all(|f| matches!(f, Fix::RemovePart(_)));
+					if only_parts {
+						self.journal.write(&Entry::Failed { batch: batch.clone(), index: i })?;
+					}
+					for fix in &fixes {
+						if let Err(e) = apply_fix(fix, &fs, &self.trash, &format!("{batch}-recover"), i) {
 							rollback_errors.push(clean(format!("{fix}: {e}")));
 						}
 					}
-					if rollback_errors.is_empty() {
+					if !only_parts && rollback_errors.is_empty() {
 						self.journal.write(&Entry::Failed { batch: batch.clone(), index: i })?;
 					}
 					rollback_errors.extend(self.roll_back(&batch)?);
@@ -308,7 +317,7 @@ impl<'a> Executor<'a> {
 				error: "its journal records are damaged; undo it by hand from `tpfs log`".into(),
 			});
 		}
-		let fs = self.fs();
+		let fs = self.fs(batch.steps.iter().flat_map(|st| [&st.inverse, &st.forward]));
 		let mut reverted = 0;
 		for step in batch.steps.iter().rev().filter(|s| s.done && !s.undone) {
 			let fail = |error: String| ExecError::Undo { batch: batch.id.clone(), error };
@@ -489,7 +498,7 @@ impl<'a> Executor<'a> {
 
 	fn recover_batches(&mut self, batches: Vec<crate::journal::BatchView>) -> Result<RecoveryReport, ExecError> {
 		let mut report = RecoveryReport::default();
-		let fs = self.fs();
+		let fs = self.fs(batches.iter().flat_map(|b| &b.steps).flat_map(|st| [&st.inverse, &st.forward]));
 		// Newest first: an older batch's inverses assume the later ones were undone already.
 		for batch in batches.into_iter().rev() {
 			if batch.damaged {
@@ -512,7 +521,11 @@ impl<'a> Executor<'a> {
 						Ok(()) => {
 							self.journal.write(&Entry::UndoStep { batch: batch.id.clone(), index: step.index })?
 						}
-						Err(e) => errors.push(clean(format!("{}: {e}", step.inverse))),
+						Err(e) => {
+							// Older inverses assume this one ran: stop here, as undo does.
+							errors.push(clean(format!("{}: {e}", step.inverse)));
+							break;
+						}
 					}
 					continue;
 				}
@@ -533,9 +546,10 @@ impl<'a> Executor<'a> {
 						clean_step = false;
 					}
 				}
-				if clean_step {
-					self.journal.write(&Entry::UndoStep { batch: batch.id.clone(), index: step.index })?;
+				if !clean_step {
+					break; // older steps wait until this one is cleaned up
 				}
+				self.journal.write(&Entry::UndoStep { batch: batch.id.clone(), index: step.index })?;
 			}
 			if errors.is_empty() {
 				self.journal.write(&Entry::Abort { batch: batch.id.clone() })?;
@@ -560,8 +574,21 @@ impl<'a> Executor<'a> {
 
 	/// Confined file operations for the roots, and for the per-file-system trash folders next to
 	/// them (outside the roots, so they get anchors of their own).
-	fn fs(&self) -> Fs {
-		let trashes: Vec<PathBuf> = self.validator.roots().iter().filter_map(|r| local_trash(&self.trash, r)).collect();
+	fn fs<'o>(&self, ops: impl IntoIterator<Item = &'o Op>) -> Fs {
+		// The trash each item would actually use (one per file system), anchored and checked on its
+		// handle — also when it lies inside a root: the deepest anchor wins. Only a trash step may
+		// create one; for other paths an existing one is anchored (undo moves out of it).
+		let mut trashes: Vec<PathBuf> = Vec::new();
+		for op in ops {
+			let create = matches!(op, Op::Trash { .. });
+			for p in op.paths() {
+				if let Some(t) = local_trash(&self.trash, p, create)
+					&& !trashes.contains(&t)
+				{
+					trashes.push(t);
+				}
+			}
+		}
 		Fs::confined_with_private(self.validator.roots(), &trashes)
 	}
 
@@ -968,12 +995,12 @@ fn cleanup(forward: &Op, inverse: &Op, tag: &str, published: bool) -> Vec<Fix> {
 /// rename and not a copy: `<mount point>/.tpfs-trash-<uid>` (Unix), else the global trash (Windows:
 /// trashing on another drive copies to the home drive first).
 fn trash_slot(trash: &Path, batch: &str, index: usize, path: &Path) -> PathBuf {
-	let base = local_trash(trash, path).unwrap_or_else(|| trash.to_path_buf());
+	let base = local_trash(trash, path, true).unwrap_or_else(|| trash.to_path_buf());
 	base.join(batch).join(index.to_string()).join(path.file_name().unwrap_or_else(|| "root".as_ref()))
 }
 
 #[cfg(unix)]
-fn local_trash(trash: &Path, path: &Path) -> Option<PathBuf> {
+fn local_trash(trash: &Path, path: &Path, create: bool) -> Option<PathBuf> {
 	use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
 	let dev = fs::symlink_metadata(path).ok()?.dev();
@@ -993,7 +1020,9 @@ fn local_trash(trash: &Path, path: &Path) -> Option<PathBuf> {
 
 	let uid = rustix::process::geteuid().as_raw();
 	let dir = mount.join(format!(".tpfs-trash-{uid}"));
-	let _ = fs::DirBuilder::new().mode(0o700).create(&dir);
+	if create {
+		let _ = fs::DirBuilder::new().mode(0o700).create(&dir);
+	}
 
 	// Never use a trash someone else prepared (a symlink, another owner, readable by others).
 	let m = fs::symlink_metadata(&dir).ok()?;
@@ -1001,7 +1030,7 @@ fn local_trash(trash: &Path, path: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(not(unix))]
-fn local_trash(_: &Path, _: &Path) -> Option<PathBuf> {
+fn local_trash(_: &Path, _: &Path, _: bool) -> Option<PathBuf> {
 	None
 }
 
