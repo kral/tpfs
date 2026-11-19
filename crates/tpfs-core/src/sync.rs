@@ -121,6 +121,16 @@ pub fn compare(left: &Path, right: &Path, recursive: bool) -> io::Result<Compari
 			"the two folders must be separate (one is inside the other)",
 		));
 	}
+	// A missing folder (an unplugged disk, a share that is not mounted) is not an empty one: a
+	// mirror against it would plan to trash everything on the other side.
+	for dir in [left, right] {
+		if !fs::metadata(dir).is_ok_and(|m| m.is_dir()) {
+			return Err(io::Error::new(
+				io::ErrorKind::NotFound,
+				format!("{} is not a folder (missing or not mounted)", sanitize(dir.as_os_str())),
+			));
+		}
+	}
 	let mut out = Comparison::default();
 	let mut budget = MAX_ENTRIES;
 	walk(left, right, Path::new(""), recursive, &mut out, &mut budget)?;
@@ -338,6 +348,29 @@ pub fn sync_plan(left: &Path, right: &Path, cmp: &Comparison, opts: SyncOptions)
 		return SyncPlan {
 			plan: Plan::new(vec![], "Sync not planned: the comparison is incomplete (too many entries)"),
 			skipped: vec![Skipped { rel: PathBuf::new(), why: "comparison incomplete; nothing planned".into() }],
+		};
+	}
+	// A mirror from an empty source (often a mount point with nothing mounted) would trash the
+	// whole target: never planned; the user can trash the target's contents explicitly.
+	let target_only = match opts.direction {
+		Direction::RightToLeft => Diff::OnlyLeft,
+		_ => Diff::OnlyRight,
+	};
+	if opts.mirror
+		&& opts.direction != Direction::Both
+		&& !cmp.items.is_empty()
+		&& cmp.items.iter().all(|i| i.diff == target_only)
+	{
+		return SyncPlan {
+			plan: Plan::new(
+				vec![],
+				"Sync not planned: the source folder is empty, so a mirror would trash the whole target",
+			),
+			skipped: vec![Skipped {
+				rel: PathBuf::new(),
+				why: "the source folder is empty (is it mounted?); a mirror would trash everything in the target"
+					.into(),
+			}],
 		};
 	}
 	let mut ops = Vec::new();

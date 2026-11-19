@@ -251,3 +251,17 @@ fn one_way_and_mirror_syncs_are_idempotent() {
 		assert!(again.plan.ops.is_empty(), "mirror={mirror}: {:?}", again.plan.preview());
 	}
 }
+
+/// An unmounted or missing source is not an empty one, and a mirror from an empty source plans
+/// nothing: either would trash the whole target.
+#[test]
+fn a_mirror_from_a_missing_or_empty_source_plans_nothing() {
+	let e = Env::new();
+	e.file(&e.right.join("photo.jpg"), "P", 0);
+	assert!(compare(&e.base.join("not-mounted"), &e.right, true).is_err());
+	let cmp = compare(&e.left, &e.right, true).unwrap();
+	let sp = sync_plan(&e.left, &e.right, &cmp, SyncOptions { direction: Direction::LeftToRight, mirror: true });
+	assert!(sp.plan.ops.is_empty(), "{:?}", sp.plan.ops);
+	assert!(sp.skipped[0].why.contains("empty"));
+	assert!(e.right.join("photo.jpg").exists());
+}
