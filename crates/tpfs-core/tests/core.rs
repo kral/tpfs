@@ -715,3 +715,33 @@ fn recover_is_idempotent_and_retryable() {
 	assert_eq!(fs::read_to_string(&a).unwrap(), "A");
 	assert_eq!(j.batches().unwrap()[0].status, BatchStatus::Aborted);
 }
+
+/// On case-insensitive file systems another spelling of a root is still that root.
+#[test]
+#[cfg(any(windows, target_os = "macos"))]
+fn another_spelling_of_a_root_is_the_root() {
+	let s = Sandbox::new();
+	let photos = s.dir("Photos");
+	let v = Validator::new([&s.root, &photos]).unwrap();
+	let mut spellings = vec![s.root.join("photos"), s.root.join("PHOTOS")];
+	if cfg!(windows) {
+		spellings.push(s.root.join("Photos."));
+	}
+	for p in spellings {
+		let plan = Plan::new(vec![Op::Trash { path: p.clone() }], "");
+		let m = messages(&v, &plan);
+		assert!(!m.is_empty(), "{} was accepted", p.display());
+	}
+	assert!(photos.is_dir());
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_rejects_names_it_would_misread() {
+	let s = Sandbox::new();
+	let a = s.file("a.txt", "a");
+	for name in ["CON", "nul.txt", "COM1", "x.", "x ", "a.txt:hidden"] {
+		let plan = Plan::new(vec![Op::Copy { from: a.clone(), to: s.root.join(name) }], "");
+		assert!(!messages(&s.validator(), &plan).is_empty(), "{name} was accepted");
+	}
+}

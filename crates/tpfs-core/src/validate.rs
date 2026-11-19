@@ -259,12 +259,28 @@ impl Validator {
 	}
 
 	/// Normalise, confine to a root, and refuse paths that pass through a symlink.
+	///
+	/// The result is the path as the file system spells it (existing part canonicalised), so that
+	/// different spellings of one folder — `Photos` and `photos` on a case-insensitive file system,
+	/// `Photos.` or an 8.3 short name on Windows — are recognised as the same root.
 	fn resolve(&self, path: &Path) -> Result<PathBuf, String> {
 		let path = normalize(path).ok_or_else(|| format!("Path must be absolute: {}", show(path)))?;
 		if path.to_str().is_none() {
 			// The plan, its digest and the journal store paths as JSON strings.
 			return Err(format!("File names that are not valid Unicode are not supported yet: {}", show(&path)));
 		}
+		check_names(&path)?;
+		// Symlinks are judged on the path as written…
+		if let Some(root) = self.root_of(&path)
+			&& let Ok(Some(link)) = symlink_in_between(&path, root)
+		{
+			return Err(format!("Path goes through a symlink: {}", show(&link)));
+		}
+		if self.root_of(&path).is_none() && through_symlink(&path) {
+			return Err(format!("Outside the allowed folders: {}", show(&path)));
+		}
+		// …and the root on the path as the file system spells it.
+		let path = spelled(&path);
 		if path.components().any(|c| is_own_name(c.as_os_str())) {
 			return Err(format!("This is tpfs's own working data and cannot be changed by a plan: {}", show(&path)));
 		}
@@ -281,6 +297,61 @@ impl Validator {
 			Err(e) => Err(format!("Cannot inspect {}: {e}", show(&path))),
 		}
 	}
+}
+
+/// Whether any existing directory on the way to `path` is a symlink.
+fn through_symlink(path: &Path) -> bool {
+	path.ancestors().skip(1).any(|a| fs::symlink_metadata(a).is_ok_and(|m| m.file_type().is_symlink()))
+}
+
+/// The file system's own spelling of `path`: its existing directories canonicalised, and the
+/// last component too when it exists and is not a symlink (operations act on a link itself).
+/// Symlinks in between are caught afterwards by comparing against the roots.
+fn spelled(path: &Path) -> PathBuf {
+	if let Ok(m) = fs::symlink_metadata(path)
+		&& !m.file_type().is_symlink()
+		&& let Ok(c) = crate::path::canonicalize(path)
+	{
+		return c;
+	}
+	let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else { return path.to_path_buf() };
+	let mut rest = vec![name];
+	let mut base = parent;
+	loop {
+		if let Ok(c) = crate::path::canonicalize(base) {
+			let mut out = c;
+			out.extend(rest.iter().rev());
+			return out;
+		}
+		match (base.parent(), base.file_name()) {
+			(Some(p), Some(n)) => {
+				rest.push(n);
+				base = p;
+			}
+			_ => return path.to_path_buf(),
+		}
+	}
+}
+
+/// Names Windows cannot use or silently changes: `a:b` (an alternate data stream of `a`),
+/// trailing dots and spaces (stripped), and device names such as `CON` or `com1.txt`.
+fn check_names(path: &Path) -> Result<(), String> {
+	if !cfg!(windows) {
+		return Ok(());
+	}
+	for c in path.components() {
+		let std::path::Component::Normal(name) = c else { continue };
+		let name = name.to_string_lossy();
+		let stem = name.split('.').next().unwrap_or_default().trim_end().to_ascii_uppercase();
+		let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+			|| ((stem.starts_with("COM") || stem.starts_with("LPT"))
+				&& stem.len() == 4
+				&& stem[3..].chars().all(|d| ('1'..='9').contains(&d) || "¹²³".contains(d)));
+		if name.contains(':') || name.ends_with(['.', ' ']) || device {
+			return Err(format!("Windows cannot use this name safely: '{}'", sanitize(name.as_ref().as_ref())));
+		}
+	}
+	Ok(())
 }
 
 /// FIFOs, sockets and device nodes are never copied: reading them can block forever or read a whole disk.
