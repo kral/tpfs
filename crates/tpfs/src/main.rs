@@ -33,7 +33,7 @@ USAGE:
                 [--apply]                         confirm and execute (or --approve <digest>)
                 [--json]                          print the plan as JSON (for `tpfs apply -`)
   tpfs undo [--approve <batch>]                 revert the most recent batch
-  tpfs log                                      list recorded batches
+  tpfs log [<batch>]                            list batches, or every step of one batch and its undo
   tpfs recover                                  roll back batches interrupted by a crash
                 [--abandon <batch>]               give up on one recovery cannot handle (damaged, or
                                                   older than newer changes): records it as abandoned
@@ -116,7 +116,8 @@ fn allowed(command: &str) -> Option<(&'static [&'static str], usize)> {
 		"apply" => (&["root", "approve", "source", "max-ops", "home"], 1),
 		"sync" => (&["both", "mirror", "apply", "approve", "json", "home"], 2),
 		"undo" => (&["approve", "home"], 0),
-		"log" | "pending" => (&["home"], 0),
+		"log" => (&["home"], 1),
+		"pending" => (&["home"], 0),
 		"recover" => (&["home", "abandon"], 0),
 		"mcp" => (&["root", "approval", "home"], 0),
 		"approve" | "reject" => (&["home"], 1),
@@ -375,7 +376,10 @@ fn run(args: Args) -> Res {
 			eprintln!("State: {}", tpfs_core::sanitize(state_dir(&args)?.as_os_str()));
 			let batches = journal.batches().map_err(|e| e.to_string())?;
 			// `tpfs log <batch>`: every step of one batch, what it did and how it is undone.
-			if let Some(id) = args.plan.as_deref().and_then(|p| p.to_str()) {
+			if let Some(raw) = args.plan.as_deref() {
+				let id = raw
+					.to_str()
+					.ok_or_else(|| usage(format!("no batch {} in the journal", tpfs_core::sanitize(raw))))?;
 				let b = batches
 					.iter()
 					.find(|b| b.id == id)

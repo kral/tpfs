@@ -79,6 +79,19 @@ impl Fs {
 		fs
 	}
 
+	/// Whether `dir` itself has a checked anchor (a root or a private folder).
+	pub(crate) fn anchors_exactly(&self, dir: &Path) -> bool {
+		#[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
+		{
+			self.anchors.iter().any(|a| a.root() == dir)
+		}
+		#[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
+		{
+			let _ = dir;
+			false
+		}
+	}
+
 	/// Operations under any of `roots` are confined to it; roots are expected to be canonical.
 	pub(crate) fn confined(roots: &[PathBuf]) -> Self {
 		#[cfg(any(target_os = "linux", target_vendor = "apple", windows))]

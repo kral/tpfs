@@ -7,7 +7,20 @@ use std::{
 };
 
 fn tpfs(home: &Path, args: &[&str]) -> Output {
-	Command::new(env!("CARGO_BIN_EXE_tpfs")).args(args).env("TPFS_HOME", home).stdin(Stdio::null()).output().unwrap()
+	// Spawned while no journal is open in this process: a child shares the locked file
+	// description until it execs, which would make its own journal open fail.
+	let child = {
+		let _quiet = journal_lock();
+		Command::new(env!("CARGO_BIN_EXE_tpfs"))
+			.args(args)
+			.env("TPFS_HOME", home)
+			.stdin(Stdio::null())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()
+			.unwrap()
+	};
+	child.wait_with_output().unwrap()
 }
 
 fn stdout(o: &Output) -> String {
@@ -52,6 +65,7 @@ fn dry_run_approve_digest_and_undo() {
 
 	// Undo through the shared journal.
 	let id = {
+		let _quiet = journal_lock();
 		let mut j = tpfs_core::Journal::open(home.join("journal.jsonl")).unwrap();
 		j.batches().unwrap().pop().unwrap().id
 	};
@@ -74,4 +88,10 @@ fn json_output_is_a_plan_for_apply() {
 
 	let nested = tpfs(&base.join("state"), &["sync", base.to_str().unwrap(), src.to_str().unwrap()]);
 	assert!(!nested.status.success(), "nested folders are refused");
+}
+
+/// Held while a journal is opened in this process or a child is spawned (see `tpfs`).
+fn journal_lock() -> std::sync::MutexGuard<'static, ()> {
+	static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+	LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }

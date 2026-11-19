@@ -310,8 +310,12 @@ impl Journal {
 		// The batch of the last readable record: the one being written when damage appears (an
 		// undo may be writing an older batch than the newest one).
 		let mut writing: Option<String> = None;
+		// An unreadable line was just seen: the next readable record tells which batch was being
+		// written too (an undo of an older batch may have lost its first record to it).
+		let mut after_damage = false;
 		for e in self.records()? {
 			let Some(e) = e else {
+				after_damage = true;
 				// Only the batch being written when the damage happened can have lost a record to it;
 				// an older batch is not affected by later damage.
 				let current = writing.as_ref().and_then(|id| index.get(id)).and_then(|&i| batches.get(i));
@@ -349,6 +353,13 @@ impl Journal {
 				if !matches!(&e, Entry::UndoPublished { .. } | Entry::UndoStep { .. }) || !recovery {
 					suspect.clear();
 				}
+			}
+			if std::mem::take(&mut after_damage)
+				&& matches!(e, Entry::UndoStep { .. } | Entry::UndoPublished { .. } | Entry::Undo { .. })
+				&& let Some(b) = index.get(e.batch()).and_then(|&i| batches.get_mut(i))
+				&& b.status == BatchStatus::Committed
+			{
+				b.damaged = true; // an undo record of it may be the one that was lost
 			}
 			writing = Some(e.batch().to_owned());
 			if let Entry::Begin { batch, at, source, reason, v, .. } = &e {

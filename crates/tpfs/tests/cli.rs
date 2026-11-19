@@ -7,11 +7,25 @@ use std::{
 };
 
 fn tpfs(home: &Path, args: &[&str]) -> Output {
-	Command::new(env!("CARGO_BIN_EXE_tpfs")).args(args).env("TPFS_HOME", home).stdin(Stdio::null()).output().unwrap()
+	// Spawned while no journal is open in this process: a child shares the locked file
+	// description until it execs, which would make its own journal open fail.
+	let child = {
+		let _quiet = journal_lock();
+		Command::new(env!("CARGO_BIN_EXE_tpfs"))
+			.args(args)
+			.env("TPFS_HOME", home)
+			.stdin(Stdio::null())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn()
+			.unwrap()
+	};
+	child.wait_with_output().unwrap()
 }
 
 /// The newest committed batch (the journal is opened only while no child runs).
 fn newest_batch(home: &Path) -> Option<String> {
+	let _quiet = journal_lock();
 	let mut j = tpfs_core::Journal::open(home.join("journal.jsonl")).unwrap();
 	let b = j.batches().unwrap().into_iter().rev().find(|b| b.status == tpfs_core::BatchStatus::Committed);
 	b.map(|b| b.id)
@@ -38,7 +52,8 @@ fn exit_codes_tell_what_happened() {
 	assert_eq!(code(&tpfs(&home, &["check", g, "--root", r])), 0);
 	assert_eq!(code(&tpfs(&home, &["check", b, "--root", r])), 3);
 	assert_eq!(code(&tpfs(&home, &["check", g])), 2, "missing --root is a usage error");
-	assert_eq!(code(&tpfs(&home, &["log", "extra"])), 2);
+	assert_eq!(code(&tpfs(&home, &["log", "extra"])), 2, "an unknown batch is a usage error");
+	assert_eq!(code(&tpfs(&home, &["log", "a", "b"])), 2);
 	assert_eq!(code(&tpfs(&home, &["undo", "--json"])), 2);
 
 	// Not interactive and no digest: cancelled, nothing changed.
@@ -129,6 +144,7 @@ fn recover_reports_success_and_refusal_by_exit_code() {
 	fs::write(&a, "in the way").unwrap();
 	{
 		use tpfs_core::{Entry, Journal, Op};
+		let _quiet = journal_lock();
 		let mut j = Journal::open(home.join("journal.jsonl")).unwrap();
 		j.append(&Entry::Begin {
 			batch: "x".into(),
@@ -193,6 +209,7 @@ fn mcp_speaks_only_json_rpc_on_stdout() {
 	let base = tpfs_core::canonicalize(tmp.path()).unwrap();
 	let (root, home) = (base.join("root"), base.join("home"));
 	fs::create_dir(&root).unwrap();
+	let quiet = journal_lock();
 	let mut child = Command::new(env!("CARGO_BIN_EXE_tpfs"))
 		.args(["mcp", "--root", root.to_str().unwrap()])
 		.env("TPFS_HOME", &home)
@@ -201,6 +218,7 @@ fn mcp_speaks_only_json_rpc_on_stdout() {
 		.stderr(Stdio::piped())
 		.spawn()
 		.unwrap();
+	drop(quiet);
 	let mut stdin = child.stdin.take().unwrap();
 	stdin
 		.write_all(
@@ -259,6 +277,7 @@ fn an_empty_plan_is_nothing_to_do_and_undo_points_to_recover_first() {
 	{
 		use tpfs_core::{Entry, Journal, Op};
 		tpfs_core::private_dir(&home).unwrap();
+		let _quiet = journal_lock();
 		let mut j = Journal::open(home.join("journal.jsonl")).unwrap();
 		let dir = root.join("d");
 		j.append(&Entry::Begin {
@@ -282,4 +301,44 @@ fn an_empty_plan_is_nothing_to_do_and_undo_points_to_recover_first() {
 	assert_eq!(code(&o), 1);
 	let err = String::from_utf8_lossy(&o.stderr);
 	assert!(err.contains("1-cut") && err.contains("tpfs recover"), "{err}");
+}
+
+#[test]
+fn log_lists_the_steps_of_one_batch() {
+	let tmp = tempfile::TempDir::new().unwrap();
+	let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+	let (root, home) = (base.join("root"), base.join("home"));
+	fs::create_dir(&root).unwrap();
+	let plan = base.join("p.json");
+	fs::write(
+		&plan,
+		format!(
+			r#"{{"ops":[{{"op":"mkdir","path":{:?}}},{{"op":"mkdir","path":{:?}}}]}}"#,
+			root.join("a"),
+			root.join("b")
+		),
+	)
+	.unwrap();
+	let digest =
+		String::from_utf8(tpfs(&home, &["check", plan.to_str().unwrap(), "--root", root.to_str().unwrap()]).stdout)
+			.unwrap()
+			.lines()
+			.find_map(|l| l.strip_prefix("Digest: ").map(str::to_owned))
+			.unwrap();
+	assert_eq!(
+		code(&tpfs(&home, &["apply", plan.to_str().unwrap(), "--root", root.to_str().unwrap(), "--approve", &digest])),
+		0
+	);
+	let id = newest_batch(&home).unwrap();
+	let o = tpfs(&home, &["log", &id]);
+	assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+	let out = String::from_utf8(o.stdout).unwrap();
+	assert!(out.contains("#1") && out.contains("#2") && out.matches("undo:").count() == 2, "{out}");
+	assert_eq!(code(&tpfs(&home, &["log", "nope"])), 2);
+}
+
+/// Held while a journal is opened in this process or a child is spawned (see `tpfs`).
+fn journal_lock() -> std::sync::MutexGuard<'static, ()> {
+	static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+	LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }

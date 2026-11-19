@@ -97,16 +97,12 @@ pub fn assess(plan: &Plan, source: Source) -> Risk {
 	Risk { level, reasons }
 }
 
-/// Number of hard links of a regular file, when there is more than one.
-#[cfg(unix)]
+/// Number of hard links of a regular file, when there is more than one (NTFS has them too).
 fn hard_links(p: &Path) -> Option<u64> {
-	use std::os::unix::fs::MetadataExt;
-	fs::symlink_metadata(p).ok().filter(|m| m.is_file() && m.nlink() > 1).map(|m| m.nlink())
-}
-
-#[cfg(not(unix))]
-fn hard_links(_: &Path) -> Option<u64> {
-	None
+	if !fs::symlink_metadata(p).is_ok_and(|m| m.is_file()) {
+		return None;
+	}
+	crate::fsops::link_count(p).filter(|&n| n > 1)
 }
 
 fn is_dir(p: &Path) -> bool {

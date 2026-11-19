@@ -162,7 +162,7 @@ impl Validator {
 			let message = if plan.reason.trim().is_empty() {
 				"The plan is empty.".to_owned()
 			} else {
-				format!("The plan is empty: {}", sanitize(plan.reason.as_ref()))
+				format!("The plan is empty: it has no operations (reason: {})", sanitize(plan.reason.as_ref()))
 			};
 			return vec![Issue { index: None, message }];
 		}

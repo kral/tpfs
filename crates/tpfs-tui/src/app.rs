@@ -543,7 +543,9 @@ impl App {
 				let id = tpfs_core::sanitize(b.id.as_ref());
 				self.status = match (b.status, b.damaged) {
 					(BatchStatus::Committed, _) => {
-						format!("The last batch ({id}) has damaged journal records: undo it by hand from `tpfs log`.")
+						format!(
+							"The last batch ({id}) has damaged journal records: see `tpfs log {id}`, undo by hand what you need, then `tpfs recover --abandon {id}`."
+						)
 					}
 					(_, true) => format!(
 						"The last batch ({id}) was interrupted and its records are damaged: see `tpfs log`, then `tpfs recover --abandon {id}`."

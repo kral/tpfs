@@ -107,6 +107,8 @@ pub struct Executor<'a> {
 pub enum Phase {
 	BeforeApply,
 	AfterApply,
+	/// A failed step was recorded as failed; its own marks are about to be cleaned up.
+	FailedRecorded,
 }
 
 impl<'a> Executor<'a> {
@@ -262,6 +264,9 @@ impl<'a> Executor<'a> {
 					let only_parts = fixes.iter().all(|f| matches!(f, Fix::RemovePart(_)));
 					if only_parts {
 						self.journal.write(&Entry::Failed { batch: batch.clone(), index: i })?;
+						if let Some(hook) = &mut self.hook {
+							hook(i, Phase::FailedRecorded);
+						}
 					}
 					for fix in &fixes {
 						if let Err(e) = apply_fix(fix, &fs, &self.trash, &format!("{batch}-recover"), i) {
@@ -530,7 +535,18 @@ impl<'a> Executor<'a> {
 					continue;
 				}
 				if step.failed {
-					continue; // its own call failed and its marks were cleaned up
+					// Its own call failed and nothing but its partial copy can be left (a crash between
+					// the record and the clean-up): drop that, and leave everything else alone.
+					let part = cleanup(&step.forward, &step.inverse, &tag(&batch.id, step.index), false)
+						.into_iter()
+						.filter(|f| matches!(f, Fix::RemovePart(_)));
+					for fix in part {
+						if let Err(e) = apply_fix(&fix, &fs, &self.trash, &format!("{}-recover", batch.id), step.index)
+						{
+							errors.push(clean(format!("{fix}: {e}")));
+						}
+					}
+					continue;
 				}
 				let mut clean_step = true;
 				for fix in cleanup(&step.forward, &step.inverse, &tag(&batch.id, step.index), step.published) {
@@ -582,6 +598,9 @@ impl<'a> Executor<'a> {
 		for op in ops {
 			let create = matches!(op, Op::Trash { .. });
 			for p in op.paths() {
+				// A target that does not exist yet lives on the file system of its nearest existing
+				// folder: that trash is used too (clean-up of a cross-device move, its undo).
+				let Some(p) = p.ancestors().find(|a| fs::symlink_metadata(a).is_ok()) else { continue };
 				if let Some(t) = local_trash(&self.trash, p, create)
 					&& !trashes.contains(&t)
 				{
@@ -635,7 +654,7 @@ fn absolute_real(path: &Path) -> PathBuf {
 /// folder that is a real directory owned by the user and private. A path that merely contains such
 /// a name (a forged journal entry) does not count.
 fn in_local_trash(path: &Path) -> bool {
-	#[cfg(unix)]
+	#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 	{
 		use std::os::unix::fs::{MetadataExt, PermissionsExt};
 		let uid = rustix::process::geteuid().as_raw();
@@ -646,7 +665,7 @@ fn in_local_trash(path: &Path) -> bool {
 					.is_ok_and(|m| m.is_dir() && m.uid() == uid && m.permissions().mode() & 0o077 == 0)
 		})
 	}
-	#[cfg(not(unix))]
+	#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 	{
 		let _ = path;
 		false
@@ -829,10 +848,18 @@ fn apply(
 			// <trash>/<batch>/<index>/<name>: the trash folder exists; the two levels below are made
 			// through the confined calls (a local trash is anchored like a root, never followed).
 			let batch_dir = parent.parent().ok_or_else(|| io::Error::other("trash slot without a batch folder"))?;
-			if let Some(base) = batch_dir.parent()
-				&& !exists(base)
-			{
-				fs::create_dir_all(base)?; // the private trash in the state folder
+			if let Some(base) = batch_dir.parent() {
+				if base == trash {
+					if !exists(base) {
+						fs::create_dir_all(base)?; // the private trash in the state folder
+					}
+				} else if !fs.anchors_exactly(base) {
+					// A per-file-system trash is only ever used through its checked anchor.
+					return Err(io::Error::new(
+						io::ErrorKind::PermissionDenied,
+						format!("refused: the trash {} was not opened safely", crate::sanitize(base.as_os_str())),
+					));
+				}
 			}
 			for d in [batch_dir, parent] {
 				match fs.mkdir(d) {
@@ -999,7 +1026,7 @@ fn trash_slot(trash: &Path, batch: &str, index: usize, path: &Path) -> PathBuf {
 	base.join(batch).join(index.to_string()).join(path.file_name().unwrap_or_else(|| "root".as_ref()))
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 fn local_trash(trash: &Path, path: &Path, create: bool) -> Option<PathBuf> {
 	use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
@@ -1029,7 +1056,7 @@ fn local_trash(trash: &Path, path: &Path, create: bool) -> Option<PathBuf> {
 	(m.is_dir() && m.uid() == uid && m.permissions().mode() & 0o077 == 0).then_some(dir)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 fn local_trash(_: &Path, _: &Path, _: bool) -> Option<PathBuf> {
 	None
 }

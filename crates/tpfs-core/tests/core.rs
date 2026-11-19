@@ -1679,3 +1679,51 @@ fn a_refused_publish_is_recorded_before_its_part_goes() {
 	assert!(report.errors.is_empty(), "{report:?}");
 	assert_eq!(fs::read_to_string(&b).unwrap(), "THEIRS");
 }
+
+/// An interrupted step that cannot be cleaned up (a conflict) stops recovery: the older step's
+/// inverse would otherwise run on top of it and move someone else's file.
+#[test]
+fn recovery_stops_at_an_interrupted_step_it_cannot_clean_up() {
+	let s = Sandbox::new();
+	let (x, a, b) = (s.root.join("x"), s.root.join("a"), s.root.join("b"));
+	fs::write(&b, "MOVED").unwrap(); // x -> a (done), a -> b (renamed, not recorded)
+	let mut j = s.journal();
+	begin(&mut j, "w");
+	j.append(&Entry::Intent {
+		batch: "w".into(),
+		index: 0,
+		forward: Op::Move { from: x.clone(), to: a.clone() },
+		inverse: Op::Move { from: a.clone(), to: x.clone() },
+	})
+	.unwrap();
+	j.append(&Entry::Done { batch: "w".into(), index: 0, check: None, mode: None }).unwrap();
+	j.append(&Entry::Intent {
+		batch: "w".into(),
+		index: 1,
+		forward: Op::Move { from: a.clone(), to: b.clone() },
+		inverse: Op::Move { from: b.clone(), to: a.clone() },
+	})
+	.unwrap();
+	fs::write(&a, "USER").unwrap(); // someone reuses the name
+	let first = Executor::new(&s.validator(), &mut j, s.trash()).recover().unwrap();
+	assert_eq!(first.errors.len(), 1, "{first:?}");
+	assert!(!x.exists(), "the older step moved someone else's file");
+	assert_eq!(fs::read_to_string(&a).unwrap(), "USER");
+	assert_eq!(fs::read_to_string(&b).unwrap(), "MOVED");
+}
+
+/// The first undo record of an older batch lost right after the newer batch's own `undo`.
+#[test]
+fn a_lost_first_undo_record_of_an_older_batch_is_noticed() {
+	let s = Sandbox::new();
+	let older = run(&s, vec![Op::Mkdir { path: s.root.join("d") }, Op::Rmdir { path: s.root.join("d") }]);
+	run(&s, vec![Op::Mkdir { path: s.root.join("n") }]);
+	undo(&s).unwrap();
+	corrupt_line(&s); // UndoStep(older, 1) rotted
+	let mut j = s.journal();
+	j.append(&Entry::UndoStep { batch: older.clone(), index: 0 }).unwrap();
+	let b = j.batches().unwrap().into_iter().find(|b| b.id == older).unwrap();
+	assert!(b.damaged, "the lost first undo record went unnoticed");
+	drop(j);
+	assert!(undo(&s).is_err());
+}

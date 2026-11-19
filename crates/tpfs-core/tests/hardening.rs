@@ -542,3 +542,43 @@ fn a_root_swapped_mid_plan_never_redirects_a_step() {
 	assert_eq!(now, ["f.txt"], "the outside folder changed");
 	assert_eq!(fs::read_to_string(outside.join("f.txt")).unwrap(), "secret");
 }
+
+/// A crash right after a refused publish was recorded as failed, before its part was removed:
+/// recovery removes the part and leaves the other program's file at the target alone.
+#[test]
+fn a_crash_after_a_refused_publish_never_takes_the_other_file() {
+	let s = Sandbox::new();
+	fs::write(s.root.join("a.txt"), "A").unwrap();
+	let b = s.root.join("b.txt");
+	let plan = Plan::new(vec![Op::Copy { from: s.root.join("a.txt"), to: b.clone() }], "");
+	let rb = b.clone();
+	let default_hook = panic::take_hook();
+	panic::set_hook(Box::new(|_| {}));
+	let crashed = panic::catch_unwind(AssertUnwindSafe(|| {
+		let v = s.validator();
+		let mut j = s.journal();
+		let _ = Executor::new(&v, &mut j, s.state.join("trash"))
+			.hook(move |_, p| match p {
+				Phase::BeforeApply => fs::write(&rb, "THEIRS").unwrap(),
+				Phase::FailedRecorded => panic!("simulated crash"),
+				_ => {}
+			})
+			.execute(&plan, Source::Human);
+	}));
+	panic::set_hook(default_hook);
+	assert!(crashed.is_err(), "the refused publish was not recorded before its clean-up");
+
+	let v = s.validator();
+	let mut j = s.journal();
+	let report = Executor::new(&v, &mut j, s.state.join("trash")).recover().unwrap();
+	assert!(report.errors.is_empty(), "{:?}", report.errors);
+	assert_eq!(fs::read_to_string(&b).unwrap(), "THEIRS");
+	let leftovers: Vec<_> = fs::read_dir(&s.root)
+		.unwrap()
+		.filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+		.filter(|n| n.starts_with(".tpfs-part-"))
+		.collect();
+	assert!(leftovers.is_empty(), "{leftovers:?}");
+	let trash = s.state.join("trash");
+	assert!(!trash.exists() || fs::read_dir(&trash).unwrap().next().is_none(), "the other file went to the trash");
+}
