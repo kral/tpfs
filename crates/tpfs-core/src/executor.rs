@@ -285,7 +285,9 @@ impl<'a> Executor<'a> {
 						Op::Copy { to, .. } => normalize(to).and_then(|t| fingerprint(&t)),
 						_ => None,
 					};
-					self.journal.write(&Entry::Done { batch: batch.clone(), index: i, check, mode })?;
+					// The mode is journaled once, in `Mode` before the removal (older journals also
+					// carry it here; both are read).
+					self.journal.write(&Entry::Done { batch: batch.clone(), index: i, check, mode: None })?;
 					applied.push(inverse);
 					if let Some(progress) = &mut self.progress {
 						progress(i + 1);
@@ -578,14 +580,6 @@ impl<'a> Executor<'a> {
 			))),
 			None => Err(ExecError::Blocked(format!("no batch {} in the journal", crate::sanitize(id.as_ref())))),
 		}
-	}
-
-	/// Roll back the newest batch if, and only if, it was interrupted: the change "Undo" means.
-	/// An older interrupted batch is left for an explicit `recover`, because rolling it back now
-	/// would apply its inverses over everything that happened since.
-	pub fn recover_last(&mut self) -> Result<RecoveryReport, ExecError> {
-		let last = self.journal.batches()?.pop().filter(|b| b.status == BatchStatus::Incomplete);
-		self.recover_batches(last.into_iter().collect())
 	}
 
 	fn recover_batches(&mut self, batches: Vec<crate::journal::BatchView>) -> Result<RecoveryReport, ExecError> {

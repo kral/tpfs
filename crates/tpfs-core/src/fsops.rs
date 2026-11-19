@@ -751,13 +751,17 @@ pub(crate) fn merge_back(
 	}
 }
 
+/// Every entry of the tree at `path` (relative names, and whether each is a folder), each folder
+/// before what is in it. An explicit stack: no recursion however deep the tree.
 fn collect(fs: &Fs, path: &Path, rel: &Path, out: &mut Vec<(PathBuf, bool)>) -> io::Result<()> {
-	let is_dir = std::fs::symlink_metadata(path)?.is_dir();
-	out.push((rel.to_path_buf(), is_dir));
-	if is_dir {
-		for name in fs.list(path)? {
-			collect(fs, &path.join(&name), &rel.join(&name), out)?;
+	let mut stack = vec![(path.to_path_buf(), rel.to_path_buf())];
+	while let Some((path, rel)) = stack.pop() {
+		let is_dir = std::fs::symlink_metadata(&path)?.is_dir();
+		if is_dir {
+			let names = fs.list(&path)?;
+			stack.extend(names.into_iter().rev().map(|name| (path.join(&name), rel.join(&name))));
 		}
+		out.push((rel, is_dir));
 	}
 	Ok(())
 }

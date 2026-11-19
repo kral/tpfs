@@ -489,7 +489,7 @@ fn history_of_a_big_batch_reads_quickly() {
 }
 
 #[test]
-fn recover_last_only_touches_an_interrupted_newest_batch() {
+fn recover_rolls_back_only_what_has_nothing_newer_on_top() {
 	let s = Sandbox::new();
 	let dir = s.root.join("half");
 	let mut j = s.journal();
@@ -540,16 +540,14 @@ fn recover_last_only_touches_an_interrupted_newest_batch() {
 	j.append(&Entry::Done { batch: "n".into(), index: 0, check: None, mode: None }).unwrap();
 	j.append(&Entry::Commit { batch: "n".into() }).unwrap();
 
-	let r = Executor::new(&v, &mut j, s.trash()).recover_last().unwrap();
-	assert!(r.rolled_back.is_empty(), "an older interrupted batch must not be rolled back by Undo");
 	let r = Executor::new(&v, &mut j, s.trash()).recover().unwrap();
 	assert!(r.rolled_back.is_empty() && r.errors[0].contains("newer batches"), "{r:?}");
 	assert!(dir.exists() && newer.exists());
 
 	fs::remove_dir(&dir).unwrap();
 	crashed(&mut j, "new");
-	let r = Executor::new(&v, &mut j, s.trash()).recover_last().unwrap();
-	assert_eq!(r.rolled_back, vec!["new".to_string()]);
+	let r = Executor::new(&v, &mut j, s.trash()).recover().unwrap();
+	assert_eq!(r.rolled_back, vec!["new".to_string()], "{r:?}");
 	assert!(!dir.exists() && newer.exists());
 }
 

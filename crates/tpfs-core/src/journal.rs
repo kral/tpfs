@@ -39,7 +39,8 @@ pub enum Entry {
 		/// For copies: a fingerprint of the result, so undo can tell whether it was changed since.
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		check: Option<String>,
-		/// For `rmdir`: the folder's permission bits, restored by undo.
+		/// For `rmdir`, in journals of older versions: the folder's permission bits (now only in
+		/// [`Entry::Mode`]). Still read.
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		mode: Option<u32>,
 	},
@@ -49,8 +50,8 @@ pub enum Entry {
 		index: usize,
 		check: String,
 	},
-	/// For `rmdir`: the folder's permission bits, recorded before it is removed (the same value
-	/// also goes in `done`), so recovery after a crash in between restores them.
+	/// For `rmdir`: the folder's permission bits, recorded before it is removed, so undo and
+	/// recovery after a crash in between restore them.
 	Mode {
 		batch: String,
 		index: usize,
