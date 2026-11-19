@@ -45,6 +45,8 @@ pub enum Diff {
 	Conflict,
 	/// A file on one side, a folder (or something else) on the other.
 	TypeMismatch,
+	/// The same name in a different letter case on a file system that ignores case.
+	CaseMismatch,
 	Same,
 }
 
@@ -125,17 +127,42 @@ fn walk(
 	out: &mut Comparison,
 	budget: &mut usize,
 ) -> io::Result<()> {
-	let l = list(&left.join(rel), budget)?;
-	let r = list(&right.join(rel), budget)?;
-	if *budget == 0 {
+	let (l, lt) = list(&left.join(rel), budget)?;
+	let (r, rt) = list(&right.join(rel), budget)?;
+	if lt || rt {
 		out.truncated = true;
 	}
+
+	// On file systems that ignore letter case, `A.txt` and `a.txt` are one file: pairing them by
+	// exact name would plan a copy onto an existing file. They are reported, not synced.
+	if CASE_INSENSITIVE {
+		let folded: BTreeMap<String, &std::ffi::OsString> =
+			r.keys().map(|k| (k.to_string_lossy().to_lowercase(), k)).collect();
+		for name in l.keys().filter(|k| !r.contains_key(*k)) {
+			if folded.contains_key(&name.to_string_lossy().to_lowercase()) {
+				out.items.push(Item {
+					rel: rel.join(name),
+					diff: Diff::CaseMismatch,
+					left: l.get(name).cloned(),
+					right: None,
+				});
+			}
+		}
+	}
+	let case_twin = |name: &std::ffi::OsString, other: &BTreeMap<std::ffi::OsString, Meta>| {
+		CASE_INSENSITIVE
+			&& !other.contains_key(name)
+			&& other.keys().any(|k| k.to_string_lossy().to_lowercase() == name.to_string_lossy().to_lowercase())
+	};
 
 	let mut names: Vec<&std::ffi::OsString> = l.keys().chain(r.keys()).collect();
 	names.sort();
 	names.dedup();
 
 	for name in names {
+		if case_twin(name, if l.contains_key(name) { &r } else { &l }) {
+			continue; // reported above
+		}
 		let rel = rel.join(name);
 		let (lm, rm) = (l.get(name).cloned(), r.get(name).cloned());
 		let diff = match (&lm, &rm) {
@@ -160,10 +187,13 @@ fn walk(
 	Ok(())
 }
 
+/// Windows and macOS (by default) ignore letter case in file names.
+const CASE_INSENSITIVE: bool = cfg!(any(windows, target_vendor = "apple"));
+
 fn file_diff(a: &Meta, b: &Meta) -> Diff {
-	let tol = MTIME_TOLERANCE.as_millis() as i64;
+	let tol = MTIME_TOLERANCE.as_millis() as u64;
 	match (a.modified, b.modified) {
-		(Some(x), Some(y)) if (x - y).abs() <= tol => {
+		(Some(x), Some(y)) if x.abs_diff(y) <= tol => {
 			if a.size == b.size {
 				Diff::Same
 			} else {
@@ -182,33 +212,41 @@ fn file_diff(a: &Meta, b: &Meta) -> Diff {
 	}
 }
 
-/// Directory listing without following symlinks. A missing directory is an empty one.
-fn list(dir: &Path, budget: &mut usize) -> io::Result<BTreeMap<std::ffi::OsString, Meta>> {
+/// Directory listing without following symlinks. A missing directory is an empty one. The flag
+/// says the budget ran out while entries were left. Metadata comes from a fresh `lstat` per entry
+/// (directory-listing data can be stale on Windows); an entry that cannot be read is listed as
+/// `Other`, so it is skipped instead of looking absent (which `--mirror` would trash on the other side).
+fn list(dir: &Path, budget: &mut usize) -> io::Result<(BTreeMap<std::ffi::OsString, Meta>, bool)> {
 	let mut out = BTreeMap::new();
 	let rd = match fs::read_dir(dir) {
 		Ok(rd) => rd,
-		Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
+		Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((out, false)),
 		Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", sanitize(dir.as_os_str())))),
 	};
 	for entry in rd {
+		let entry = entry?;
 		if *budget == 0 {
-			break;
+			return Ok((out, true));
 		}
 		*budget -= 1;
-		let entry = entry?;
-		let Ok(m) = entry.metadata() else { continue };
-		let ft = m.file_type();
-		let kind = if ft.is_dir() {
-			Kind::Dir
-		} else if ft.is_file() {
-			Kind::File
-		} else {
-			Kind::Other
+		let meta = match fs::symlink_metadata(entry.path()) {
+			Ok(m) => {
+				let ft = m.file_type();
+				let kind = if ft.is_dir() {
+					Kind::Dir
+				} else if ft.is_file() {
+					Kind::File
+				} else {
+					Kind::Other
+				};
+				let modified = m.modified().ok().and_then(millis);
+				Meta { kind, size: if kind == Kind::File { m.len() } else { 0 }, modified }
+			}
+			Err(_) => Meta { kind: Kind::Other, size: 0, modified: None },
 		};
-		let modified = m.modified().ok().and_then(millis);
-		out.insert(entry.file_name(), Meta { kind, size: if kind == Kind::File { m.len() } else { 0 }, modified });
+		out.insert(entry.file_name(), meta);
 	}
-	Ok(out)
+	Ok((out, false))
 }
 
 /// What a sync does with one difference. The single source of truth for both the plan and any
@@ -263,6 +301,7 @@ pub fn action(item: &Item, opts: SyncOptions) -> Action {
 		(RightNewer, LeftToRight) => Skip("the right one is newer; would replace a newer file"),
 		(Conflict, _) => Skip("same time, different size; decide by hand"),
 		(TypeMismatch, _) => Skip("file on one side, folder or link on the other"),
+		(CaseMismatch, _) => Skip("same name in a different letter case; rename one by hand"),
 		(Same, _) => Skip("identical"),
 	}
 }
@@ -270,7 +309,16 @@ pub fn action(item: &Item, opts: SyncOptions) -> Action {
 /// Turn a comparison into a plan. Never overwrites: a newer file replaces an older one by trashing
 /// the old one first. Conflicts, type mismatches, symlinks and changes against the chosen direction
 /// are skipped and reported.
+///
+/// An incomplete comparison (`truncated`) gives an empty plan: entries that were not listed would
+/// look missing, and syncing on that basis could copy or trash the wrong things.
 pub fn sync_plan(left: &Path, right: &Path, cmp: &Comparison, opts: SyncOptions) -> SyncPlan {
+	if cmp.truncated {
+		return SyncPlan {
+			plan: Plan::new(vec![], "Sync not planned: the comparison is incomplete (too many entries)"),
+			skipped: vec![Skipped { rel: PathBuf::new(), why: "comparison incomplete; nothing planned".into() }],
+		};
+	}
 	let mut ops = Vec::new();
 	let mut skipped = Vec::new();
 	let (mut copies, mut replaced, mut trashed) = (0usize, 0usize, 0usize);
@@ -327,5 +375,5 @@ pub fn sync_plan(left: &Path, right: &Path, cmp: &Comparison, opts: SyncOptions)
 
 /// For callers that need a timestamp in the same form as [`Meta::modified`].
 pub fn millis(t: SystemTime) -> Option<i64> {
-	t.duration_since(UNIX_EPOCH).ok().map(|d| d.as_millis() as i64)
+	t.duration_since(UNIX_EPOCH).ok().and_then(|d| i64::try_from(d.as_millis()).ok())
 }

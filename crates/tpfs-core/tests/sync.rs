@@ -167,3 +167,16 @@ fn replacing_files_is_medium_risk() {
 	assert_eq!(risk.level, Level::Medium);
 	assert!(risk.reasons.iter().any(|r| r.contains("replaces 1 existing file")), "{:?}", risk.reasons);
 }
+
+#[test]
+fn an_incomplete_comparison_plans_nothing() {
+	use tpfs_core::sync::{Comparison, Direction, SyncOptions, sync_plan};
+	let e = Env::new();
+	e.file(&e.right.join("only-right.txt"), "r", 100);
+	let mut cmp = compare(&e.left, &e.right, true).unwrap();
+	assert!(!cmp.items.is_empty());
+	cmp.truncated = true;
+	let sp = sync_plan(&e.left, &e.right, &cmp, SyncOptions { direction: Direction::LeftToRight, mirror: true });
+	assert!(sp.plan.ops.is_empty(), "{:?}", sp.plan.ops);
+	let _ = Comparison::default();
+}
