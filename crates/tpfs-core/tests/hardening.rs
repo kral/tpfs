@@ -729,3 +729,39 @@ fn a_state_folder_under_a_world_writable_folder_is_refused() {
 	fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
 	tpfs_core::private_dir(&shared.join("tpfs")).unwrap();
 }
+
+/// A move to another file system of a tree with a read-only folder empties the source (the
+/// read-only folder is opened for writing only to remove what was copied), and undo brings the
+/// folder back read-only.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cross_device_move_of_a_read_only_folder_completes_and_undoes() {
+	use std::os::unix::fs::{MetadataExt, PermissionsExt};
+	let shm = Path::new("/dev/shm");
+	let s = Sandbox::new();
+	if !shm.is_dir() || fs::metadata(shm).unwrap().dev() == fs::metadata(&s.root).unwrap().dev() {
+		assert!(std::env::var_os("CI").is_none(), "CI needs /dev/shm on its own file system");
+		eprintln!("skipped: no second file system available");
+		return;
+	}
+	let other = TempDir::new_in(shm).unwrap();
+	let other_root = tpfs_core::canonicalize(other.path()).unwrap();
+	let src = s.root.join("src");
+	fs::create_dir_all(src.join("ro")).unwrap();
+	fs::write(src.join("ro").join("f"), "F").unwrap();
+	fs::set_permissions(src.join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
+	let dst = other_root.join("dst");
+	let v = Validator::new([&s.root, &other_root]).unwrap();
+	let mut j = s.journal();
+	Executor::new(&v, &mut j, s.state.join("trash"))
+		.execute(&Plan::new(vec![Op::Move { from: src.clone(), to: dst.clone() }], ""), Source::Human)
+		.unwrap();
+	assert!(!src.exists());
+	assert_eq!(fs::read_to_string(dst.join("ro").join("f")).unwrap(), "F");
+	assert_eq!(fs::metadata(dst.join("ro")).unwrap().permissions().mode() & 0o777, 0o555);
+	Executor::new(&v, &mut j, s.state.join("trash")).undo_last().unwrap().unwrap();
+	assert!(!dst.exists());
+	assert_eq!(fs::read_to_string(src.join("ro").join("f")).unwrap(), "F");
+	assert_eq!(fs::metadata(src.join("ro")).unwrap().permissions().mode() & 0o777, 0o555);
+	fs::set_permissions(src.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
+}

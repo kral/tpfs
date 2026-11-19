@@ -81,9 +81,9 @@ fn run_external(external: External) -> Result<String, String> {
 			let editor = editor().ok_or(
 				"no editor found: set the EDITOR environment variable to the editor you use (e.g. nano, vim, code --wait)",
 			)?;
-			let mut parts = editor.split_whitespace();
-			let program = parts.next().unwrap_or_default();
-			let status = Command::new(program).args(parts).arg(&path).status().map_err(|e| {
+			let (program, args) = split_command(&editor);
+			let program = program.as_str();
+			let status = Command::new(program).args(&args).arg(&path).status().map_err(|e| {
 				if e.kind() == io::ErrorKind::NotFound {
 					format!("editor `{program}` not found: set EDITOR to the editor you use")
 				} else {
@@ -100,12 +100,18 @@ fn run_external(external: External) -> Result<String, String> {
 				None if cfg!(windows) => (std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()), "/C"),
 				None => ("sh".into(), "-c"),
 			};
-			let status = Command::new(&shell)
-				.arg(flag)
-				.arg(&command)
-				.current_dir(&cwd)
-				.status()
-				.map_err(|e| format!("{shell}: {e}"))?;
+			let mut run = Command::new(&shell);
+			run.arg(flag).current_dir(&cwd);
+			// cmd.exe does not read the quoting Rust applies to arguments: hand it the line as typed.
+			#[cfg(windows)]
+			if flag == "/C" {
+				std::os::windows::process::CommandExt::raw_arg(&mut run, &command);
+			} else {
+				run.arg(&command);
+			}
+			#[cfg(not(windows))]
+			run.arg(&command);
+			let status = run.status().map_err(|e| format!("{shell}: {e}"))?;
 			print!("\n[{status}] Press Enter to return to tpfs… ");
 			io::stdout().flush().ok();
 			io::stdin().lock().read_line(&mut String::new()).ok();
@@ -116,13 +122,74 @@ fn run_external(external: External) -> Result<String, String> {
 
 /// The editor for F4: $VISUAL or $EDITOR, else the first common one on PATH (Notepad on Windows).
 fn editor() -> Option<String> {
-	if let Some(e) = ["VISUAL", "EDITOR"].iter().find_map(|v| std::env::var(v).ok().filter(|e| !e.trim().is_empty())) {
+	editor_from(std::env::var("VISUAL").ok(), std::env::var("EDITOR").ok(), std::env::var_os("PATH"), cfg!(windows))
+}
+
+fn editor_from(
+	visual: Option<String>,
+	editor: Option<String>,
+	path: Option<std::ffi::OsString>,
+	windows: bool,
+) -> Option<String> {
+	if let Some(e) = [visual, editor].into_iter().flatten().find(|e| !e.trim().is_empty()) {
 		return Some(e);
 	}
-	let candidates: &[&str] = if cfg!(windows) { &["notepad"] } else { &["nano", "vim", "vi"] };
-	if cfg!(windows) {
-		return candidates.first().map(|c| (*c).to_owned());
+	if windows {
+		return Some("notepad".into());
 	}
-	let path = std::env::var_os("PATH")?;
-	candidates.iter().find(|c| std::env::split_paths(&path).any(|d| d.join(c).is_file())).map(|c| (*c).to_owned())
+	let path = path?;
+	["nano", "vim", "vi"]
+		.iter()
+		.find(|c| std::env::split_paths(&path).any(|d| d.join(c).is_file()))
+		.map(|c| (*c).to_owned())
+}
+
+/// A command line as a program and its arguments: a quoted program (`"C:\Program Files\…\x.exe"
+/// -n`), a whole value that is an existing file (a path with spaces), or words.
+fn split_command(line: &str) -> (String, Vec<String>) {
+	let line = line.trim();
+	if let Some(rest) = line.strip_prefix('"')
+		&& let Some((program, args)) = rest.split_once('"')
+	{
+		return (program.to_owned(), args.split_whitespace().map(str::to_owned).collect());
+	}
+	if std::path::Path::new(line).is_file() {
+		return (line.to_owned(), Vec::new());
+	}
+	let mut words = line.split_whitespace().map(str::to_owned);
+	(words.next().unwrap_or_default(), words.collect())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn the_editor_is_chosen_from_the_environment_then_path() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let path = || Some(tmp.path().as_os_str().to_owned());
+		let s = |v: &str| Some(v.to_owned());
+		assert_eq!(editor_from(s("code --wait"), s("vim"), path(), false).as_deref(), Some("code --wait"));
+		assert_eq!(editor_from(s("  "), s("vim"), path(), false).as_deref(), Some("vim"));
+		assert_eq!(editor_from(None, s(""), path(), false), None, "nothing on PATH");
+		std::fs::write(tmp.path().join("vi"), "").unwrap();
+		assert_eq!(editor_from(None, None, path(), false).as_deref(), Some("vi"));
+		std::fs::write(tmp.path().join("nano"), "").unwrap();
+		assert_eq!(editor_from(None, None, path(), false).as_deref(), Some("nano"));
+		assert_eq!(editor_from(None, None, None, true).as_deref(), Some("notepad"));
+	}
+
+	#[test]
+	fn editor_commands_keep_paths_with_spaces() {
+		let w = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+		assert_eq!(split_command("code --wait"), ("code".into(), w(&["--wait"])));
+		assert_eq!(
+			split_command(r#""C:\Program Files\Notepad++\notepad++.exe" -multiInst"#),
+			(r"C:\Program Files\Notepad++\notepad++.exe".into(), w(&["-multiInst"]))
+		);
+		let tmp = tempfile::TempDir::new().unwrap();
+		let spaced = tmp.path().join("my editor");
+		std::fs::write(&spaced, "").unwrap();
+		assert_eq!(split_command(spaced.to_str().unwrap()), (spaced.to_str().unwrap().into(), vec![]));
+	}
 }

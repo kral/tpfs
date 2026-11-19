@@ -568,6 +568,7 @@ type Left = (Vec<PathBuf>, Vec<(PathBuf, io::Error)>);
 fn remove_copied(fs: &Fs, from: &Path, copied: &[Copied]) -> io::Result<Left> {
 	let mut left = Vec::new();
 	let mut stuck = Vec::new();
+	let mut opened: Vec<(PathBuf, fs::Permissions)> = Vec::new();
 	for c in copied.iter().rev() {
 		let path = if c.rel.as_os_str().is_empty() { from.to_path_buf() } else { from.join(&c.rel) };
 		let meta = match std::fs::symlink_metadata(&path) {
@@ -579,11 +580,29 @@ fn remove_copied(fs: &Fs, from: &Path, copied: &[Copied]) -> io::Result<Left> {
 			left.push(path);
 			continue;
 		}
-		match if c.dir { fs.rmdir(&path) } else { fs.remove_file(&path) } {
+		let remove = |p: &Path| if c.dir { fs.rmdir(p) } else { fs.remove_file(p) };
+		let mut result = remove(&path);
+		// A read-only folder of the copied tree (it is in the copy with its mode): opened for
+		// writing so its entries can go, and put back as it was if it is not removed itself.
+		if let Err(e) = &result
+			&& e.kind() == io::ErrorKind::PermissionDenied
+			&& let Some(parent) = path.parent().filter(|p| p.starts_with(from) && !opened.iter().any(|(o, _)| o == p))
+			&& let Ok(perms) = std::fs::symlink_metadata(parent).map(|m| m.permissions())
+			&& make_dir_writable(fs, parent).is_ok()
+		{
+			opened.push((parent.to_path_buf(), perms));
+			result = remove(&path);
+		}
+		match result {
 			Ok(()) => {}
 			// A folder that still holds entries — ones we left, or new ones — changed meanwhile.
 			Err(e) if c.dir && (e.kind() == io::ErrorKind::DirectoryNotEmpty || !left.is_empty()) => left.push(path),
 			Err(e) => stuck.push((path, e)),
+		}
+	}
+	for (dir, perms) in opened {
+		if crate::path::exists(&dir) {
+			let _ = fs.set_dir_mode(&dir, perms);
 		}
 	}
 	Ok((left, stuck))
@@ -1804,8 +1823,9 @@ mod windows {
 			return None;
 		}
 		// 128-bit id first (ReFS does not guarantee unique 64-bit indexes).
-		// SAFETY: an all-zero FILE_ID_INFO is a valid value; the buffer has the size passed.
+		// SAFETY: an all-zero FILE_ID_INFO is a valid value of this plain C struct.
 		let mut id: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+		// SAFETY: `h` is an open handle; `id` is a valid out-buffer of exactly the size passed.
 		let ok = unsafe {
 			GetFileInformationByHandleEx(h, FileIdInfo, (&raw mut id).cast(), size_of::<FILE_ID_INFO>() as u32)
 		};

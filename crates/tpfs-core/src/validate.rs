@@ -565,7 +565,7 @@ struct Sim {
 	created_dirs: HashSet<PathBuf>,
 	reserved: HashMap<u64, u64>,
 	/// Tree sizes already measured in this plan.
-	sizes: HashMap<PathBuf, u64>,
+	sizes: HashMap<(PathBuf, PathBuf), u64>,
 	/// Entries left to measure for the whole plan: past it, sizes are not checked (the executor
 	/// still stops cleanly when a disk fills up).
 	size_budget: Option<usize>,
@@ -623,7 +623,9 @@ impl Sim {
 
 	/// Refuse a copy that would not fit, counting everything the plan already writes to that file system.
 	fn reserve_space(&mut self, from: &Path, target_dir: &Path) -> Result<(), String> {
-		let needed = match self.sizes.get(from) {
+		// Keyed by target too: the depth check depends on where the copy goes.
+		let key = (from.to_path_buf(), target_dir.to_path_buf());
+		let needed = match self.sizes.get(&key) {
 			Some(&n) => n,
 			None => {
 				let budget = self.size_budget.get_or_insert(1_000_000);
@@ -640,7 +642,7 @@ impl Sim {
 					format!("Too deep to copy (more than {MAX_DEPTH} folders or {MAX_PATH} bytes): {}", show(&p))
 				})?;
 				let Some(n) = size else { return Ok(()) };
-				self.sizes.insert(from.to_path_buf(), n);
+				self.sizes.insert(key, n);
 				n
 			}
 		};

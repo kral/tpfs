@@ -2083,4 +2083,21 @@ fn a_copy_too_deep_for_its_target_is_refused() {
 	// A shallow target takes the same tree.
 	let plan = Plan::new(vec![Op::Copy { from: s.root.join("src"), to: s.root.join("copy") }], "");
 	assert!(messages(&s.validator(), &plan).is_empty(), "{:?}", messages(&s.validator(), &plan));
+	// …and copying it there first does not let a second copy to the deep target through.
+	let plan = Plan::new(
+		vec![
+			Op::Copy { from: s.root.join("src"), to: s.root.join("copy") },
+			Op::Copy { from: s.root.join("src"), to: target.join("copy") },
+		],
+		"",
+	);
+	let m = messages(&s.validator(), &plan);
+	assert!(m.iter().any(|m| m.starts_with("#2") && m.contains("Too deep to copy")), "{m:?}");
+}
+
+/// Errors name a batch only in printable form, whatever the journal holds.
+#[test]
+fn undo_errors_print_batch_ids_safely() {
+	let e = ExecError::Undo { batch: "evil\u{1b}]52;c;x\u{7}".into(), error: "x".into() };
+	assert!(!e.to_string().chars().any(char::is_control), "{e}");
 }

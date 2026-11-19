@@ -62,7 +62,9 @@ impl fmt::Display for ExecError {
 				step + 1,
 				rollback_errors.join("; ")
 			),
-			ExecError::Undo { batch, error } => write!(f, "cannot undo batch {batch}: {error}"),
+			ExecError::Undo { batch, error } => {
+				write!(f, "cannot undo batch {}: {error}", crate::sanitize(batch.as_ref()))
+			}
 			ExecError::Blocked(why) => f.write_str(why),
 			ExecError::Journal(e) => write!(f, "journal error: {e}"),
 		}
@@ -1325,6 +1327,47 @@ mod tests {
 		assert_eq!(done.id, id);
 		assert!(!dst.exists());
 		assert_eq!(fs::read_to_string(slot.join("b")).unwrap(), "B");
+	}
+
+	/// A resumed undo of a copy (its trash copy published) whose half-removed rest the user
+	/// changed meanwhile stops and keeps both: the rest is trashed only if all of it is in the copy.
+	#[test]
+	fn a_resumed_undo_of_a_copy_keeps_what_the_user_changed() {
+		for edit in ["changed", "added"] {
+			let tmp = tempfile::TempDir::new().unwrap();
+			let base = crate::path::canonicalize(tmp.path()).unwrap();
+			let root = base.join("root");
+			fs::create_dir_all(root.join("src")).unwrap();
+			fs::write(root.join("src").join("a"), "A").unwrap();
+			fs::write(root.join("src").join("b"), "B").unwrap();
+			let v = Validator::new([&root]).unwrap();
+			let trash = base.join("state").join("trash");
+			let mut j = Journal::open(base.join("state").join("journal.jsonl")).unwrap();
+			let dst = root.join("dst");
+			let id = Executor::new(&v, &mut j, &trash)
+				.execute(&Plan::new(vec![Op::Copy { from: root.join("src"), to: dst.clone() }], ""), Source::Human)
+				.unwrap()
+				.id;
+			let slot = trash_slot(&trash, &format!("{id}-undo"), 0, &dst);
+			fs::create_dir_all(&slot).unwrap();
+			fs::write(slot.join("a"), "A").unwrap();
+			fs::write(slot.join("b"), "B").unwrap();
+			fs::remove_file(dst.join("b")).unwrap();
+			j.append(&Entry::UndoPublished { batch: id.clone(), index: 0 }).unwrap();
+			if edit == "changed" {
+				fs::write(dst.join("a"), "edited after the interruption").unwrap();
+			} else {
+				fs::write(dst.join("new"), "N").unwrap();
+			}
+			assert!(Executor::new(&v, &mut j, &trash).undo_last().is_err(), "{edit}");
+			assert!(dst.exists(), "{edit}");
+			if edit == "changed" {
+				assert_eq!(fs::read_to_string(dst.join("a")).unwrap(), "edited after the interruption");
+			} else {
+				assert_eq!(fs::read_to_string(dst.join("new")).unwrap(), "N");
+			}
+			assert_eq!(fs::read_to_string(slot.join("b")).unwrap(), "B");
+		}
 	}
 
 	/// An undo of a copy cut short before its trash copy was published still notices a change

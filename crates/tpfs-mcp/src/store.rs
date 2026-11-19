@@ -87,7 +87,10 @@ impl Store {
 			Ok(entries) => entries,
 			Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((plans, damaged)),
 			Err(e) => {
-				return Err(io::Error::new(e.kind(), format!("cannot read {}: {e}", self.dir.display())));
+				return Err(io::Error::new(
+					e.kind(),
+					format!("cannot read {}: {e}", tpfs_core::sanitize(self.dir.as_os_str())),
+				));
 			}
 		};
 		for e in entries.filter_map(Result::ok) {
@@ -95,13 +98,14 @@ impl Store {
 			if path.extension().is_none_or(|x| x != "json") {
 				continue;
 			}
+			let Some(id) = path.file_stem().and_then(|s| s.to_str()).filter(|id| check_id(id).is_ok()) else {
+				continue; // not a name `tpfs pending` could show or `tpfs reject` take
+			};
+			// Listed under its file name: a plan whose own id differs is damaged (`tpfs reject` takes
+			// the file name).
 			match fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Pending>(&b).ok()) {
-				Some(p) => plans.push(p),
-				None => {
-					if let Some(id) = path.file_stem().and_then(|s| s.to_str()).filter(|id| check_id(id).is_ok()) {
-						damaged.push(id.to_owned());
-					}
-				}
+				Some(p) if p.id == id => plans.push(p),
+				_ => damaged.push(id.to_owned()),
 			}
 		}
 		plans.sort_by_key(|p| p.created);
@@ -171,4 +175,69 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 	let mut f = options.open(path)?;
 	f.write_all(bytes)?;
 	f.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn plan() -> Plan {
+		Plan::new(vec![tpfs_core::Op::Mkdir { path: "/x/y".into() }], "")
+	}
+
+	/// One read: valid plans oldest first; a damaged file, and a plan whose own id is not its file
+	/// name, listed as damaged (so `tpfs reject` can take them); other names ignored.
+	#[test]
+	fn scan_lists_plans_and_damaged_files_by_name() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let store = Store::new(tmp.path());
+		let a = store.put(&plan(), &[]).unwrap();
+		std::thread::sleep(std::time::Duration::from_millis(2));
+		let b = store.put(&plan(), &[]).unwrap();
+		let dir = tmp.path().join("pending");
+		fs::write(dir.join("0123abcd.json"), "not json").unwrap();
+		let mut moved = a.clone();
+		moved.id = "fedcba98".into();
+		fs::write(dir.join("deadbeef.json"), serde_json::to_vec(&moved).unwrap()).unwrap();
+		fs::write(dir.join("zz.json"), "{}").unwrap();
+		fs::write(dir.join(format!("{}.approved", a.id)), "x").unwrap();
+		let (plans, damaged) = store.scan().unwrap();
+		assert_eq!(plans.iter().map(|p| p.id.as_str()).collect::<Vec<_>>().len(), 2);
+		assert!(plans.iter().any(|p| p.id == a.id) && plans.iter().any(|p| p.id == b.id));
+		assert!(plans.windows(2).all(|w| w[0].created <= w[1].created));
+		assert_eq!(damaged, ["0123abcd", "deadbeef"]);
+	}
+
+	/// Files `tpfs pending` cannot show do not use up the limit of waiting plans.
+	#[test]
+	fn only_listed_plans_count_toward_the_limit() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let store = Store::new(tmp.path());
+		store.put(&plan(), &[]).unwrap();
+		let dir = tmp.path().join("pending");
+		for i in 0..MAX_PENDING {
+			fs::write(dir.join(format!("junk-{i}.json")), "{}").unwrap();
+		}
+		store.put(&plan(), &[]).unwrap();
+	}
+
+	/// An unreadable pending folder is an error naming it, not "no plans".
+	#[cfg(unix)]
+	#[test]
+	fn an_unreadable_pending_folder_is_reported() {
+		use std::os::unix::fs::PermissionsExt;
+		let tmp = tempfile::TempDir::new().unwrap();
+		let store = Store::new(tmp.path());
+		store.put(&plan(), &[]).unwrap();
+		let dir = tmp.path().join("pending");
+		fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+		if fs::read_dir(&dir).is_ok() {
+			fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+			eprintln!("skipped: running as root, which reads any folder");
+			return;
+		}
+		let err = store.scan().unwrap_err();
+		fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+		assert!(err.to_string().contains("pending"), "{err}");
+	}
 }
