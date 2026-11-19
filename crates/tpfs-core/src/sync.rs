@@ -113,7 +113,14 @@ pub struct SyncPlan {
 
 /// Compare `left` and `right`. With `recursive`, folders present on both sides are compared
 /// entry by entry; a folder present on one side only is one item (copying it copies everything).
+/// The two folders must be separate: if one contains the other, a sync would copy into itself.
 pub fn compare(left: &Path, right: &Path, recursive: bool) -> io::Result<Comparison> {
+	if left.starts_with(right) || right.starts_with(left) {
+		return Err(io::Error::new(
+			io::ErrorKind::InvalidInput,
+			"the two folders must be separate (one is inside the other)",
+		));
+	}
 	let mut out = Comparison::default();
 	let mut budget = MAX_ENTRIES;
 	walk(left, right, Path::new(""), recursive, &mut out, &mut budget)?;

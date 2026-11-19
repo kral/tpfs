@@ -270,3 +270,14 @@ fn listing_reports_truncation() {
 	assert_eq!(v["truncated"], true);
 	assert_eq!(v["entries"].as_array().unwrap().len(), 2);
 }
+
+#[test]
+fn an_agent_cannot_raise_the_operation_limit() {
+	let mut f = Fixture::new(Approval::Terminal);
+	let ops: Vec<Value> =
+		(0..=tpfs_core::MAX_OPS).map(|i| json!({ "op": "mkdir", "path": f.root.join(format!("d{i}")) })).collect();
+	let (v, err) = f.tool("propose_plan", json!({ "plan": { "ops": ops } }));
+	assert!(!err && v["valid"] == false, "{}", &v.to_string()[..200.min(v.to_string().len())]);
+	assert!(v["issues"][0].as_str().unwrap().contains("Too many"));
+	assert!(f.server.store().list().unwrap().is_empty(), "an invalid plan is not stored");
+}

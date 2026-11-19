@@ -26,11 +26,12 @@ impl Env {
 		Self { _tmp: tmp, base, left, right }
 	}
 
-	/// A file with content and a modification time `age` seconds ago.
+	/// A file with content and a modification time `age` seconds before a fixed moment (absolute
+	/// times: nothing depends on how long the test takes).
 	fn file(&self, path: &Path, content: &str, age: u64) {
 		fs::create_dir_all(path.parent().unwrap()).unwrap();
 		fs::write(path, content).unwrap();
-		let t = SystemTime::now() - Duration::from_secs(age);
+		let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 - age);
 		File::options().write(true).open(path).unwrap().set_modified(t).unwrap();
 	}
 
@@ -179,4 +180,49 @@ fn an_incomplete_comparison_plans_nothing() {
 	let sp = sync_plan(&e.left, &e.right, &cmp, SyncOptions { direction: Direction::LeftToRight, mirror: true });
 	assert!(sp.plan.ops.is_empty(), "{:?}", sp.plan.ops);
 	let _ = Comparison::default();
+}
+
+#[test]
+fn nested_folders_are_refused() {
+	let e = Env::new();
+	let inner = e.left.join("inner");
+	fs::create_dir(&inner).unwrap();
+	assert!(compare(&e.left, &inner, true).is_err());
+	assert!(compare(&inner, &e.left, true).is_err());
+}
+
+#[test]
+fn two_way_sync_skips_conflicts_and_undoes_completely() {
+	let e = Env::new();
+	e.file(&e.left.join("new-left.txt"), "L", 100);
+	e.file(&e.right.join("new-right.txt"), "R", 100);
+	e.file(&e.left.join("shared.txt"), "newer", 10);
+	e.file(&e.right.join("shared.txt"), "older", 1000);
+	e.file(&e.left.join("clash.txt"), "aaaa", 100);
+	e.file(&e.right.join("clash.txt"), "b", 100);
+	fs::create_dir_all(e.left.join("kind")).unwrap();
+	e.file(&e.right.join("kind"), "file", 100);
+	let snap = |p: &Path| {
+		let mut v: Vec<String> = fs::read_dir(p)
+			.unwrap()
+			.map(|x| {
+				let x = x.unwrap().path();
+				format!("{}={}", x.file_name().unwrap().to_string_lossy(), fs::read_to_string(&x).unwrap_or_default())
+			})
+			.collect();
+		v.sort();
+		v
+	};
+	let (l0, r0) = (snap(&e.left), snap(&e.right));
+
+	let cmp = compare(&e.left, &e.right, true).unwrap();
+	let sp = sync_plan(&e.left, &e.right, &cmp, SyncOptions { direction: Direction::Both, mirror: false });
+	let skipped: Vec<String> = sp.skipped.iter().map(|s| s.rel.to_string_lossy().into_owned()).collect();
+	assert!(skipped.contains(&"clash.txt".to_owned()) && skipped.contains(&"kind".to_owned()), "{skipped:?}");
+	e.run(SyncOptions { direction: Direction::Both, mirror: false });
+	assert_eq!(fs::read_to_string(e.right.join("shared.txt")).unwrap(), "newer");
+	assert!(e.left.join("new-right.txt").exists() && e.right.join("new-left.txt").exists());
+
+	e.undo();
+	assert_eq!((snap(&e.left), snap(&e.right)), (l0, r0), "undo restores both sides, including the replaced file");
 }

@@ -202,6 +202,8 @@ fn trash_stays_on_the_same_file_system() {
 	let shm = Path::new("/dev/shm");
 	let state_tmp = TempDir::new().unwrap();
 	if !shm.is_dir() || fs::metadata(shm).unwrap().dev() == fs::metadata(state_tmp.path()).unwrap().dev() {
+		// Only a developer machine may lack it; CI must exercise this path.
+		assert!(std::env::var_os("CI").is_none(), "CI needs /dev/shm on its own file system");
 		eprintln!("skipped: no second file system available");
 		return;
 	}
@@ -224,6 +226,45 @@ fn trash_stays_on_the_same_file_system() {
 
 	Executor::new(&Validator::new(tpfs_core::system_roots()).unwrap(), &mut j, &trash).undo_last().unwrap().unwrap();
 	assert_eq!(fs::read_to_string(&file).unwrap(), "N");
+	// Leave the shared /dev/shm as we found it.
+	let _ = fs::remove_dir(&local);
+}
+
+/// A trash folder someone else prepared on that file system is never used.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_planted_local_trash_is_not_used() {
+	use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+	let shm = Path::new("/dev/shm");
+	let state_tmp = TempDir::new().unwrap();
+	if !shm.is_dir() || fs::metadata(shm).unwrap().dev() == fs::metadata(state_tmp.path()).unwrap().dev() {
+		assert!(std::env::var_os("CI").is_none(), "CI needs /dev/shm on its own file system");
+		return;
+	}
+	// A private mount point of our own: a folder on tmpfs with its own planted trash names.
+	let s = Sandbox::new_in(Some(shm));
+	let uid = fs::metadata(&s.root).unwrap().uid();
+	let planted = shm.join(format!(".tpfs-trash-{uid}"));
+	let existed = planted.exists();
+	if !existed {
+		// Readable by others: must be refused (and so must a symlink or a foreign owner).
+		fs::create_dir(&planted).unwrap();
+		fs::set_permissions(&planted, fs::Permissions::from_mode(0o755)).unwrap();
+	}
+	let file = s.root.join("n.txt");
+	fs::write(&file, "N").unwrap();
+	let trash = state_tmp.path().join("trash");
+	let v = s.validator();
+	let mut j = Journal::open(state_tmp.path().join("journal.jsonl")).unwrap();
+	let batch = Executor::new(&v, &mut j, &trash)
+		.execute(&Plan::new(vec![Op::Trash { path: file.clone() }], ""), Source::Human)
+		.unwrap();
+	if !existed {
+		assert!(!planted.join(&batch.id).exists(), "used a trash readable by others");
+		assert!(trash.join(&batch.id).exists());
+		fs::remove_dir(&planted).unwrap();
+	}
 }
 
 #[cfg(unix)]
