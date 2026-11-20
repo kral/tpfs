@@ -7,6 +7,9 @@ through a write-ahead journal, so you can undo the whole batch later, and a batc
 crash is rolled back on request. You can use it from the command line, from a two-panel file manager
 in the terminal, or let an AI agent propose plans over MCP while you keep the final say.
 
+
+![An agent's rm -rf is refused by tpfs guard; a plan is previewed, applied and undone](docs/assets/tpfs-demo.gif)
+
 ## Guarantees
 
 - **No overwrite.** A move, copy or rename never replaces an existing file. To replace a file, a
