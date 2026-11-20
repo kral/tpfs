@@ -411,9 +411,10 @@ fn inside(path: &Path, root: &Path, strict: bool) -> bool {
 	}
 }
 
-/// One folder name, as the volumes of this system compare it: Windows ignores letter case; macOS
-/// treats composed and decomposed accents as one name, but a volume may be case-sensitive, so
-/// case still counts there; elsewhere names are compared byte for byte.
+/// One folder name, as the usual volumes of this system compare it: Windows ignores letter case;
+/// macOS ignores it too (the default) and treats composed and decomposed accents as one name;
+/// elsewhere names are compared byte for byte. This is a check before the plan's own validation,
+/// which confines every step to the roots exactly, so it may be lenient.
 fn same(a: Component<'_>, b: Component<'_>) -> bool {
 	if a == b {
 		return true;
@@ -422,7 +423,7 @@ fn same(a: Component<'_>, b: Component<'_>) -> bool {
 	if cfg!(windows) {
 		x.to_lowercase() == y.to_lowercase()
 	} else if cfg!(target_vendor = "apple") {
-		tpfs_core::nfd(&x) == tpfs_core::nfd(&y)
+		tpfs_core::nfd(&x.to_lowercase()) == tpfs_core::nfd(&y.to_lowercase())
 	} else {
 		false
 	}

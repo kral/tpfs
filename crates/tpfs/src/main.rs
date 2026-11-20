@@ -59,7 +59,8 @@ USAGE:
   tpfs recipe show <id>                         show a proposed or installed recipe
   tpfs recipe run <recipe> <entry>... [--set <field>=<value>]...
                                                   expand an installed recipe over the entries, show
-                                                  the plan, confirm and execute it (or --approve <digest>)
+                                                  the plan, confirm and execute it (or --approve <digest>;
+                                                  a recipe's first 3 runs need a typed yes in a terminal)
   tpfs recipe remove <recipe>                   uninstall a recipe
   tpfs guard                                    hook for AI agents (Claude Code, Cursor): refuses shell
                                                   commands that move, rename or delete files and points
@@ -981,9 +982,9 @@ fn watch(args: &Args) -> Res {
 			let roots = match recipe_cli::resolve(args, &p) {
 				Ok(r) => r,
 				Err(Fail(_, e)) => {
-					eprintln!("It cannot be installed as proposed: {e}");
-					println!(
-						"`tpfs recipe install {id} --root <dir>` installs it for chosen folders; `tpfs recipe reject {id}` drops it."
+					eprintln!("tpfs watch: it cannot be installed as proposed: {e}");
+					eprintln!(
+						"tpfs watch: `tpfs recipe install {id} --root <dir>` installs it for chosen folders; `tpfs recipe reject {id}` drops it."
 					);
 					continue;
 				}
@@ -992,7 +993,7 @@ fn watch(args: &Args) -> Res {
 			match answer.as_str() {
 				"yes" => {
 					if let Err(Fail(_, e)) = recipe_cli::finish(args, &p, &roots) {
-						eprintln!("Not installed: {e}");
+						eprintln!("tpfs watch: not installed: {e}");
 					}
 				}
 				"no" | "reject" => {

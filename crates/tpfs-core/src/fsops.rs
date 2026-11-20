@@ -380,7 +380,7 @@ impl Fs {
 			if let Some((src, dst)) = confined::open_copy_pair(&self.anchors, from, to, &meta)? {
 				check_regular(&src, from)?;
 				copy_stream(src, dst, from, &meta)?;
-				copied.push(Copied::of(rel, &meta));
+				copied.push(Copied::of(rel, &meta, from));
 				return Ok(());
 			}
 			let src = open_regular(from)?;
@@ -388,7 +388,7 @@ impl Fs {
 			copy_stream(src, dst, from, &meta)?;
 		} else if ft.is_dir() {
 			self.mkdir(to)?;
-			copied.push(Copied::of(rel, &meta));
+			copied.push(Copied::of(rel, &meta, from));
 			// tpfs's own work entries (a volume's trash, partial copies) are never copied along.
 			for name in self.list(from)?.into_iter().filter(|n| !crate::validate::is_own_name(n)) {
 				// Never into another disk mounted below (like `cp -x`, but refusing: a move would
@@ -411,7 +411,7 @@ impl Fs {
 		} else {
 			return Err(io::Error::new(io::ErrorKind::Unsupported, format!("special file: {}", from.display())));
 		}
-		copied.push(Copied::of(rel, &meta));
+		copied.push(Copied::of(rel, &meta, from));
 		Ok(())
 	}
 
@@ -558,31 +558,41 @@ pub(crate) struct Copied {
 }
 
 impl Copied {
-	fn of(rel: &Path, meta: &fs::Metadata) -> Self {
+	fn of(rel: &Path, meta: &fs::Metadata, path: &Path) -> Self {
 		Self {
 			rel: rel.to_path_buf(),
 			dir: meta.is_dir(),
 			len: meta.len(),
 			modified: meta.modified().ok(),
-			change: change_of(meta),
+			change: change_of(meta, path),
 		}
 	}
 
-	fn unchanged(&self, meta: &fs::Metadata) -> bool {
+	fn unchanged(&self, meta: &fs::Metadata, path: &Path) -> bool {
 		meta.is_dir() == self.dir
 			&& (self.dir
-				|| (meta.len() == self.len && meta.modified().ok() == self.modified && change_of(meta) == self.change))
+				|| (meta.len() == self.len
+					&& meta.modified().ok() == self.modified
+					&& change_of(meta, path) == self.change))
 	}
 }
 
+/// The file's identity and status-change time: Unix inode and ctime; Windows file id and NTFS
+/// change time. Either changes on a rewrite that keeps the size and restores the modification time.
 #[cfg(unix)]
-fn change_of(meta: &fs::Metadata) -> Option<(u64, i64, i64)> {
+fn change_of(meta: &fs::Metadata, _: &Path) -> Option<(u64, i64, i64)> {
 	use std::os::unix::fs::MetadataExt;
 	Some((meta.ino(), meta.ctime(), meta.ctime_nsec()))
 }
 
-#[cfg(not(unix))]
-fn change_of(_: &fs::Metadata) -> Option<(u64, i64, i64)> {
+#[cfg(windows)]
+fn change_of(_: &fs::Metadata, path: &Path) -> Option<(u64, i64, i64)> {
+	let (volume, id) = windows::file_id(path)?;
+	Some((volume ^ (id as u64) ^ ((id >> 64) as u64), windows::change_time(path)?, 0))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn change_of(_: &fs::Metadata, _: &Path) -> Option<(u64, i64, i64)> {
 	None
 }
 
@@ -602,7 +612,7 @@ fn remove_copied(fs: &Fs, from: &Path, copied: &[Copied]) -> io::Result<Left> {
 			Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
 			Err(e) => return Err(e),
 		};
-		if !c.unchanged(&meta) {
+		if !c.unchanged(&meta, &path) {
 			left.push(path);
 			continue;
 		}
@@ -1910,6 +1920,37 @@ mod windows {
 				u128::from((u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow)),
 			)
 		})
+	}
+
+	/// The NTFS change time (100 ns ticks): updated on any write or attribute change, unlike the
+	/// modification time a program can set back.
+	pub(super) fn change_time(p: &Path) -> Option<i64> {
+		use windows_sys::Win32::Storage::FileSystem::{FILE_BASIC_INFO, FILE_READ_ATTRIBUTES, FileBasicInfo};
+		let w = wide(p);
+		// SAFETY: `w` is NUL-terminated and outlives the call; no security attributes or template.
+		let h = unsafe {
+			CreateFileW(
+				w.as_ptr(),
+				FILE_READ_ATTRIBUTES,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				std::ptr::null(),
+				OPEN_EXISTING,
+				FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+				std::ptr::null_mut(),
+			)
+		};
+		if h == INVALID_HANDLE_VALUE {
+			return None;
+		}
+		// SAFETY: an all-zero FILE_BASIC_INFO is a valid value of this plain C struct.
+		let mut info: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+		// SAFETY: `h` is open; `info` is a valid out-buffer of exactly the size passed.
+		let ok = unsafe {
+			GetFileInformationByHandleEx(h, FileBasicInfo, (&raw mut info).cast(), size_of::<FILE_BASIC_INFO>() as u32)
+		};
+		// SAFETY: `h` was returned by CreateFileW above and is not used after this.
+		unsafe { CloseHandle(h) };
+		(ok != 0).then_some(info.ChangeTime)
 	}
 
 	pub(super) fn link_count(p: &Path) -> Option<u64> {

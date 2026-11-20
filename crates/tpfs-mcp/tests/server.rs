@@ -120,7 +120,7 @@ fn approval_is_void_if_the_plan_is_modified() {
 	fs::write(&file, tampered).unwrap();
 
 	let (v, err) = f.tool("apply_plan", json!({ "planId": id }));
-	assert!(err, "{v}");
+	assert!(err && v["status"] == "modified", "{v}");
 	assert!(a.exists() && b.exists());
 }
 
@@ -613,4 +613,27 @@ fn an_interrupted_apply_does_not_run_again() {
 	let (v, err) = f.tool("apply_plan", json!({ "planId": id }));
 	assert!(err && v["status"] == "rejected", "{v}");
 	assert!(!f.root.join("m").exists());
+}
+
+/// Proposing a recipe again: the waiting one is flagged as a duplicate, a rejected one is reported
+/// as rejected, and recipe_status gives a next step, also for a damaged file.
+#[test]
+fn recipe_proposals_again_and_damaged() {
+	let mut f = Fixture::new(Approval::Terminal);
+	let recipe = photo_recipe(json!([f.root]));
+	let (first, _) = f.tool("recipe_propose", json!({ "recipe": recipe }));
+	let (again, err) = f.tool("recipe_propose", json!({ "recipe": recipe, "note": "new note" }));
+	assert!(!err && again["id"] == first["id"] && again["duplicate"] == true, "{again}");
+	let id = first["id"].as_str().unwrap().to_owned();
+	f.server.recipes().reject(&id).unwrap();
+	let (v, err) = f.tool("recipe_propose", json!({ "recipe": recipe }));
+	assert!(err && v["status"] == "rejected" && v["id"] == id.as_str(), "{v}");
+	// A damaged waiting file.
+	let mut other = recipe.clone();
+	other["version"] = json!(5);
+	let (v, _) = f.tool("recipe_propose", json!({ "recipe": other }));
+	let id = v["id"].as_str().unwrap().to_owned();
+	fs::write(f.state.join("pending-recipes").join(format!("{id}.json")), "{").unwrap();
+	let (v, _) = f.tool("recipe_status", json!({ "id": id }));
+	assert!(v["status"] == "damaged" && v["next"].as_str().unwrap().contains("reject"), "{v}");
 }

@@ -300,7 +300,7 @@ pub(super) fn resolve(args: &super::Args, p: &PendingRecipe) -> Result<Vec<PathB
 				),
 			));
 		}
-		if tpfs_core::normalize(&std::path::absolute(r).unwrap_or_default()).as_deref() != Some(c.as_path()) {
+		if fs::symlink_metadata(r).is_ok_and(|m| m.file_type().is_symlink()) {
 			println!("  Note: {shown} is a link; it means {}", sanitize(c.as_os_str()));
 		}
 		roots.push(c);

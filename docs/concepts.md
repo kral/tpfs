@@ -101,6 +101,12 @@ proposed the plan cannot set it.
 | MEDIUM | a move crosses file systems (the data is copied, and undo copies it back) |
 | low | anything else |
 
+A move across file systems copies the data, then removes the source. tpfs removes only the
+entries that are unchanged since they were copied: same size and modification time, and the same
+file identity and status-change time (inode and ctime on Unix, file id and NTFS change time on
+Windows). An entry someone changed meanwhile, even at the same size with its modification time set
+back, stays in place and is reported.
+
 The rating decides how carefully you must confirm (see [Approval](#approval)). The preview lists the
 reasons:
 

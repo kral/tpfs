@@ -128,8 +128,8 @@ uses must be listed in `required`.
 |---|---|---|
 | `recipe_schema` | none | the format's JSON Schema, a short guide and two examples |
 | `recipe_validate` | `recipe`, optional `sample` `{items: [{name, mtime}], values}` (≤ 20 invented entries) | checks the recipe; with a sample, also returns the steps a run would produce. It touches no file: the scope is used as written and every name counts as free |
-| `recipe_propose` | `recipe`, optional `note` (≤ 300 characters) | puts the recipe in the inbox and returns `{id, status: "pending"}`. Proposing the same recipe again returns the same id. At most 5 recipes wait at once |
-| `recipe_status` | `id` | `pending`, `damaged` (its file cannot be read; the person can only reject it), `installed`, `rejected` or `unknown`. A decision is remembered for a month |
+| `recipe_propose` | `recipe`, optional `note` (≤ 300 characters) | puts the recipe in the inbox and returns `{id, status: "pending"}`. Proposing the same recipe again returns the same id with `duplicate: true` (the first note is kept). Exactly a recipe the user rejected gets `status: "rejected"`, one they installed `status: "installed"`. At most 5 recipes wait at once |
+| `recipe_status` | `id` | `pending`, `damaged` (its file cannot be read; the person can only reject it), `installed`, `rejected` or `unknown`. A decision is remembered for a month. Each answer has a `next` step |
 
 No tool can install a recipe, list installed recipes or run one.
 

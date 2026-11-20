@@ -146,7 +146,30 @@ impl RecipeStore {
 		if fs::symlink_metadata(self.path(id, "json")?).is_err() {
 			return Err(io::Error::new(io::ErrorKind::NotFound, format!("no pending recipe '{id}'")));
 		}
-		self.decide(id, "rejected", b"")
+		// The hash is kept, so the same recipe proposed again is recognised as rejected.
+		let hash = self.get(id).map(|p| p.hash).unwrap_or_default();
+		self.decide(id, "rejected", hash.as_bytes())
+	}
+
+	/// A recent decision on exactly this recipe (by hash): the proposal's id and whether it was
+	/// installed or rejected.
+	pub fn decided(&self, hash: &str) -> Option<(String, RecipeStatus)> {
+		let entries = fs::read_dir(&self.dir).ok()?;
+		let mut found: Vec<(String, RecipeStatus)> = entries
+			.filter_map(Result::ok)
+			.filter_map(|e| {
+				let path = e.path();
+				let status = match path.extension()?.to_str()? {
+					"installed" => RecipeStatus::Installed,
+					"rejected" => RecipeStatus::Rejected,
+					_ => return None,
+				};
+				let id = path.file_stem()?.to_str().filter(|id| check_id(id).is_ok())?.to_owned();
+				(fs::read(&path).ok()? == hash.as_bytes()).then_some((id, status))
+			})
+			.collect();
+		found.sort_by(|a, b| a.0.cmp(&b.0));
+		found.pop()
 	}
 
 	pub fn status(&self, id: &str) -> RecipeStatus {
@@ -331,7 +354,8 @@ impl InstalledRecipes {
 		loop {
 			match fs::rename(&part, &file) {
 				Ok(()) => break,
-				Err(e) if cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied && tries < 10 => {
+				// Access denied (5), sharing violation (32), lock violation (33).
+				Err(e) if cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32 | 33)) && tries < 10 => {
 					tries += 1;
 					std::thread::sleep(Duration::from_millis(50));
 				}
@@ -399,6 +423,7 @@ mod tests {
 		assert_eq!(store.get(&a.id).unwrap(), a);
 		store.reject(&a.id).unwrap();
 		assert_eq!(store.status(&a.id), RecipeStatus::Rejected);
+		assert_eq!(store.decided(&a.hash), Some((a.id.clone(), RecipeStatus::Rejected)));
 		assert!(store.mark_installed(&b.id, "not-the-hash").is_err());
 		assert_eq!(store.status(&b.id), RecipeStatus::Pending);
 		store.mark_installed(&b.id, &b.hash).unwrap();

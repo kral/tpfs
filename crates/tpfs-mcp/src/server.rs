@@ -411,9 +411,16 @@ impl Server {
 			.execute(&pending.plan, Source::Agent);
 		// An approval is for one execution: the plan is used up either way.
 		let removed = self.store.remove(id);
-		let batch = result.map_err(|e| {
-			format!("{}\nThe plan was used up; propose a corrected plan if needed.", e.to_string().trim_end())
-		})?;
+		let batch = match result {
+			Ok(b) => b,
+			Err(e) => {
+				return refused(
+					"failed",
+					format!("{}\nThe plan was used up.", e.to_string().trim_end()),
+					"tpfs rolls back a failed run; check history for what happened, then propose a corrected plan if needed.",
+				);
+			}
+		};
 		removed.map_err(|e| {
 			format!("applied, but the approved plan could not be removed ({e}); reject it with `tpfs reject {id}`")
 		})?;
@@ -476,19 +483,58 @@ impl Server {
 			Ok(r) => r,
 			Err(errors) => return Ok(json!({ "valid": false, "errors": errors })),
 		};
+		let hash = recipe.hash();
+		match self.recipes.decided(&hash) {
+			Some((id, crate::RecipeStatus::Rejected)) => {
+				return Ok(json!({
+					"id": id,
+					"status": "rejected",
+					"error": "the user already rejected exactly this recipe",
+					"next": "Do not propose it again. Ask the user what to change, then propose a changed recipe (a new version).",
+				}));
+			}
+			Some((id, _)) => {
+				return Ok(json!({
+					"id": id,
+					"status": "installed",
+					"next": "The user already installed exactly this recipe; they can run it whenever they want.",
+				}));
+			}
+			None => {}
+		}
+		let waiting = self.recipes.scan().is_ok_and(|(p, _)| p.iter().any(|p| p.hash == hash));
 		let pending = self.recipes.put(&recipe, &self.client, note).map_err(|e| e.to_string())?;
-		Ok(json!({
+		let mut reply = json!({
 			"id": pending.id,
 			"status": "pending",
 			"next": "Tell the user a recipe is waiting in their commander (Agent recipes). They review and install it, or reject it; recipe_status tells you which. You never run it: the user does, on their own selection.",
-		}))
+		});
+		if waiting {
+			reply["duplicate"] = json!(true);
+			reply["note"] = json!("This recipe was already waiting; the first proposal (and its note) is kept.");
+		}
+		Ok(reply)
 	}
 
 	fn recipe_status(&self, args: &Value) -> Result<Value, String> {
 		let Some(id) = args.get("id").and_then(Value::as_str) else {
 			return Err("'id' is required: the id returned by recipe_propose".into());
 		};
-		Ok(json!({ "id": id, "status": self.recipes.status(id).as_str() }))
+		let status = self.recipes.status(id);
+		let next = match status {
+			crate::RecipeStatus::Pending => {
+				"The user has not decided yet; ask them to review it, or check again later."
+			}
+			crate::RecipeStatus::Damaged => {
+				"Its file is damaged: ask the user to reject it (`tpfs recipe reject <id>` or in their commander), then propose it again."
+			}
+			crate::RecipeStatus::Installed => "Installed: the user can run it on their own selection.",
+			crate::RecipeStatus::Rejected => {
+				"Rejected: ask the user what to change; do not propose the same recipe again."
+			}
+			crate::RecipeStatus::Unknown => "Never proposed, or decided over a month ago.",
+		};
+		Ok(json!({ "id": id, "status": status.as_str(), "next": next }))
 	}
 
 	fn journal(&self) -> Result<Journal, String> {
@@ -544,7 +590,7 @@ fn tools() -> Value {
 		},
 		{
 			"name": "apply_plan",
-			"description": "Execute a proposed plan after the user approved it. In terminal mode the user approves with `tpfs approve <planId>`. When it cannot run, the error carries a status and a next step: not_approved (wait and call again later), rejected (the user said no: ask what to change; do not propose the same plan), unknown (applied already or never proposed: see history), modified (propose again), used (already started once: see history). A plan can be applied once; if execution fails it is used up and must be proposed again.",
+			"description": "Execute a proposed plan after the user approved it. In terminal mode the user approves with `tpfs approve <planId>`. When it cannot run, the error carries a status and a next step: not_approved (wait and call again later), rejected (the user said no: ask what to change; do not propose the same plan), unknown (applied already or never proposed: see history), modified (propose again), used (already started once: see history), failed (it ran and failed; it is used up: see history). A plan can be applied once; if execution fails it is used up and must be proposed again.",
 			"inputSchema": {
 				"type": "object",
 				"properties": { "planId": { "type": "string", "description": "The planId returned by propose_plan." } },
