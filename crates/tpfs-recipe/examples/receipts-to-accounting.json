@@ -2,9 +2,9 @@
   "format": "tpfs-recipe/1",
   "id": "receipts-to-accounting",
   "version": 1,
-  "title": "Doklady do účetnictví",
+  "title": "Receipts to accounting",
   "description": "Moves the selected receipts into the accounting folder, by year and month of the file.",
-  "scope": { "roots": ["~/Downloads", "~/Účetnictví"] },
+  "scope": { "roots": ["~/Downloads", "~/Accounting"] },
   "input": { "kind": "file", "glob": ["*.pdf", "*.jpg", "*.png"], "max": 200 },
   "form": {
     "type": "object",

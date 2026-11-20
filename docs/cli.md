@@ -436,7 +436,7 @@ installed:
 ```console
 $ tpfs recipes
 Proposed by agents (review with `tpfs recipe install <id>`, or `tpfs recipe reject <id>`):
-  18e999de8774bc37432  "Doklady do účetnictví" v1 (receipts-to-accounting) from claude-code — You sort receipts by hand.
+  18e99b8dfcc271573f8  "Receipts to accounting" v1 (receipts-to-accounting) from claude-code — You sort receipts by hand.
 ```
 
 An installed recipe whose file was changed outside tpfs is listed as `DISABLED`. It cannot run
@@ -464,18 +464,18 @@ terminal). A proposal for an id that is already installed replaces it only if it
 newer.
 
 ```console
-$ tpfs recipe install 18e999de8774bc37432
-Recipe proposal 18e999de8774bc37432 from claude-code (as the agent's client calls itself):
+$ tpfs recipe install 18e99b8dfcc271573f8
+Recipe proposal 18e99b8dfcc271573f8 from claude-code (as the agent's client calls itself):
   Note: "You sort receipts by hand."
-  Title: "Doklady do účetnictví" — receipts-to-accounting version 1
+  Title: "Receipts to accounting" — receipts-to-accounting version 1
   Description: "Moves the selected receipts into the accounting folder, by year and month of the file."
-  Folders it may touch: ~/Downloads, ~/Účetnictví
+  Folders it may touch: ~/Downloads, ~/Accounting
   Takes: 1–200 files named *.pdf, *.jpg, *.png
   Field --set supplier=…: "Supplier", text, 1–40 characters
   Field --set target=…: "Accounting folder", a folder inside the scope
   Action: move each to {form.target}/{item.mtime:%Y}/{item.mtime:%m}/{form.supplier|ascii|slug}_{item.mtime:%Y-%m-%d}_{n:02}.{item.ext|lower} (a taken name gets _2, _3 …)
-  Hash: cf134148…
-  It will work in: /home/you/Downloads, /home/you/Účetnictví
+  Hash: bb4bd284…
+  It will work in: /home/you/Downloads, /home/you/Accounting
 Type 'yes' to install this recipe (anything else leaves it waiting): yes
 Installed receipts-to-accounting. Run it with `tpfs recipe run receipts-to-accounting <entry>…`.
 ```
@@ -496,19 +496,19 @@ digest, in the same way as `tpfs apply`.
   without asking.
 
 ```console
-$ tpfs recipe run receipts-to-accounting ~/Downloads/faktura.PDF ~/Downloads/uctenka.jpg --set 'supplier=Kovárna Kyjovice'
-target ("Accounting folder", a folder inside the scope): /home/you/Účetnictví
-Plan: Recipe "Doklady do účetnictví" v1: move 2 files
-  MKDIR   /home/you/Účetnictví/2026
-  MKDIR   /home/you/Účetnictví/2026/10
-  MOVE    /home/you/Downloads/faktura.PDF  ->  /home/you/Účetnictví/2026/10/Kovarna_Kyjovice_2026-10-03_01.pdf
-  MOVE    /home/you/Downloads/uctenka.jpg  ->  /home/you/Účetnictví/2026/10/Kovarna_Kyjovice_2026-10-03_02.jpg
+$ tpfs recipe run receipts-to-accounting ~/Downloads/invoice.PDF ~/Downloads/receipt.jpg --set 'supplier=Café Müller'
+target ("Accounting folder", a folder inside the scope): /home/you/Accounting
+Plan: Recipe "Receipts to accounting" v1: move 2 files
+  MKDIR   /home/you/Accounting/2026
+  MKDIR   /home/you/Accounting/2026/10
+  MOVE    /home/you/Downloads/invoice.PDF  ->  /home/you/Accounting/2026/10/Cafe_Muller_2026-10-03_01.pdf
+  MOVE    /home/you/Downloads/receipt.jpg  ->  /home/you/Accounting/2026/10/Cafe_Muller_2026-10-03_02.jpg
 Total: 4 operation(s): 2 move (4 B), 2 mkdir
 Risk: low
-Digest: 3034610c…
+Digest: aa87a9b3…
 This recipe is new to you (run 1 of its first 3): check every step.
 Type 'yes' to run it: yes
-Done: 4 step(s), batch 18e999de98bb61eb-43d. Undo with `tpfs undo`.
+Done: 4 step(s), batch 18e99b8e0de606b0-402. Undo with `tpfs undo`.
 ```
 
 A run is an ordinary batch: `tpfs undo` reverts it.

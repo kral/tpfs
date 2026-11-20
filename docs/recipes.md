@@ -22,8 +22,8 @@ recipe, so they cannot carry instructions to it (prompt injection).
   "format": "tpfs-recipe/1",
   "id": "receipts-to-accounting",
   "version": 1,
-  "title": "Doklady do účetnictví",
-  "scope": { "roots": ["~/Downloads", "~/Účetnictví"] },
+  "title": "Receipts to accounting",
+  "scope": { "roots": ["~/Downloads", "~/Accounting"] },
   "input": { "kind": "file", "glob": ["*.pdf", "*.jpg", "*.png"], "max": 200 },
   "form": {
     "type": "object",
@@ -41,18 +41,22 @@ recipe, so they cannot carry instructions to it (prompt injection).
 }
 ```
 
-Run on `faktura.PDF` and `uctenka.jpg` (both from 3 October 2026), with the supplier set to
-`Kovárna Kyjovice`, it gives this plan:
+Run on `invoice.PDF` and `receipt.jpg` (both from 3 October 2026), with the supplier set to
+`Café Müller`, it gives this plan:
 
 ```text
-MKDIR   /home/you/Účetnictví/2026
-MKDIR   /home/you/Účetnictví/2026/10
-MOVE    /home/you/Downloads/faktura.PDF  ->  /home/you/Účetnictví/2026/10/Kovarna_Kyjovice_2026-10-03_01.pdf
-MOVE    /home/you/Downloads/uctenka.jpg  ->  /home/you/Účetnictví/2026/10/Kovarna_Kyjovice_2026-10-03_02.jpg
+MKDIR   /home/you/Accounting/2026
+MKDIR   /home/you/Accounting/2026/10
+MOVE    /home/you/Downloads/invoice.PDF  ->  /home/you/Accounting/2026/10/Cafe_Muller_2026-10-03_01.pdf
+MOVE    /home/you/Downloads/receipt.jpg  ->  /home/you/Accounting/2026/10/Cafe_Muller_2026-10-03_02.jpg
 ```
 
+The supplier's name becomes a safe file name: `ascii` drops the diacritics and `slug` turns the
+space into `_`. The extension is lowercased, and `n` numbers the files in the order you selected
+them.
+
 The plan's reason is written by tpfs, never by the recipe's author:
-`Recipe "Doklady do účetnictví" v1: move 2 files`.
+`Recipe "Receipts to accounting" v1: move 2 files`.
 
 ## The format
 
@@ -92,7 +96,7 @@ uses must be listed in `required`.
 |---|---|
 | Sources | `item.name`, `item.stem`, `item.ext`, `item.mtime`, `today`, `n` (the position in the selection, from 1), `form.<field>` |
 | Formats | `%Y %m %d %H %M` for `item.mtime`; `%Y %m %d` for `today` and date fields (the default is `%Y-%m-%d`); `:0N` (as in `:03`) for `n` and integer fields |
-| Filters | `lower`, `trim`, `ascii` (strips diacritics, so `Kyjovice č. 2` becomes `Kyjovice c. 2`), `slug` (spaces and characters that are unsafe in names become `_`, and repeated `_` are collapsed) |
+| Filters | `lower`, `trim`, `ascii` (strips diacritics, so `Café Müller` becomes `Cafe Muller`), `slug` (spaces and characters that are unsafe in names become `_`, and repeated `_` are collapsed) |
 
 - **`move` and `copy`** targets are paths. They may start with `{item.dir}` or a folder field
   such as `{form.target}`; otherwise they start in the entry's own folder.
