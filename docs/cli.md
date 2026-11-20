@@ -18,6 +18,12 @@ tpfs pending
 tpfs approve <planId>
 tpfs reject <planId>
 tpfs watch
+tpfs recipes
+tpfs recipe install <id> [--root <dir>...]
+tpfs recipe reject <id>
+tpfs recipe show <id>
+tpfs recipe run <recipe> <entry>... [--set <field>=<value>]... [--approve <digest>]
+tpfs recipe remove <recipe>
 tpfs guard
 tpfs doctor [<project>]
 ```
@@ -413,3 +419,103 @@ Digest: …
 Type 'yes' to approve exactly this plan, 'no' to reject it, or Enter to decide later: yes
 Approved. The agent can now call apply_plan for 18e98f3dd61777bec4a.
 ```
+
+Recipes that agents propose are shown in the same loop, in the same way as
+`tpfs recipe install` shows them. Answer `yes` to install the recipe, `no` to reject it, or press
+Enter to decide later.
+
+## tpfs recipes
+
+```text
+tpfs recipes
+```
+
+Lists the [recipes](recipes.md) that agents proposed and that wait for you, and the ones you
+installed:
+
+```console
+$ tpfs recipes
+Proposed by agents (review with `tpfs recipe install <id>`, or `tpfs recipe reject <id>`):
+  18e999de8774bc37432  "Doklady do účetnictví" v1 (receipts-to-accounting) from claude-code — You sort receipts by hand.
+```
+
+An installed recipe whose file was changed outside tpfs is listed as `DISABLED`. It cannot run
+until it is installed again from a new proposal.
+
+## tpfs recipe
+
+```text
+tpfs recipe install <id> [--root <dir>...]
+tpfs recipe reject <id>
+tpfs recipe show <id>
+tpfs recipe run <recipe> <entry>... [--set <field>=<value>]... [--approve <digest>]
+tpfs recipe remove <recipe>
+```
+
+### install
+
+`install` shows the whole proposal and then asks you to type `yes`. The proposal includes the
+client the agent named, its note, the folders the recipe may touch, what it takes, every form
+field, the action template and the hash.
+
+`--root` narrows the folders the recipe may work in. Each `--root` must lie inside the recipe's
+own folders, and every folder must exist. Installing is interactive only (exit 4 without a
+terminal). A proposal for an id that is already installed replaces it only if its version is
+newer.
+
+```console
+$ tpfs recipe install 18e999de8774bc37432
+Recipe proposal 18e999de8774bc37432 from claude-code (as the agent's client calls itself):
+  Note: "You sort receipts by hand."
+  Title: "Doklady do účetnictví" — receipts-to-accounting version 1
+  Description: "Moves the selected receipts into the accounting folder, by year and month of the file."
+  Folders it may touch: ~/Downloads, ~/Účetnictví
+  Takes: 1–200 files named *.pdf, *.jpg, *.png
+  Field --set supplier=…: "Supplier", text, 1–40 characters
+  Field --set target=…: "Accounting folder", a folder inside the scope
+  Action: move each to {form.target}/{item.mtime:%Y}/{item.mtime:%m}/{form.supplier|ascii|slug}_{item.mtime:%Y-%m-%d}_{n:02}.{item.ext|lower} (a taken name gets _2, _3 …)
+  Hash: cf134148…
+  It will work in: /home/you/Downloads, /home/you/Účetnictví
+Type 'yes' to install this recipe (anything else leaves it waiting): yes
+Installed receipts-to-accounting. Run it with `tpfs recipe run receipts-to-accounting <entry>…`.
+```
+
+### run
+
+`run` expands an installed recipe over the entries you name and shows the plan, its risk and its
+digest, in the same way as `tpfs apply`.
+
+- **Form values.** Pass them with `--set field=value`. In a terminal, tpfs asks for any required
+  field you left out. Without a terminal, a missing field is a usage error (exit 2).
+- **Dates.** Modification times are taken in your time zone.
+- **Rejected selections.** A selection the recipe does not accept is refused as a whole, with
+  every problem listed (exit 3). Examples: a file outside its folders, a name its patterns do not
+  match, or a taken name with `on_conflict: stop`.
+- **The first three runs.** For these you type `yes`. After that, the question is the usual
+  `Apply? [y/N]`. With `--approve <digest>`, it runs exactly the plan shown in an earlier run
+  without asking.
+
+```console
+$ tpfs recipe run receipts-to-accounting ~/Downloads/faktura.PDF ~/Downloads/uctenka.jpg --set 'supplier=Kovárna Kyjovice'
+target ("Accounting folder", a folder inside the scope): /home/you/Účetnictví
+Plan: Recipe "Doklady do účetnictví" v1: move 2 files
+  MKDIR   /home/you/Účetnictví/2026
+  MKDIR   /home/you/Účetnictví/2026/10
+  MOVE    /home/you/Downloads/faktura.PDF  ->  /home/you/Účetnictví/2026/10/Kovarna_Kyjovice_2026-10-03_01.pdf
+  MOVE    /home/you/Downloads/uctenka.jpg  ->  /home/you/Účetnictví/2026/10/Kovarna_Kyjovice_2026-10-03_02.jpg
+Total: 4 operation(s): 2 move (4 B), 2 mkdir
+Risk: low
+Digest: 3034610c…
+This recipe is new to you (run 1 of its first 3): check every step.
+Type 'yes' to run it: yes
+Done: 4 step(s), batch 18e999de98bb61eb-43d. Undo with `tpfs undo`.
+```
+
+A run is an ordinary batch: `tpfs undo` reverts it.
+
+### reject, show, remove
+
+- `reject` discards a proposal; the agent sees `rejected` in `recipe_status`.
+- `show` prints a proposal, or an installed recipe with the folders you confirmed and its run
+  count.
+- `remove` uninstalls a recipe.

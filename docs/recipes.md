@@ -5,9 +5,10 @@ data only: a form (a flat JSON Schema object) and an operation template. There i
 expressions and no HTML in it. A recipe cannot read your disk, run anything, or approve anything.
 
 1. The agent proposes a recipe over `tpfs mcp` (`recipe_propose`).
-2. Your commander (troppau) shows it in its inbox. You read it, narrow its folders if you like, and
-   install it or reject it.
-3. Whenever you want, you select entries, fill in the form and run the recipe. Each run expands
+2. You review it, narrow its folders if you like, and install it or reject it: with
+   `tpfs recipe install <id>` (or in `tpfs watch`), or in a front end such as troppau.
+3. Whenever you want, you run it on entries you choose (`tpfs recipe run <recipe> <entry>…
+   --set field=value`, or a selection in the front end). Each run expands
    into an ordinary [plan](plan-format.md), which you review like any other. The plan is journaled
    and can be undone.
 
@@ -140,4 +141,13 @@ taken?", is the `exists` callback.
 
 `tpfs_mcp::RecipeStore` is the inbox (`<state>/pending-recipes`). It has `scan`, `get`,
 `mark_installed(id, hash)` (with the hash that was shown to the person), `reject` and `status`.
-Keeping installed recipes is the front end's job.
+Installed recipes are kept in `<state>/recipes/<recipe id>.json` (`tpfs_mcp::InstalledRecipes`).
+The format is shared by every front end that uses the same state folder:
+
+```json
+{ "recipe": { … }, "hash": "<sha-256 of the reviewed recipe>", "roots": ["/home/you/Downloads"], "installed": 1795132800, "runs": 0 }
+```
+
+`roots` is the scope the person confirmed. A file whose recipe no longer matches its hash was
+changed outside a front end, and it stays disabled until it is installed again. The command line
+asks for a typed `yes` during a recipe's first three runs (`runs` < 3).

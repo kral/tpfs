@@ -186,6 +186,140 @@ impl RecipeStore {
 	}
 }
 
+/// A recipe the person installed, as kept in `<state>/recipes/<recipe id>.json`. The format is
+/// shared by every front end on the same state folder.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Installed {
+	pub recipe: Recipe,
+	/// [`Recipe::hash`] of the recipe the person reviewed.
+	pub hash: String,
+	/// The scope the person confirmed (absolute folders; may be narrower than the recipe's).
+	pub roots: Vec<PathBuf>,
+	/// Unix seconds.
+	pub installed: u64,
+	/// Completed runs; a front end may ask for more care during the first few.
+	#[serde(default)]
+	pub runs: u32,
+}
+
+/// Installed recipes (`<state>/recipes`), private like the inboxes.
+#[derive(Clone, Debug)]
+pub struct InstalledRecipes {
+	dir: PathBuf,
+}
+
+impl InstalledRecipes {
+	pub fn new(state: &Path) -> Self {
+		Self { dir: state.join("recipes") }
+	}
+
+	/// Install (or update to a newer version) exactly the reviewed recipe within `roots`.
+	pub fn install(&self, recipe: &Recipe, hash: &str, roots: &[PathBuf]) -> io::Result<Installed> {
+		if recipe.hash() != hash {
+			return Err(io::Error::other("the recipe is not the one that was reviewed (its hash differs)"));
+		}
+		recipe.check().map_err(|e| io::Error::other(e[0].to_string()))?;
+		if let Some(old) = self.get(&recipe.id).ok().filter(|old| old.recipe.version >= recipe.version) {
+			return Err(io::Error::new(
+				io::ErrorKind::AlreadyExists,
+				format!(
+					"version {} of '{}' is installed; only a newer version replaces it",
+					old.recipe.version, recipe.id
+				),
+			));
+		}
+		create_private_dir(&self.dir)?;
+		let installed = Installed {
+			recipe: recipe.clone(),
+			hash: hash.to_owned(),
+			roots: roots.to_vec(),
+			installed: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+			runs: 0,
+		};
+		self.write(&installed)?;
+		Ok(installed)
+	}
+
+	/// An installed recipe, refused if its file was changed outside a front end (it must be
+	/// reviewed again).
+	pub fn get(&self, id: &str) -> io::Result<Installed> {
+		let file = self.file(id)?;
+		let bytes = fs::read(&file).map_err(|e| match e.kind() {
+			io::ErrorKind::NotFound => io::Error::new(e.kind(), format!("no installed recipe '{id}'")),
+			_ => e,
+		})?;
+		let i: Installed = serde_json::from_slice(&bytes)
+			.map_err(|e| io::Error::other(format!("installed recipe '{id}' is unreadable: {e}")))?;
+		if i.recipe.id != id || i.recipe.check().is_err() || i.recipe.hash() != i.hash {
+			return Err(io::Error::other(format!(
+				"installed recipe '{id}' was changed outside tpfs; it stays disabled until it is installed again from a proposal"
+			)));
+		}
+		Ok(i)
+	}
+
+	/// Every installed recipe by id, and the ids that cannot be used (unreadable or changed).
+	pub fn list(&self) -> io::Result<(Vec<Installed>, Vec<String>)> {
+		let (mut ok, mut bad) = (Vec::new(), Vec::new());
+		let entries = match fs::read_dir(&self.dir) {
+			Ok(e) => e,
+			Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((ok, bad)),
+			Err(e) => return Err(e),
+		};
+		for e in entries.filter_map(Result::ok) {
+			let path = e.path();
+			if path.extension().is_none_or(|x| x != "json") {
+				continue;
+			}
+			let Some(id) = path.file_stem().and_then(|s| s.to_str()).filter(|id| recipe_id_ok(id)) else { continue };
+			match self.get(id) {
+				Ok(i) => ok.push(i),
+				Err(_) => bad.push(id.to_owned()),
+			}
+		}
+		ok.sort_by(|a, b| a.recipe.id.cmp(&b.recipe.id));
+		bad.sort();
+		Ok((ok, bad))
+	}
+
+	pub fn remove(&self, id: &str) -> io::Result<()> {
+		fs::remove_file(self.file(id)?).map_err(|e| match e.kind() {
+			io::ErrorKind::NotFound => io::Error::new(e.kind(), format!("no installed recipe '{id}'")),
+			_ => e,
+		})
+	}
+
+	/// Count a completed run.
+	pub fn record_run(&self, id: &str) -> io::Result<()> {
+		let mut i = self.get(id)?;
+		i.runs = i.runs.saturating_add(1);
+		self.write(&i)
+	}
+
+	fn write(&self, i: &Installed) -> io::Result<()> {
+		let bytes = serde_json::to_vec_pretty(i).map_err(io::Error::other)?;
+		// Written beside and renamed: a crash never leaves half a recipe.
+		let part = self.dir.join(format!(".{}.part", i.recipe.id));
+		write_private(&part, &bytes)?;
+		fs::rename(&part, self.file(&i.recipe.id)?)
+	}
+
+	fn file(&self, id: &str) -> io::Result<PathBuf> {
+		if !recipe_id_ok(id) {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				format!("invalid recipe id '{}'", tpfs_core::sanitize(id.as_ref())),
+			));
+		}
+		Ok(self.dir.join(format!("{id}.json")))
+	}
+}
+
+fn recipe_id_ok(id: &str) -> bool {
+	(3..=48).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -237,5 +371,32 @@ mod tests {
 		assert!(store.get(&p.id).is_err());
 		store.reject(&p.id).unwrap();
 		assert_eq!(store.status(&p.id), RecipeStatus::Rejected);
+	}
+
+	#[test]
+	fn installed_recipes_are_kept_by_hash_and_version() {
+		let tmp = tempfile::tempdir().unwrap();
+		let shelf = InstalledRecipes::new(tmp.path());
+		let r = recipe();
+		assert!(shelf.install(&r, "bad-hash", &[]).is_err());
+		let roots = vec![PathBuf::from("/data")];
+		shelf.install(&r, &r.hash(), &roots).unwrap();
+		assert_eq!(shelf.get(&r.id).unwrap().roots, roots);
+		assert_eq!(shelf.install(&r, &r.hash(), &roots).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+		let mut newer = r.clone();
+		newer.version += 1;
+		shelf.install(&newer, &newer.hash(), &roots).unwrap();
+		shelf.record_run(&r.id).unwrap();
+		let (list, bad) = shelf.list().unwrap();
+		assert_eq!((list.len(), list[0].runs, list[0].recipe.version, bad.len()), (1, 1, newer.version, 0));
+		// Changed outside tpfs: disabled.
+		let file = tmp.path().join("recipes").join(format!("{}.json", r.id));
+		let text = fs::read_to_string(&file).unwrap().replace("Rename photos by date", "Rename photos");
+		fs::write(&file, text).unwrap();
+		assert!(shelf.get(&r.id).unwrap_err().to_string().contains("changed outside"));
+		assert_eq!(shelf.list().unwrap().1, vec![r.id.clone()]);
+		shelf.remove(&r.id).unwrap();
+		assert!(shelf.get(&r.id).is_err());
+		assert!(shelf.get("../x").is_err());
 	}
 }

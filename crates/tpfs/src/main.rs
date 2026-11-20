@@ -1,5 +1,6 @@
 mod doctor;
 mod guard;
+mod recipe_cli;
 
 use std::{
 	ffi::OsString,
@@ -49,8 +50,17 @@ USAGE:
   tpfs pending                                  list plans proposed by agents
   tpfs approve <planId>                         review and approve an agent's plan (interactive)
   tpfs reject <planId>                          discard an agent's plan
-  tpfs watch                                    review agents' plans as they arrive: approve (yes),
-                                                  reject (no) or leave for later (Enter)
+  tpfs watch                                    review agents' plans (and recipes) as they arrive:
+                                                  approve (yes), reject (no) or leave for later (Enter)
+  tpfs recipes                                  list recipes agents proposed, and installed ones
+  tpfs recipe install <id> [--root <dir>...]    review a proposed recipe and install it (interactive);
+                                                  --root narrows the folders it may work in
+  tpfs recipe reject <id>                       discard a proposed recipe
+  tpfs recipe show <id>                         show a proposed or installed recipe
+  tpfs recipe run <recipe> <entry>... [--set <field>=<value>]...
+                                                  expand an installed recipe over the entries, show
+                                                  the plan, confirm and execute it (or --approve <digest>)
+  tpfs recipe remove <recipe>                   uninstall a recipe
   tpfs guard                                    hook for AI agents (Claude Code, Cursor): refuses shell
                                                   commands that move, rename or delete files and points
                                                   the agent to tpfs (reads the tool call on stdin)
@@ -135,6 +145,8 @@ fn allowed(command: &str) -> Option<(&'static [&'static str], usize)> {
 		"approve" | "reject" => (&["home"], 1),
 		"guard" => (&[], 0),
 		"watch" => (&["home"], 0),
+		"recipes" => (&["home"], 0),
+		"recipe" => (&["home", "root", "set", "approve"], usize::MAX),
 		"doctor" => (&["home"], 1),
 		_ => return None,
 	})
@@ -144,6 +156,10 @@ struct Args {
 	command: String,
 	plan: Option<OsString>,
 	extra: Option<OsString>,
+	/// Positional arguments after the first two (`tpfs recipe run <id> <entry>…`).
+	rest: Vec<OsString>,
+	/// `--set field=value`, in order.
+	sets: Vec<String>,
 	roots: Vec<PathBuf>,
 	approve: Option<String>,
 	approval: tpfs_mcp::Approval,
@@ -197,6 +213,8 @@ fn parse_args() -> Result<Args, Fail> {
 		command: String::new(),
 		plan: None,
 		extra: None,
+		rest: vec![],
+		sets: vec![],
 		roots: vec![],
 		approve: None,
 		approval: tpfs_mcp::Approval::Terminal,
@@ -218,9 +236,9 @@ fn parse_args() -> Result<Args, Fail> {
 	let e = |e: lexopt::Error| usage(e.to_string());
 	while let Some(arg) = parser.next().map_err(e)? {
 		if let Long(name) = &arg {
-			const FLAGS: [&str; 12] = [
+			const FLAGS: [&str; 13] = [
 				"root", "approve", "approval", "icons", "both", "mirror", "apply", "json", "max-ops", "home", "source",
-				"all",
+				"all", "set",
 			];
 			if let Some(f) = FLAGS.iter().find(|f| **f == *name) {
 				args.given.push(f);
@@ -249,6 +267,7 @@ fn parse_args() -> Result<Args, Fail> {
 			Long("abandon") => {
 				args.abandon = Some(parser.value().map_err(e)?.string().map_err(|e| usage(e.to_string()))?)
 			}
+			Long("set") => args.sets.push(parser.value().map_err(e)?.string().map_err(|e| usage(e.to_string()))?),
 			Long("icons") => args.icons = true,
 			Long("both") => args.both = true,
 			Long("all") => args.all = true,
@@ -270,13 +289,16 @@ fn parse_args() -> Result<Args, Fail> {
 			Value(v) if args.command.is_empty() => args.command = v.string().map_err(|e| usage(e.to_string()))?,
 			Value(v) if args.plan.is_none() => args.plan = Some(v),
 			Value(v) if args.extra.is_none() => args.extra = Some(v),
+			Value(v) => args.rest.push(v),
 			other => return Err(usage(other.unexpected().to_string())),
 		}
 	}
 
 	// `tpfs <dir> [<dir>]` opens the commander there.
-	const COMMANDS: [&str; 12] =
-		["ui", "schema", "check", "apply", "sync", "undo", "log", "recover", "mcp", "pending", "approve", "reject"];
+	const COMMANDS: [&str; 14] = [
+		"ui", "schema", "check", "apply", "sync", "undo", "log", "recover", "mcp", "pending", "approve", "reject",
+		"recipes", "recipe",
+	];
 	if !args.command.is_empty() && !COMMANDS.contains(&args.command.as_str()) && Path::new(&args.command).is_dir() {
 		args.extra = args.plan.take();
 		args.plan = Some(std::mem::take(&mut args.command).into());
@@ -616,10 +638,16 @@ fn run(args: Args) -> Res {
 					tpfs_core::sanitize(p.plan.reason.as_ref())
 				);
 			}
+			let recipes = tpfs_mcp::RecipeStore::new(&state_dir(&args)?).scan().map_or(0, |(r, d)| r.len() + d.len());
+			if recipes > 0 {
+				println!("{recipes} recipe(s) proposed by agents are waiting too: see `tpfs recipes`.");
+			}
 			Ok(ExitCode::SUCCESS)
 		}
 		"approve" => approve(&args),
 		"watch" => watch(&args),
+		"recipes" => recipe_cli::list(&args),
+		"recipe" => recipe_cli::run(&args),
 		"reject" => {
 			let id = plan_id(&args)?;
 			let store = tpfs_mcp::Store::new(&state_dir(&args)?);
@@ -928,7 +956,29 @@ fn watch(args: &Args) -> Res {
 		tpfs_core::sanitize(state.as_os_str())
 	);
 	let mut seen = std::collections::HashSet::new();
+	let recipes = tpfs_mcp::RecipeStore::new(&state);
 	loop {
+		let (proposals, _) = recipes.scan().map_err(|e| e.to_string())?;
+		for p in proposals {
+			if !seen.insert(format!("recipe:{}", p.id)) {
+				continue;
+			}
+			println!();
+			let id = tpfs_core::sanitize(p.id.as_ref());
+			recipe_cli::describe_proposal(&p);
+			let answer = ask("Type 'yes' to install this recipe, 'no' to reject it, or Enter to decide later: ")?;
+			match answer.as_str() {
+				"yes" => match recipe_cli::install(args, &p.id, Some("yes")) {
+					Ok(_) => {}
+					Err(Fail(_, e)) => println!("Not installed: {e}"),
+				},
+				"no" | "reject" => {
+					recipes.reject(&p.id).map_err(|e| e.to_string())?;
+					println!("Rejected recipe {id}.");
+				}
+				_ => println!("Left waiting: `tpfs recipe install {id}` or `tpfs recipe reject {id}` later."),
+			}
+		}
 		let (plans, _) = store.scan().map_err(|e| e.to_string())?;
 		for pending in plans {
 			if !seen.insert(pending.id.clone()) || store.is_approved(&pending) {

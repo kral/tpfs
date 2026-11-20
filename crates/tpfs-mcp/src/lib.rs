@@ -9,6 +9,6 @@ mod recipes;
 mod server;
 mod store;
 
-pub use recipes::{MAX_PENDING_RECIPES, PendingRecipe, RecipeStatus, RecipeStore};
+pub use recipes::{Installed, InstalledRecipes, MAX_PENDING_RECIPES, PendingRecipe, RecipeStatus, RecipeStore};
 pub use server::{Approval, Config, MAX_MESSAGE, PROTOCOL_VERSION, Server};
 pub use store::{MAX_PENDING, Pending, Store};

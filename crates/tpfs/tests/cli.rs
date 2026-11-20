@@ -440,3 +440,70 @@ fn watch_needs_a_terminal() {
 	assert_eq!(code(&o), 4, "{}", String::from_utf8_lossy(&o.stderr));
 	assert!(String::from_utf8_lossy(&o.stderr).contains("terminal"));
 }
+
+/// Recipes from the command line: list, reject, a refused non-interactive install, and runs on a
+/// selection, approved by digest.
+#[test]
+fn recipes_are_listed_rejected_and_run() {
+	let tmp = tempfile::TempDir::new().unwrap();
+	let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+	let (root, home) = (base.join("photos"), base.join("home"));
+	fs::create_dir(&root).unwrap();
+	fs::write(root.join("IMG_1.JPG"), "a").unwrap();
+	fs::write(root.join("notes.txt"), "b").unwrap();
+	let mut json: serde_json::Value =
+		serde_json::from_str(include_str!("../../tpfs-recipe/examples/photos-by-date.json")).unwrap();
+	json["scope"]["roots"] = serde_json::json!([root]);
+	let recipe = tpfs_recipe::from_value(json).unwrap();
+
+	let o = tpfs(&home, &["recipes"]);
+	assert!(String::from_utf8_lossy(&o.stdout).contains("No recipes"));
+	let inbox = tpfs_mcp::RecipeStore::new(&home);
+	let a = inbox.put(&recipe, "test-agent", "for the holiday").unwrap();
+	let b = inbox.put(&recipe, "test-agent", "").unwrap();
+	let out = String::from_utf8_lossy(&tpfs(&home, &["recipes"]).stdout).into_owned();
+	assert!(out.contains(&a.id) && out.contains("test-agent") && out.contains("for the holiday"), "{out}");
+
+	// Installing is interactive only.
+	let o = tpfs(&home, &["recipe", "install", &a.id]);
+	assert_eq!(code(&o), 4, "{}", String::from_utf8_lossy(&o.stderr));
+	assert!(String::from_utf8_lossy(&o.stdout).contains("Hash: "), "the recipe is shown first");
+	assert_eq!(inbox.status(&a.id), tpfs_mcp::RecipeStatus::Pending);
+	assert_eq!(code(&tpfs(&home, &["recipe", "reject", &b.id])), 0);
+	assert_eq!(inbox.status(&b.id), tpfs_mcp::RecipeStatus::Rejected);
+	assert_eq!(code(&tpfs(&home, &["recipe", "reject", &b.id])), 2, "already decided");
+	assert_eq!(code(&tpfs(&home, &["recipe", "install", &a.id, "--set", "x=y"])), 2);
+	assert_eq!(code(&tpfs(&home, &["recipe", "frobnicate", "x"])), 2);
+
+	// Installed as the person would in a terminal (same calls as `tpfs recipe install`).
+	tpfs_mcp::InstalledRecipes::new(&home).install(&recipe, &a.hash, std::slice::from_ref(&root)).unwrap();
+	inbox.mark_installed(&a.id, &a.hash).unwrap();
+	let img = root.join("IMG_1.JPG");
+	let img = img.to_str().unwrap();
+	let run = |extra: &[&str]| {
+		let mut v = vec!["recipe", "run", "photos-by-date", img];
+		v.extend_from_slice(extra);
+		tpfs(&home, &v)
+	};
+	assert_eq!(code(&run(&[])), 2, "a required field is missing and nobody can be asked");
+	let txt = root.join("notes.txt");
+	let o = tpfs(&home, &["recipe", "run", "photos-by-date", txt.to_str().unwrap(), "--set", "place=Kyjovice"]);
+	assert_eq!(code(&o), 3, "the glob refuses notes.txt: {}", String::from_utf8_lossy(&o.stderr));
+	let o = run(&["--set", "place=Kyjovice č. 2"]);
+	assert_eq!(code(&o), 4, "a new recipe asks; not interactive and no digest");
+	let out = String::from_utf8_lossy(&o.stdout).into_owned();
+	assert!(out.contains("kyjovice_c._2.jpg") && out.contains("new to you"), "{out}");
+	let digest = out.lines().find_map(|l| l.strip_prefix("Digest: ")).unwrap().to_owned();
+	let o = run(&["--set", "place=Kyjovice č. 2", "--approve", &digest]);
+	assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+	assert!(!root.join("IMG_1.JPG").exists());
+	let renamed: Vec<_> = fs::read_dir(&root).unwrap().filter_map(|e| e.ok()?.file_name().into_string().ok()).collect();
+	assert!(renamed.iter().any(|n| n.ends_with("_kyjovice_c._2.jpg")), "{renamed:?}");
+	assert_eq!(tpfs_mcp::InstalledRecipes::new(&home).get("photos-by-date").unwrap().runs, 1);
+	// The run is an ordinary batch: undo puts the name back.
+	let batch = newest_batch(&home).unwrap();
+	assert_eq!(code(&tpfs(&home, &["undo", "--approve", &batch])), 0);
+	assert!(root.join("IMG_1.JPG").exists());
+	assert_eq!(code(&tpfs(&home, &["recipe", "remove", "photos-by-date"])), 0);
+	assert_eq!(code(&tpfs(&home, &["recipe", "run", "photos-by-date", img])), 2);
+}

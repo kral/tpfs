@@ -3,7 +3,7 @@ resolver = "3"
 members  = ["crates/tpfs-core", "crates/tpfs-mcp", "crates/tpfs-recipe", "crates/tpfs-tui", "crates/tpfs"]
 
 [workspace.package]
-version      = "0.6.0"
+version      = "0.7.0"
 edition      = "2024"
 rust-version = "1.89"
 license      = "MIT OR Apache-2.0"
@@ -28,7 +28,7 @@ serde_path_to_error = "0.1"
 sha2       = "0.10"
 tempfile   = "3"
 unicode-width = "0.2"
-windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Time"] }
 
 [profile.release]
 opt-level     = "s"
