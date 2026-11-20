@@ -7,6 +7,9 @@ through a write-ahead journal, so you can undo the whole batch later, and a batc
 crash is rolled back on request. You can use it from the command line, from a two-panel file manager
 in the terminal, or let an AI agent propose plans over MCP while you keep the final say.
 
+
+![An agent's rm -rf is refused by tpfs guard; a plan is previewed, applied and undone](docs/assets/tpfs-demo.gif)
+
 ## Guarantees
 
 - **No overwrite.** A move, copy or rename never replaces an existing file. To replace a file, a
@@ -22,7 +25,19 @@ in the terminal, or let an AI agent propose plans over MCP while you keep the fi
 
 ## Install
 
-You need Rust 1.89 or newer.
+**Prebuilt binary.** Download the archive for your system from the
+[latest release](https://github.com/kral/tpfs/releases/latest): Linux (x86_64, ARM64, static),
+macOS (Apple silicon, Intel) or Windows (x64, ARM64). Unpack it and put `tpfs` (`tpfs.exe`) on your
+`PATH`. `SHA256SUMS` lists the checksums.
+
+```sh
+# Linux x86_64 example
+curl -LO https://github.com/kral/tpfs/releases/latest/download/tpfs-v0.7.2-x86_64-unknown-linux-musl.tar.gz
+tar xzf tpfs-v0.7.2-x86_64-unknown-linux-musl.tar.gz
+sudo install tpfs-v0.7.2-x86_64-unknown-linux-musl/tpfs /usr/local/bin/
+```
+
+**From source.** You need Rust 1.89 or newer.
 
 ```sh
 git clone https://github.com/kral/tpfs
