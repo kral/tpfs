@@ -16,9 +16,14 @@ use crate::{
 
 /// Errors listed one by one before the rest is only counted.
 const LISTED_ERRORS: usize = 20;
+/// Names tried for one entry with `on_conflict: number` (`_2` … `_1000`).
+const MAX_NUMBER: u32 = 1_000;
+/// Free-name checks (calls to `exists`) for numbering in one run.
+const NUMBER_BUDGET: usize = 50_000;
 
 /// A calendar date and time of day, in the time zone the person sees (the front end converts).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub struct Stamp {
 	pub year: i32,
 	pub month: u8,
@@ -110,6 +115,7 @@ impl Stamp {
 
 /// One selected entry, in the order shown to the person.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Item {
 	/// Absolute path.
 	pub path: PathBuf,
@@ -119,9 +125,45 @@ pub struct Item {
 	pub mtime: Stamp,
 }
 
+impl Item {
+	pub fn new(path: impl Into<PathBuf>, dir: bool, mtime: Stamp) -> Self {
+		Self { path: path.into(), dir, mtime }
+	}
+}
+
 /// The filled-in form: field name → JSON value.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Values(pub BTreeMap<String, Value>);
+pub struct Values(pub(crate) BTreeMap<String, Value>);
+
+impl Values {
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	pub fn insert(&mut self, field: impl Into<String>, value: Value) {
+		self.0.insert(field.into(), value);
+	}
+
+	pub fn get(&self, field: &str) -> Option<&Value> {
+		self.0.get(field)
+	}
+
+	pub fn contains(&self, field: &str) -> bool {
+		self.0.contains_key(field)
+	}
+}
+
+impl From<BTreeMap<String, Value>> for Values {
+	fn from(map: BTreeMap<String, Value>) -> Self {
+		Self(map)
+	}
+}
+
+impl FromIterator<(String, Value)> for Values {
+	fn from_iter<I: IntoIterator<Item = (String, Value)>>(iter: I) -> Self {
+		Self(iter.into_iter().collect())
+	}
+}
 
 /// A checked form value, ready for a template.
 enum Ready {
@@ -348,8 +390,15 @@ fn check_items(recipe: &Recipe, roots: &[PathBuf], items: &[Item], errors: &mut 
 	out
 }
 
+/// Whether `path` is `root` or lies inside it, compared as [`expand`] compares them (letter case
+/// ignored on Windows and macOS). Both should be normalised the same way (for example canonical).
+pub fn within(path: &Path, root: &Path) -> bool {
+	inside(path, root, false)
+}
+
 /// Whether `path` lies in `root` (strictly below it if `strict`). Letter case is ignored where the
-/// usual file systems ignore it.
+/// usual file systems ignore it: this is a check before the plan's own validation, which confines
+/// every step to the roots by itself.
 fn inside(path: &Path, root: &Path, strict: bool) -> bool {
 	let (mut p, mut r) = (path.components(), root.components());
 	loop {
@@ -386,6 +435,7 @@ struct Run<'a> {
 	mkdirs: Vec<Op>,
 	ops: Vec<Op>,
 	collisions: Vec<String>,
+	budget: usize,
 }
 
 impl<'a> Run<'a> {
@@ -405,6 +455,7 @@ impl<'a> Run<'a> {
 			mkdirs: Vec::new(),
 			ops: Vec::new(),
 			collisions: Vec::new(),
+			budget: NUMBER_BUDGET,
 		}
 	}
 
@@ -459,12 +510,22 @@ impl<'a> Run<'a> {
 				}
 				OnConflict::Number => {
 					let (stem, ext) = text::split_ext(last);
-					let found = (2..10_000).map(|k| numbered(stem, ext, k)).find_map(|n| {
+					let mut found = None;
+					for k in 2..=MAX_NUMBER {
+						if self.budget == 0 {
+							break;
+						}
+						self.budget -= 1;
+						let n = numbered(stem, ext, k);
 						let t = dir.join(&n);
-						(text::bad_component(&n).is_none() && free(self, &t)).then_some(t)
-					});
+						if text::bad_component(&n).is_none() && free(self, &t) {
+							found = Some(t);
+							break;
+						}
+					}
 					let Some(t) = found else {
-						errors.push(&at, format!("no free name for '{}'", text::show(last)));
+						errors
+							.push(&at, format!("no free name for '{}' (tried up to _{MAX_NUMBER})", text::show(last)));
 						return;
 					};
 					target = t;

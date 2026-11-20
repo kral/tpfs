@@ -400,6 +400,7 @@ fn the_same_input_gives_the_same_plan() {
 	let items: Vec<Item> = (0..50).map(|i| item(&format!("/data/in/f{}.pdf", i % 7))).collect();
 	let a = run(&r, &items, &values("Kyjovice č. 2"));
 	let b = run(&r, &items, &values("Kyjovice č. 2"));
+	assert!(a.is_ok(), "{a:?}");
 	assert_eq!(a.as_ref().map(tpfs_core::Plan::digest), b.as_ref().map(tpfs_core::Plan::digest));
 	let r2 = parse(&serde_json::to_string(&r).unwrap()).unwrap();
 	assert_eq!(r.hash(), r2.hash());

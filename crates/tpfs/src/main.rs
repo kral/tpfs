@@ -966,12 +966,23 @@ fn watch(args: &Args) -> Res {
 			println!();
 			let id = tpfs_core::sanitize(p.id.as_ref());
 			recipe_cli::describe_proposal(&p);
+			let roots = match recipe_cli::resolve(args, &p) {
+				Ok(r) => r,
+				Err(Fail(_, e)) => {
+					eprintln!("It cannot be installed as proposed: {e}");
+					println!(
+						"`tpfs recipe install {id} --root <dir>` installs it for chosen folders; `tpfs recipe reject {id}` drops it."
+					);
+					continue;
+				}
+			};
 			let answer = ask("Type 'yes' to install this recipe, 'no' to reject it, or Enter to decide later: ")?;
 			match answer.as_str() {
-				"yes" => match recipe_cli::install(args, &p.id, Some("yes")) {
-					Ok(_) => {}
-					Err(Fail(_, e)) => println!("Not installed: {e}"),
-				},
+				"yes" => {
+					if let Err(Fail(_, e)) = recipe_cli::finish(args, &p, &roots) {
+						eprintln!("Not installed: {e}");
+					}
+				}
 				"no" | "reject" => {
 					recipes.reject(&p.id).map_err(|e| e.to_string())?;
 					println!("Rejected recipe {id}.");

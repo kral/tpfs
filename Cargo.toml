@@ -3,7 +3,7 @@ resolver = "3"
 members  = ["crates/tpfs-core", "crates/tpfs-mcp", "crates/tpfs-recipe", "crates/tpfs-tui", "crates/tpfs"]
 
 [workspace.package]
-version      = "0.7.0"
+version      = "0.7.1"
 edition      = "2024"
 rust-version = "1.89"
 license      = "MIT OR Apache-2.0"
@@ -18,7 +18,7 @@ tpfs-tui  = { path = "crates/tpfs-tui" }
 crc32fast  = "1"
 lexopt     = "0.3"
 libc       = "0.2"
-regex      = { version = "1", default-features = false, features = ["std", "unicode"] }
+regex      = { version = "1", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
 ratatui    = { version = "0.30", default-features = false, features = ["crossterm"] }
 rustix     = { version = "1", features = ["fs", "process"] }
 schemars   = "1"

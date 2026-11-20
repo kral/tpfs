@@ -128,6 +128,10 @@ impl Store {
 
 	/// Approved, and the stored plan has not been modified since: its digest still matches.
 	pub fn is_approved(&self, pending: &Pending) -> bool {
+		// A rejection wins over an approval left behind by an interrupted `reject`.
+		if self.was_rejected(&pending.id) {
+			return false;
+		}
 		let Ok(path) = self.approval(&pending.id) else { return false };
 		fs::read_to_string(path).is_ok_and(|d| d == pending.digest && pending.plan.digest() == pending.digest)
 	}
@@ -150,8 +154,15 @@ impl Store {
 		if fs::symlink_metadata(&file).is_err() {
 			return Err(io::Error::new(io::ErrorKind::NotFound, format!("no pending plan '{id}'")));
 		}
+		// The approval goes first: whatever fails or crashes after this, the plan cannot run.
+		match fs::remove_file(self.approval(id)?) {
+			Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+			_ => {}
+		}
 		write_private(&self.rejection(id)?, b"")?;
-		self.remove(id)
+		self.remove(id)?;
+		sync_dir(&self.dir);
+		Ok(())
 	}
 
 	/// The user rejected this plan within the last day.
@@ -198,6 +209,16 @@ pub(crate) fn check_id(id: &str) -> io::Result<&str> {
 			format!("invalid plan id '{}'", tpfs_core::sanitize(id.as_ref())),
 		))
 	}
+}
+
+/// Make renames and removals in `dir` durable (best effort; Unix only, where a folder can be synced).
+pub(crate) fn sync_dir(dir: &Path) {
+	#[cfg(unix)]
+	if let Ok(d) = fs::File::open(dir) {
+		d.sync_all().ok();
+	}
+	#[cfg(not(unix))]
+	let _ = dir;
 }
 
 pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
@@ -301,6 +322,11 @@ mod tests {
 		assert_eq!(store.reject(&p.id).unwrap_err().kind(), io::ErrorKind::NotFound);
 		assert!(store.reject("abc").is_err());
 		assert!(!store.was_rejected("abc"));
+		// A stale approval left by an interrupted reject never counts once the plan is rejected.
+		let q = store.put(&plan(), &[]).unwrap();
+		store.approve(&q).unwrap();
+		write_private(&store.rejection(&q.id).unwrap(), b"").unwrap();
+		assert!(!store.is_approved(&q), "a rejected plan still counted as approved");
 		// A fresh marker survives the next put.
 		store.put(&plan(), &[]).unwrap();
 		assert!(store.was_rejected(&p.id));

@@ -458,8 +458,11 @@ tpfs recipe remove <recipe>
 client the agent named, its note, the folders the recipe may touch, what it takes, every form
 field, the action template and the hash.
 
-`--root` narrows the folders the recipe may work in. Each `--root` must lie inside the recipe's
-own folders, and every folder must exist. Installing is interactive only (exit 4 without a
+The folders are resolved through links and shown (`It will work in:`) before you are asked. A
+folder that is a link is noted with what it really means. A recipe for a whole drive or for the
+home folder (or a folder above it) is refused; install it with `--root <a folder inside it>`
+instead. `--root` narrows the folders the recipe may work in. Each `--root` must lie inside the
+recipe's own folders, and every folder must exist. Installing is interactive only (exit 4 without a
 terminal). A proposal for an id that is already installed replaces it only if its version is
 newer.
 
@@ -491,9 +494,9 @@ digest, in the same way as `tpfs apply`.
 - **Rejected selections.** A selection the recipe does not accept is refused as a whole, with
   every problem listed (exit 3). Examples: a file outside its folders, a name its patterns do not
   match, or a taken name with `on_conflict: stop`.
-- **The first three runs.** For these you type `yes`. After that, the question is the usual
-  `Apply? [y/N]`. With `--approve <digest>`, it runs exactly the plan shown in an earlier run
-  without asking.
+- **The first three runs.** For these you type `yes` in a terminal, even with `--approve`.
+  After that, the question is the usual `Apply? [y/N]`, and `--approve <digest>` runs exactly the
+  plan shown in an earlier run without asking.
 
 ```console
 $ tpfs recipe run receipts-to-accounting ~/Downloads/invoice.PDF ~/Downloads/receipt.jpg --set 'supplier=Café Müller'

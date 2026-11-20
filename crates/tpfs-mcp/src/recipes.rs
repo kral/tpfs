@@ -9,7 +9,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tpfs_recipe::Recipe;
 
-use crate::store::{check_id, create_private_dir, write_private};
+use crate::store::{check_id, create_private_dir, sync_dir, write_private};
 
 /// Most recipes waiting for a decision at once.
 pub const MAX_PENDING_RECIPES: usize = 5;
@@ -33,6 +33,8 @@ pub struct PendingRecipe {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecipeStatus {
 	Pending,
+	/// Waiting, but its file cannot be read or was changed: the person can only reject it.
+	Damaged,
 	Installed,
 	Rejected,
 	Unknown,
@@ -42,6 +44,7 @@ impl RecipeStatus {
 	pub fn as_str(self) -> &'static str {
 		match self {
 			Self::Pending => "pending",
+			Self::Damaged => "damaged",
 			Self::Installed => "installed",
 			Self::Rejected => "rejected",
 			Self::Unknown => "unknown",
@@ -64,6 +67,11 @@ impl RecipeStore {
 	pub fn put(&self, recipe: &Recipe, client: &str, note: &str) -> io::Result<PendingRecipe> {
 		create_private_dir(&self.dir)?;
 		self.forget_old_decisions();
+		// Proposing the same recipe again (an agent retrying) returns the waiting proposal.
+		let hash = recipe.hash();
+		if let Some(same) = self.scan()?.0.into_iter().find(|p| p.hash == hash) {
+			return Ok(same);
+		}
 		if self.waiting()? >= MAX_PENDING_RECIPES {
 			return Err(io::Error::other(format!(
 				"too many recipes are waiting (limit {MAX_PENDING_RECIPES}); ask the user to install or reject some first"
@@ -76,7 +84,7 @@ impl RecipeStore {
 			client: client.chars().take(64).collect(),
 			note: note.to_owned(),
 			recipe: recipe.clone(),
-			hash: recipe.hash(),
+			hash,
 		};
 		let bytes = serde_json::to_vec_pretty(&pending).map_err(io::Error::other)?;
 		write_private(&self.path(&pending.id, "json")?, &bytes)?;
@@ -144,7 +152,7 @@ impl RecipeStore {
 	pub fn status(&self, id: &str) -> RecipeStatus {
 		let is = |ext| self.path(id, ext).is_ok_and(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_file()));
 		if is("json") {
-			RecipeStatus::Pending
+			if self.get(id).is_ok() { RecipeStatus::Pending } else { RecipeStatus::Damaged }
 		} else if is("installed") {
 			RecipeStatus::Installed
 		} else if is("rejected") {
@@ -156,7 +164,9 @@ impl RecipeStore {
 
 	fn decide(&self, id: &str, ext: &str, bytes: &[u8]) -> io::Result<()> {
 		write_private(&self.path(id, ext)?, bytes)?;
-		fs::remove_file(self.path(id, "json")?)
+		fs::remove_file(self.path(id, "json")?)?;
+		sync_dir(&self.dir);
+		Ok(())
 	}
 
 	fn waiting(&self) -> io::Result<usize> {
@@ -182,7 +192,13 @@ impl RecipeStore {
 	}
 
 	fn path(&self, id: &str, ext: &str) -> io::Result<PathBuf> {
-		Ok(self.dir.join(format!("{}.{ext}", check_id(id)?)))
+		let id = check_id(id).map_err(|_| {
+			io::Error::new(
+				io::ErrorKind::InvalidInput,
+				format!("invalid recipe proposal id '{}'", tpfs_core::sanitize(id.as_ref())),
+			)
+		})?;
+		Ok(self.dir.join(format!("{id}.{ext}")))
 	}
 }
 
@@ -219,8 +235,15 @@ impl InstalledRecipes {
 		if recipe.hash() != hash {
 			return Err(io::Error::other("the recipe is not the one that was reviewed (its hash differs)"));
 		}
-		recipe.check().map_err(|e| io::Error::other(e[0].to_string()))?;
-		if let Some(old) = self.get(&recipe.id).ok().filter(|old| old.recipe.version >= recipe.version) {
+		if let Err(e) = recipe.check() {
+			return Err(io::Error::other(e.first().map_or_else(|| "invalid recipe".into(), ToString::to_string)));
+		}
+		let current = self.get(&recipe.id).ok();
+		if let Some(same) = current.as_ref().filter(|old| old.hash == hash) {
+			// Already installed (an install interrupted before the proposal was marked): done.
+			return Ok(same.clone());
+		}
+		if let Some(old) = current.filter(|old| old.recipe.version >= recipe.version) {
 			return Err(io::Error::new(
 				io::ErrorKind::AlreadyExists,
 				format!(
@@ -300,9 +323,26 @@ impl InstalledRecipes {
 	fn write(&self, i: &Installed) -> io::Result<()> {
 		let bytes = serde_json::to_vec_pretty(i).map_err(io::Error::other)?;
 		// Written beside and renamed: a crash never leaves half a recipe.
-		let part = self.dir.join(format!(".{}.part", i.recipe.id));
+		let part = self.dir.join(format!(".{}.{}.part", i.recipe.id, std::process::id()));
 		write_private(&part, &bytes)?;
-		fs::rename(&part, self.file(&i.recipe.id)?)
+		let file = self.file(&i.recipe.id)?;
+		// Windows refuses to replace a file another program is reading at that moment: retry briefly.
+		let mut tries = 0;
+		loop {
+			match fs::rename(&part, &file) {
+				Ok(()) => break,
+				Err(e) if cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied && tries < 10 => {
+					tries += 1;
+					std::thread::sleep(Duration::from_millis(50));
+				}
+				Err(e) => {
+					fs::remove_file(&part).ok();
+					return Err(e);
+				}
+			}
+		}
+		sync_dir(&self.dir);
+		Ok(())
 	}
 
 	fn file(&self, id: &str) -> io::Result<PathBuf> {
@@ -332,10 +372,18 @@ mod tests {
 	fn a_sixth_pending_recipe_is_refused() {
 		let tmp = tempfile::tempdir().unwrap();
 		let store = RecipeStore::new(tmp.path());
-		let ids: Vec<_> = (0..MAX_PENDING_RECIPES).map(|_| store.put(&recipe(), "test", "").unwrap().id).collect();
-		assert!(store.put(&recipe(), "test", "").is_err());
+		let variant = |v: u32| {
+			let mut r = recipe();
+			r.version = v;
+			r
+		};
+		let ids: Vec<_> =
+			(1..=MAX_PENDING_RECIPES as u32).map(|v| store.put(&variant(v), "test", "").unwrap().id).collect();
+		// The same recipe again is the same proposal, not a new one.
+		assert_eq!(store.put(&variant(1), "test", "").unwrap().id, ids[0]);
+		assert!(store.put(&variant(99), "test", "").is_err());
 		store.reject(&ids[0]).unwrap();
-		store.put(&recipe(), "test", "").unwrap();
+		store.put(&variant(99), "test", "").unwrap();
 		assert_eq!(store.scan().unwrap().0.len(), MAX_PENDING_RECIPES);
 	}
 
@@ -344,7 +392,9 @@ mod tests {
 		let tmp = tempfile::tempdir().unwrap();
 		let store = RecipeStore::new(tmp.path());
 		let a = store.put(&recipe(), "claude-code", "renames photos").unwrap();
-		let b = store.put(&recipe(), "claude-code", "").unwrap();
+		let mut other = recipe();
+		other.version = 2;
+		let b = store.put(&other, "claude-code", "").unwrap();
 		assert_eq!(store.status(&a.id), RecipeStatus::Pending);
 		assert_eq!(store.get(&a.id).unwrap(), a);
 		store.reject(&a.id).unwrap();
@@ -368,6 +418,7 @@ mod tests {
 		let text = fs::read_to_string(&file).unwrap().replace("Rename photos by date", "Something else");
 		fs::write(&file, text).unwrap();
 		assert_eq!(store.scan().unwrap(), (vec![], vec![p.id.clone()]));
+		assert_eq!(store.status(&p.id), RecipeStatus::Damaged);
 		assert!(store.get(&p.id).is_err());
 		store.reject(&p.id).unwrap();
 		assert_eq!(store.status(&p.id), RecipeStatus::Rejected);
@@ -382,7 +433,15 @@ mod tests {
 		let roots = vec![PathBuf::from("/data")];
 		shelf.install(&r, &r.hash(), &roots).unwrap();
 		assert_eq!(shelf.get(&r.id).unwrap().roots, roots);
-		assert_eq!(shelf.install(&r, &r.hash(), &roots).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+		// The same recipe again is already done (an interrupted install finishing); an older or
+		// equal version under another hash is refused.
+		shelf.install(&r, &r.hash(), &roots).unwrap();
+		let mut same_version = r.clone();
+		same_version.title = "Other".into();
+		assert_eq!(
+			shelf.install(&same_version, &same_version.hash(), &roots).unwrap_err().kind(),
+			io::ErrorKind::AlreadyExists
+		);
 		let mut newer = r.clone();
 		newer.version += 1;
 		shelf.install(&newer, &newer.hash(), &roots).unwrap();
@@ -398,5 +457,20 @@ mod tests {
 		shelf.remove(&r.id).unwrap();
 		assert!(shelf.get(&r.id).is_err());
 		assert!(shelf.get("../x").is_err());
+	}
+
+	#[test]
+	fn old_decisions_are_forgotten_on_the_next_proposal() {
+		let tmp = tempfile::tempdir().unwrap();
+		let store = RecipeStore::new(tmp.path());
+		let p = store.put(&recipe(), "x", "").unwrap();
+		store.reject(&p.id).unwrap();
+		let marker = tmp.path().join("pending-recipes").join(format!("{}.rejected", p.id));
+		let old = SystemTime::now() - DECISION_KEPT - Duration::from_secs(60);
+		fs::File::options().write(true).open(&marker).unwrap().set_modified(old).unwrap();
+		let mut other = recipe();
+		other.version = 2;
+		store.put(&other, "x", "").unwrap();
+		assert_eq!(store.status(&p.id), RecipeStatus::Unknown);
 	}
 }

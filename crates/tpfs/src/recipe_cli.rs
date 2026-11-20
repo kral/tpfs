@@ -93,7 +93,7 @@ pub(super) fn run(args: &super::Args) -> Res {
 	match what {
 		"install" => {
 			one(0)?;
-			install(args, &id()?, None)
+			install(args, &id()?)
 		}
 		"reject" => {
 			one(0)?;
@@ -110,11 +110,16 @@ pub(super) fn run(args: &super::Args) -> Res {
 			match shelf.get(&id) {
 				Ok(i) => {
 					describe(&i.recipe);
-					println!("Folders (as confirmed): {}", shown(&i.roots));
+					println!("Folders (as confirmed): {}", shown_list(&i.roots));
 					println!("Runs so far: {}", i.runs);
 				}
 				Err(e) if e.kind() == io::ErrorKind::NotFound => {
-					let p = inbox.get(&id).map_err(|e| missing(e, "tpfs recipes"))?;
+					let p = inbox.get(&id).map_err(|e| match e.kind() {
+						io::ErrorKind::NotFound | io::ErrorKind::InvalidInput => {
+							usage(format!("no recipe or proposal '{}' (see `tpfs recipes`)", s(&id)))
+						}
+						_ => e.to_string().into(),
+					})?;
 					describe_proposal(&p);
 				}
 				Err(e) => return Err(e.to_string().into()),
@@ -149,7 +154,7 @@ fn missing(e: io::Error, list: &str) -> Fail {
 	}
 }
 
-fn shown(roots: &[PathBuf]) -> String {
+fn shown_list(roots: &[PathBuf]) -> String {
 	roots.iter().map(|r| sanitize(r.as_os_str())).collect::<Vec<_>>().join(", ")
 }
 
@@ -249,49 +254,71 @@ fn field_text(f: &Field) -> String {
 	out.join(", ")
 }
 
-/// Review a proposal and install it (asked in this terminal). `--root` narrows the folders.
-/// Returns without asking when `answer` is given (from `tpfs watch`).
-pub(super) fn install(args: &super::Args, id: &str, answer: Option<&str>) -> Res {
-	let (inbox, shelf) = stores(args)?;
+/// Review a proposal and install it, asked in this terminal. `--root` narrows the folders.
+fn install(args: &super::Args, id: &str) -> Res {
+	let (inbox, _) = stores(args)?;
 	let p = inbox.get(id).map_err(|e| missing(e, "tpfs recipes"))?;
-	if answer.is_none() {
-		describe_proposal(&p);
+	describe_proposal(&p);
+	let roots = resolve(args, &p)?;
+	if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+		return Err(cancelled("installing a recipe is asked interactively in a terminal"));
 	}
-	let scope = p.recipe.resolve_roots(&home()?);
-	let wanted = if args.roots.is_empty() { scope.clone() } else { args.roots.clone() };
-	let mut roots = Vec::new();
-	for r in &wanted {
-		let Some(n) = std::path::absolute(r).ok().and_then(|a| tpfs_core::normalize(&a)) else {
-			return Err(usage(format!("--root {}: not a folder path", sanitize(r.as_os_str()))));
-		};
-		if !scope.iter().any(|sc| tpfs_core::normalize(sc).is_some_and(|sc| n.starts_with(&sc))) {
-			return Err(usage(format!(
-				"--root {} is outside the recipe's folders ({})",
-				sanitize(n.as_os_str()),
-				shown(&scope)
-			)));
-		}
-		roots.push(n);
-	}
-	// The folders must exist now: they are what every run is confined to.
-	let validator = Validator::new(&roots).map_err(|e| {
-		Fail(1, format!("{e}: {}. Create the folder, or install with --root for the ones you want", shown(&roots)))
-	})?;
-	let roots = validator.roots().to_vec();
-	println!("  It will work in: {}", shown(&roots));
-	let yes = match answer {
-		Some(a) => a == "yes",
-		None => {
-			if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-				return Err(cancelled("installing a recipe is asked interactively in a terminal"));
-			}
-			ask("Type 'yes' to install this recipe (anything else leaves it waiting): ")? == "yes"
-		}
-	};
-	if !yes {
+	if ask("Type 'yes' to install this recipe (anything else leaves it waiting): ")? != "yes" {
 		return Err(cancelled("not installed; it stays waiting"));
 	}
-	shelf.install(&p.recipe, &p.hash, &roots).map_err(|e| e.to_string())?;
+	finish(args, &p, &roots)
+}
+
+/// The folders a proposal will work in, shown before anyone is asked: the recipe's scope (or the
+/// `--root` folders inside it), resolved through links. A drive or the home folder (or a folder
+/// above it) is refused unless named with `--root`.
+pub(super) fn resolve(args: &super::Args, p: &PendingRecipe) -> Result<Vec<PathBuf>, Fail> {
+	let home = home()?;
+	let home_real = tpfs_core::canonicalize(&home).unwrap_or_else(|_| home.clone());
+	let real = |r: &Path| {
+		std::path::absolute(r).ok().and_then(|a| tpfs_core::canonicalize(&a).ok().or_else(|| tpfs_core::normalize(&a)))
+	};
+	let scope = p.recipe.resolve_roots(&home);
+	let scope_real: Vec<PathBuf> = scope.iter().filter_map(|r| real(r)).collect();
+	let named = !args.roots.is_empty();
+	let wanted = if named { args.roots.clone() } else { scope };
+	let mut roots = Vec::new();
+	for r in &wanted {
+		let shown = sanitize(r.as_os_str());
+		let c = std::path::absolute(r).and_then(|a| tpfs_core::canonicalize(&a)).map_err(|e| {
+			Fail(1, format!("{shown}: {e}. Create the folder, or install with --root for the folders you want"))
+		})?;
+		if !scope_real.iter().any(|sc| tpfs_recipe::within(&c, sc)) {
+			return Err(usage(format!("--root {shown} is outside the recipe's folders ({})", shown_list(&scope_real))));
+		}
+		if !named && (c.parent().is_none() || tpfs_recipe::within(&home_real, &c)) {
+			return Err(Fail(
+				1,
+				format!(
+					"{shown} means {}: a whole drive or the home folder is too much for a recipe. Install it with --root <a folder inside it>",
+					sanitize(c.as_os_str())
+				),
+			));
+		}
+		if tpfs_core::normalize(&std::path::absolute(r).unwrap_or_default()).as_deref() != Some(c.as_path()) {
+			println!("  Note: {shown} is a link; it means {}", sanitize(c.as_os_str()));
+		}
+		roots.push(c);
+	}
+	let validator = Validator::new(&roots).map_err(|e| Fail(1, format!("{e}: {}", shown_list(&roots))))?;
+	let roots = validator.roots().to_vec();
+	println!("  It will work in: {}", shown_list(&roots));
+	Ok(roots)
+}
+
+/// Install exactly the proposal that was shown (by its hash) in the resolved folders.
+pub(super) fn finish(args: &super::Args, p: &PendingRecipe, roots: &[PathBuf]) -> Res {
+	let (inbox, shelf) = stores(args)?;
+	match inbox.get(&p.id) {
+		Ok(now) if now.hash == p.hash => {}
+		_ => return Err("the proposal changed or went away after it was shown; nothing was installed".into()),
+	}
+	shelf.install(&p.recipe, &p.hash, roots).map_err(|e| e.to_string())?;
 	inbox.mark_installed(&p.id, &p.hash).map_err(|e| e.to_string())?;
 	println!("Installed {}. Run it with `tpfs recipe run {} <entry>…`.", p.recipe.id, p.recipe.id);
 	Ok(ExitCode::SUCCESS)
@@ -309,14 +336,20 @@ fn run_recipe(args: &super::Args, id: &str) -> Res {
 	let today = local(SystemTime::now()).ok_or("cannot tell today's date")?;
 	let mut items = Vec::new();
 	for e in &args.rest {
-		let path = std::path::absolute(e)
+		let abs = std::path::absolute(e)
 			.ok()
 			.and_then(|a| tpfs_core::normalize(&a))
 			.ok_or_else(|| usage(format!("{}: not a path", sanitize(e.as_os_str()))))?;
+		// The folder as the installed roots are kept (resolved through links); the entry itself
+		// stays what it is, a link included.
+		let path = match (abs.parent(), abs.file_name()) {
+			(Some(dir), Some(name)) => tpfs_core::canonicalize(dir).map_or_else(|_| abs.clone(), |d| d.join(name)),
+			_ => abs,
+		};
 		let meta =
 			fs::symlink_metadata(&path).map_err(|err| Fail(1, format!("{}: {err}", sanitize(path.as_os_str()))))?;
 		let mtime = meta.modified().ok().and_then(local).unwrap_or(today);
-		items.push(tpfs_recipe::Item { path, dir: meta.is_dir(), mtime });
+		items.push(tpfs_recipe::Item::new(path, meta.is_dir(), mtime));
 	}
 	let values = values(recipe, &args.sets)?;
 	let exists = |p: &Path| fs::symlink_metadata(p).is_ok();
@@ -325,15 +358,21 @@ fn run_recipe(args: &super::Args, id: &str) -> Res {
 		Fail(3, format!("the recipe cannot run on this selection; nothing was changed:\n{}", lines.join("\n")))
 	})?;
 	let validator = Validator::new(&installed.roots)
-		.map_err(|e| Fail(1, format!("{e}: {}", shown(&installed.roots))))?
+		.map_err(|e| Fail(1, format!("{e}: {}", shown_list(&installed.roots))))?
 		.with_protected([state_dir(args)?]);
 	let Some((digest, level)) = present(&validator, &plan, Source::Human) else { return Ok(rejected(args)) };
 	drop(open_state(args)?);
-	if installed.runs < NEW_RUNS && args.approve.is_none() {
-		// A new recipe: the person reads its first plans and types the answer out.
+	if installed.runs < NEW_RUNS {
+		// A new recipe: the person reads its first plans and types the answer out, in a terminal,
+		// even with --approve (which a program could copy from the output).
 		println!("This recipe is new to you (run {} of its first {NEW_RUNS}): check every step.", installed.runs + 1);
+		if args.approve.as_ref().is_some_and(|a| *a != digest) {
+			return Err(cancelled("--approve does not match this plan's digest; nothing was changed"));
+		}
 		if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-			return Err(cancelled("not interactive: pass --approve <digest> to run exactly this plan"));
+			return Err(cancelled(format!(
+				"the first {NEW_RUNS} runs of a recipe are confirmed in a terminal (type yes); after that, --approve <digest> works without one"
+			)));
 		}
 		if ask("Type 'yes' to run it: ")? != "yes" {
 			return Err(cancelled("cancelled; nothing was changed"));
@@ -342,8 +381,10 @@ fn run_recipe(args: &super::Args, id: &str) -> Res {
 		super::confirm(args, &digest, level)?;
 	}
 	let code = execute(args, &validator, &plan, open_state(args)?)?;
-	if code == ExitCode::SUCCESS {
-		shelf.record_run(id).ok();
+	if code == ExitCode::SUCCESS
+		&& let Err(e) = shelf.record_run(id)
+	{
+		eprintln!("tpfs recipe: the run was not counted ({e}); its first-runs check may ask again");
 	}
 	Ok(code)
 }
@@ -351,7 +392,7 @@ fn run_recipe(args: &super::Args, id: &str) -> Res {
 /// The form values from `--set field=value`, typed by the form; missing required fields are
 /// asked for in a terminal.
 fn values(recipe: &Recipe, sets: &[String]) -> Result<tpfs_recipe::Values, Fail> {
-	let mut out = tpfs_recipe::Values::default();
+	let mut out = tpfs_recipe::Values::new();
 	let form = &recipe.form;
 	for set in sets {
 		let (name, raw) = set.split_once('=').ok_or_else(|| usage(format!("--set {}: use field=value", s(set))))?;
@@ -359,18 +400,18 @@ fn values(recipe: &Recipe, sets: &[String]) -> Result<tpfs_recipe::Values, Fail>
 			let names: Vec<&str> = form.properties.keys().map(String::as_str).collect();
 			usage(format!("--set: no field '{}' (fields: {})", s(name), names.join(", ")))
 		})?;
-		out.0.insert(name.to_owned(), typed(name, field, raw)?);
+		out.insert(name, typed(name, field, raw)?);
 	}
 	for name in &form.required {
-		if out.0.contains_key(name) {
+		if out.contains(name) {
 			continue;
 		}
-		let field = &form.properties[name];
+		let Some(field) = form.properties.get(name) else { continue };
 		if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
 			return Err(usage(format!("missing --set {name}=… ({})", field_text(field))));
 		}
 		let raw = ask(&format!("{name} ({}): ", field_text(field)))?;
-		out.0.insert(name.clone(), typed(name, field, &raw)?);
+		out.insert(name.clone(), typed(name, field, &raw)?);
 	}
 	Ok(out)
 }
@@ -380,6 +421,8 @@ fn typed(name: &str, field: &Field, raw: &str) -> Result<Value, Fail> {
 	Ok(match field {
 		Field::String(f) if f.format == Some(StringFormat::Dir) => {
 			let dir = std::path::absolute(raw).map_err(|_| bad("a folder"))?;
+			// Resolved through links like the installed roots, when it exists.
+			let dir = tpfs_core::canonicalize(&dir).unwrap_or(dir);
 			Value::String(dir.to_str().ok_or_else(|| bad("a folder"))?.to_owned())
 		}
 		Field::String(_) => Value::String(raw.to_owned()),

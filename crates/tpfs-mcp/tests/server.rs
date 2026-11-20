@@ -543,12 +543,19 @@ fn proposed_recipes_wait_for_the_person_and_report_their_status() {
 	f.rpc("initialize", json!({ "protocolVersion": "2025-06-18", "clientInfo": { "name": "claude-code\u{1b}[31m" } }));
 	let recipe = photo_recipe(json!([f.root]));
 	let mut ids = Vec::new();
-	for _ in 0..tpfs_mcp::MAX_PENDING_RECIPES {
-		let (v, err) = f.tool("recipe_propose", json!({ "recipe": recipe, "note": "for your holiday photos" }));
+	for v in 1..=tpfs_mcp::MAX_PENDING_RECIPES {
+		let mut r = recipe.clone();
+		r["version"] = json!(v);
+		let (v, err) = f.tool("recipe_propose", json!({ "recipe": r, "note": "for your holiday photos" }));
 		assert!(!err && v["status"] == "pending", "{v}");
 		ids.push(v["id"].as_str().unwrap().to_owned());
 	}
-	let (v, err) = f.tool("recipe_propose", json!({ "recipe": recipe }));
+	// A retry of the same recipe is the same proposal.
+	let (v, _) = f.tool("recipe_propose", json!({ "recipe": recipe }));
+	assert_eq!(v["id"], ids[0], "{v}");
+	let mut sixth = recipe.clone();
+	sixth["version"] = json!(99);
+	let (v, err) = f.tool("recipe_propose", json!({ "recipe": sixth }));
 	assert!(err && v["error"].as_str().unwrap().contains("too many"), "a sixth recipe: {v}");
 
 	let store = f.server.recipes().clone();
@@ -556,7 +563,7 @@ fn proposed_recipes_wait_for_the_person_and_report_their_status() {
 	assert_eq!(pending.note, "for your holiday photos");
 	assert!(!pending.client.contains('\u{1b}'), "{:?}", pending.client);
 	store.reject(&ids[0]).unwrap();
-	store.mark_installed(&ids[1], &pending.hash).unwrap();
+	store.mark_installed(&ids[1], &store.get(&ids[1]).unwrap().hash).unwrap();
 	for (id, want) in [(&ids[0], "rejected"), (&ids[1], "installed"), (&ids[2], "pending")] {
 		let (v, _) = f.tool("recipe_status", json!({ "id": id }));
 		assert_eq!(v["status"], want, "{v}");
@@ -567,6 +574,6 @@ fn proposed_recipes_wait_for_the_person_and_report_their_status() {
 	bad["id"] = json!("NO");
 	let (v, err) = f.tool("recipe_propose", json!({ "recipe": bad }));
 	assert!(err && v["errors"][0]["path"] == "id", "{v}");
-	let (v, err) = f.tool("recipe_propose", json!({ "recipe": recipe, "note": "x".repeat(301) }));
+	let (v, err) = f.tool("recipe_propose", json!({ "recipe": sixth, "note": "x".repeat(301) }));
 	assert!(err && v["error"].as_str().unwrap().contains("note"), "{v}");
 }

@@ -551,16 +551,39 @@ pub(crate) struct Copied {
 	dir: bool,
 	len: u64,
 	modified: Option<std::time::SystemTime>,
+	/// Unix: inode and status-change time. A rewrite within the modification time's resolution
+	/// (2 s on FAT, coarse over SMB) at the same size still changes the change time, and a file
+	/// swapped in under the same name has another inode.
+	change: Option<(u64, i64, i64)>,
 }
 
 impl Copied {
 	fn of(rel: &Path, meta: &fs::Metadata) -> Self {
-		Self { rel: rel.to_path_buf(), dir: meta.is_dir(), len: meta.len(), modified: meta.modified().ok() }
+		Self {
+			rel: rel.to_path_buf(),
+			dir: meta.is_dir(),
+			len: meta.len(),
+			modified: meta.modified().ok(),
+			change: change_of(meta),
+		}
 	}
 
 	fn unchanged(&self, meta: &fs::Metadata) -> bool {
-		meta.is_dir() == self.dir && (self.dir || (meta.len() == self.len && meta.modified().ok() == self.modified))
+		meta.is_dir() == self.dir
+			&& (self.dir
+				|| (meta.len() == self.len && meta.modified().ok() == self.modified && change_of(meta) == self.change))
 	}
+}
+
+#[cfg(unix)]
+fn change_of(meta: &fs::Metadata) -> Option<(u64, i64, i64)> {
+	use std::os::unix::fs::MetadataExt;
+	Some((meta.ino(), meta.ctime(), meta.ctime_nsec()))
+}
+
+#[cfg(not(unix))]
+fn change_of(_: &fs::Metadata) -> Option<(u64, i64, i64)> {
+	None
 }
 
 /// Remove from `from` exactly the entries that were copied and have not changed since, children

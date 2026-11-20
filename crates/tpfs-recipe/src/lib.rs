@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-pub use expand::{Item, Stamp, Values, expand};
+pub use expand::{Item, Stamp, Values, expand, within};
 
 /// The format this crate reads and writes.
 pub const FORMAT: &str = "tpfs-recipe/1";
@@ -37,6 +37,7 @@ const MAX_PATTERN: usize = 200;
 /// A recipe, as proposed and stored. Unknown keys are refused everywhere.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct Recipe {
 	/// Always [`FORMAT`].
 	pub format: String,
@@ -59,6 +60,7 @@ pub struct Recipe {
 /// narrow) them at install and passes the result to [`expand`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct Scope {
 	/// 1–4 absolute folders; `~` or `~/…` means the user's home.
 	pub roots: Vec<String>,
@@ -67,6 +69,7 @@ pub struct Scope {
 /// What a run takes: entries selected by the person.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct Input {
 	pub kind: Kind,
 	/// Name patterns (`*` and `?`, letter case ignored); an entry must match one. Empty: any name.
@@ -98,6 +101,7 @@ pub enum Kind {
 /// A flat JSON Schema object. Nested objects, arrays and conditional keywords are refused.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct FormSchema {
 	#[serde(rename = "type")]
 	pub kind: ObjectType,
@@ -125,6 +129,7 @@ pub enum Field {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct StringField {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub title: Option<String>,
@@ -162,6 +167,7 @@ pub enum StringFormat {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct NumberField {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub title: Option<String>,
@@ -179,6 +185,7 @@ pub struct NumberField {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct BoolField {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub title: Option<String>,
@@ -193,6 +200,7 @@ pub struct BoolField {
 /// Hints for the front end; tpfs ignores them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct Hints {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub remember: Option<bool>,
@@ -201,6 +209,7 @@ pub struct Hints {
 /// What a run does with each entry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct Action {
 	pub op: ActionOp,
 	/// The target template: a full path for `move` and `copy`, a name for `rename`.
@@ -230,6 +239,7 @@ pub enum OnConflict {
 /// A problem with a recipe, its form values or a run, with the key it concerns
 /// (`action.to`, `form.properties.year.maximum`, `items[3]` …).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct RecipeError {
 	pub path: String,
 	pub message: String,

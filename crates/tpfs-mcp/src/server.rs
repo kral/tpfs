@@ -349,6 +349,10 @@ impl Server {
 			self.store.remove(id).ok();
 			return Err("the stored plan was modified after it was proposed; propose it again".into());
 		}
+		if self.store.was_rejected(id) {
+			self.store.remove(id).ok();
+			return Err(format!("plan '{id}' was rejected by the user"));
+		}
 		if self.config.approval == Approval::Terminal && !self.store.is_approved(&pending) {
 			return Err(format!(
 				"not approved yet. Ask the user to run `{}` in a terminal{}, then call apply_plan again.",
@@ -619,13 +623,9 @@ fn recipe_validate(args: &Value) -> Result<Value, String> {
 		.unwrap_or_else(|| PathBuf::from(if cfg!(windows) { r"C:\Users\user" } else { "/home/user" }));
 	let roots = recipe.resolve_roots(&home);
 	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-	let today = tpfs_recipe::Stamp::from_unix(i64::try_from(now).unwrap_or(0)).unwrap_or(tpfs_recipe::Stamp {
-		year: 2026,
-		month: 1,
-		day: 1,
-		hour: 0,
-		minute: 0,
-	});
+	let Some(today) = tpfs_recipe::Stamp::from_unix(i64::try_from(now).unwrap_or(0)) else {
+		return Err("cannot tell today's date".into());
+	};
 	let list = match obj.get("items") {
 		Some(Value::Array(a)) if !a.is_empty() && a.len() <= 20 => a,
 		_ => return bad("'items' lists 1–20 invented entries {name, mtime}"),
@@ -646,11 +646,11 @@ fn recipe_validate(args: &Value) -> Result<Value, String> {
 			return bad(&format!("items[{i}]: unknown key '{}' (it takes: name, mtime)", sanitize(k.as_ref())));
 		}
 		let dir = recipe.input.kind == tpfs_recipe::Kind::Dir;
-		items.push(tpfs_recipe::Item { path: roots[0].join(name), dir, mtime });
+		items.push(tpfs_recipe::Item::new(roots[0].join(name), dir, mtime));
 	}
 	let values = match obj.get("values") {
 		None | Some(Value::Null) => tpfs_recipe::Values::default(),
-		Some(Value::Object(o)) => tpfs_recipe::Values(o.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+		Some(Value::Object(o)) => o.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
 		Some(_) => return bad("'values' is an object: field name → value"),
 	};
 	match tpfs_recipe::expand(&recipe, &roots, &items, &values, today, &|_| false) {

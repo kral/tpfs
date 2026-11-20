@@ -460,7 +460,9 @@ fn recipes_are_listed_rejected_and_run() {
 	assert!(String::from_utf8_lossy(&o.stdout).contains("No recipes"));
 	let inbox = tpfs_mcp::RecipeStore::new(&home);
 	let a = inbox.put(&recipe, "test-agent", "for the holiday").unwrap();
-	let b = inbox.put(&recipe, "test-agent", "").unwrap();
+	let mut newer = recipe.clone();
+	newer.version += 1;
+	let b = inbox.put(&newer, "test-agent", "").unwrap();
 	let out = String::from_utf8_lossy(&tpfs(&home, &["recipes"]).stdout).into_owned();
 	assert!(out.contains(&a.id) && out.contains("test-agent") && out.contains("for the holiday"), "{out}");
 
@@ -494,16 +496,76 @@ fn recipes_are_listed_rejected_and_run() {
 	let out = String::from_utf8_lossy(&o.stdout).into_owned();
 	assert!(out.contains("kyjovice_c._2.jpg") && out.contains("new to you"), "{out}");
 	let digest = out.lines().find_map(|l| l.strip_prefix("Digest: ")).unwrap().to_owned();
+	// During its first runs a recipe needs a typed yes, even with the digest.
+	let o = run(&["--set", "place=Kyjovice č. 2", "--approve", &digest]);
+	assert_eq!(code(&o), 4, "{}", String::from_utf8_lossy(&o.stderr));
+	let shelf = tpfs_mcp::InstalledRecipes::new(&home);
+	for _ in 0..3 {
+		shelf.record_run("photos-by-date").unwrap();
+	}
 	let o = run(&["--set", "place=Kyjovice č. 2", "--approve", &digest]);
 	assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
 	assert!(!root.join("IMG_1.JPG").exists());
 	let renamed: Vec<_> = fs::read_dir(&root).unwrap().filter_map(|e| e.ok()?.file_name().into_string().ok()).collect();
 	assert!(renamed.iter().any(|n| n.ends_with("_kyjovice_c._2.jpg")), "{renamed:?}");
-	assert_eq!(tpfs_mcp::InstalledRecipes::new(&home).get("photos-by-date").unwrap().runs, 1);
+	assert_eq!(shelf.get("photos-by-date").unwrap().runs, 4);
 	// The run is an ordinary batch: undo puts the name back.
 	let batch = newest_batch(&home).unwrap();
 	assert_eq!(code(&tpfs(&home, &["undo", "--approve", &batch])), 0);
 	assert!(root.join("IMG_1.JPG").exists());
 	assert_eq!(code(&tpfs(&home, &["recipe", "remove", "photos-by-date"])), 0);
 	assert_eq!(code(&tpfs(&home, &["recipe", "run", "photos-by-date", img])), 2);
+}
+
+/// A recipe for a whole drive is refused at install; `show` of an unknown id says so plainly.
+#[test]
+fn a_recipe_for_a_whole_drive_is_not_installed() {
+	let tmp = tempfile::TempDir::new().unwrap();
+	let home = tpfs_core::canonicalize(tmp.path()).unwrap().join("home");
+	let mut json: serde_json::Value =
+		serde_json::from_str(include_str!("../../tpfs-recipe/examples/photos-by-date.json")).unwrap();
+	json["scope"]["roots"] = serde_json::json!(["/"]);
+	let p = tpfs_mcp::RecipeStore::new(&home).put(&tpfs_recipe::from_value(json).unwrap(), "agent", "").unwrap();
+	let o = tpfs(&home, &["recipe", "install", &p.id]);
+	assert_eq!(code(&o), 1);
+	assert!(String::from_utf8_lossy(&o.stderr).contains("whole drive"), "{}", String::from_utf8_lossy(&o.stderr));
+	let o = tpfs(&home, &["recipe", "show", "nonexistent"]);
+	assert!(
+		String::from_utf8_lossy(&o.stderr).contains("no recipe or proposal"),
+		"{}",
+		String::from_utf8_lossy(&o.stderr)
+	);
+}
+
+/// A run whose target folder is a link out of the recipe's folders is refused by validation, and
+/// nothing appears outside.
+#[cfg(unix)]
+#[test]
+fn a_recipe_run_through_a_link_out_of_its_folders_is_refused() {
+	let tmp = tempfile::TempDir::new().unwrap();
+	let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+	let (root, outside, home) = (base.join("root"), base.join("outside"), base.join("home"));
+	fs::create_dir_all(&root).unwrap();
+	fs::create_dir_all(&outside).unwrap();
+	std::os::unix::fs::symlink(&outside, root.join("out")).unwrap();
+	fs::write(root.join("a.pdf"), "a").unwrap();
+	let recipe = tpfs_recipe::from_value(serde_json::json!({
+		"format": "tpfs-recipe/1", "id": "file-it", "version": 1, "title": "File it",
+		"scope": { "roots": [root] },
+		"input": { "kind": "file" },
+		"form": { "type": "object", "properties": { "target": { "type": "string", "format": "x-tpfs-dir" } }, "required": ["target"] },
+		"action": { "op": "move", "to": "{form.target}/{item.name}" }
+	}))
+	.unwrap();
+	let shelf = tpfs_mcp::InstalledRecipes::new(&home);
+	shelf.install(&recipe, &recipe.hash(), std::slice::from_ref(&root)).unwrap();
+	for _ in 0..3 {
+		shelf.record_run("file-it").unwrap();
+	}
+	let target = format!("target={}", root.join("out").display());
+	let a = root.join("a.pdf");
+	let o = tpfs(&home, &["recipe", "run", "file-it", a.to_str().unwrap(), "--set", &target, "--approve", "x"]);
+	assert_eq!(code(&o), 3, "refused by validation, before any approval: {}", String::from_utf8_lossy(&o.stdout));
+	assert!(a.exists());
+	assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "something reached the folder outside");
 }
