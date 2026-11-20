@@ -155,16 +155,12 @@ fn walk(
 	// exact name would plan a copy onto an existing file. They are reported, not synced.
 	// Folded names of each side, built once (lookups stay logarithmic for big folders).
 	let fold = |m: &BTreeMap<std::ffi::OsString, Meta>| -> std::collections::BTreeSet<String> {
-		if CASE_INSENSITIVE {
-			m.keys().map(|k| k.to_string_lossy().to_lowercase()).collect()
-		} else {
-			Default::default()
-		}
+		if CASE_INSENSITIVE { m.keys().map(|k| name_key(k)).collect() } else { Default::default() }
 	};
 	let (lf, rf) = (fold(&l), fold(&r));
 	if CASE_INSENSITIVE {
 		for name in l.keys().filter(|k| !r.contains_key(*k)) {
-			if rf.contains(&name.to_string_lossy().to_lowercase()) {
+			if rf.contains(&name_key(name)) {
 				out.items.push(Item {
 					rel: rel.join(name),
 					diff: Diff::CaseMismatch,
@@ -177,7 +173,7 @@ fn walk(
 	let case_twin = |name: &std::ffi::OsString,
 	                 other: &BTreeMap<std::ffi::OsString, Meta>,
 	                 folded: &std::collections::BTreeSet<String>| {
-		CASE_INSENSITIVE && !other.contains_key(name) && folded.contains(&name.to_string_lossy().to_lowercase())
+		CASE_INSENSITIVE && !other.contains_key(name) && folded.contains(&name_key(name))
 	};
 
 	let mut names: Vec<&std::ffi::OsString> = l.keys().chain(r.keys()).collect();
@@ -215,6 +211,13 @@ fn walk(
 
 /// Windows and macOS (by default) ignore letter case in file names.
 const CASE_INSENSITIVE: bool = cfg!(any(windows, target_vendor = "apple"));
+
+/// How the usual volumes of this system compare a name: letter case ignored, and on macOS
+/// composed and decomposed accents too (`é` = `e` + U+0301).
+fn name_key(name: &std::ffi::OsStr) -> String {
+	let lower = name.to_string_lossy().to_lowercase();
+	if cfg!(target_vendor = "apple") { crate::path::nfd(&lower) } else { lower }
+}
 
 fn file_diff(a: &Meta, b: &Meta) -> Diff {
 	let tol = MTIME_TOLERANCE.as_millis() as u64;

@@ -92,11 +92,18 @@ A valid proposal returns:
 }
 ```
 
-Calling `apply_plan` before you approved returns an error the agent can act on:
+When `apply_plan` cannot run a plan, its error carries a `status` and a `next` step, so an agent
+does not have to read the sentence: `not_approved` (wait, then call again), `rejected` (ask the
+user what to change; do not propose the same plan again), `unknown` (applied already or never
+proposed) or `modified` (the stored plan was changed; propose it again). Calling `apply_plan`
+before you approved returns:
 
 ```json
 {
-  "error": "not approved yet. Ask the user to run `tpfs approve 18e97dcdaead317b5f2 --home /home/you/.local/state/tpfs` in a terminal, then call apply_plan again."
+  "error": "not approved yet. Ask the user to run `tpfs approve 18e97dcdaead317b5f2 --home /home/you/.local/state/tpfs` in a terminal, then call apply_plan again.",
+  "next": "Wait for the user's decision, then call apply_plan again. Do not propose the plan again meanwhile.",
+  "planId": "18e97dcdaead317b5f2",
+  "status": "not_approved"
 }
 ```
 
@@ -143,7 +150,10 @@ The agent then gets this from `apply_plan`:
 
 ```json
 {
-  "error": "plan '18e97dd0cbba59e268b' was rejected by the user"
+  "error": "plan '18e97dd0cbba59e268b' was rejected by the user",
+  "next": "Do not propose the same plan again. Ask the user what to change, then propose a new plan.",
+  "planId": "18e97dd0cbba59e268b",
+  "status": "rejected"
 }
 ```
 

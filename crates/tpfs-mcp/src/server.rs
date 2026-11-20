@@ -225,8 +225,8 @@ impl Server {
 		Ok(match outcome {
 			// An invalid plan is reported as a tool error so every client shows it to the model.
 			Ok(v) => {
-				let invalid = v.get("valid") == Some(&Value::Bool(false));
-				tool_result(&v, invalid)
+				let failed = v.get("valid") == Some(&Value::Bool(false)) || v.get("error").is_some();
+				tool_result(&v, failed)
 			}
 			Err(e) => tool_result(&json!({ "error": e }), true),
 		})
@@ -343,22 +343,48 @@ impl Server {
 			Some(_) => return Err("'planId' must be the string id returned by propose_plan".into()),
 			None => return Err("'planId' is required".into()),
 		};
-		let pending = self.store.get(id).map_err(|e| e.to_string())?;
+		// Outcomes an agent acts on carry a `status` and a `next` step, not only a sentence.
+		let refused = |status: &str, error: String, next: &str| {
+			Ok(json!({ "planId": id, "status": status, "error": error, "next": next }))
+		};
+		if self.store.was_rejected(id) {
+			self.store.remove(id).ok();
+			return refused(
+				"rejected",
+				format!("plan '{id}' was rejected by the user"),
+				"Do not propose the same plan again. Ask the user what to change, then propose a new plan.",
+			);
+		}
+		let pending = match self.store.get(id) {
+			Ok(p) => p,
+			Err(e) if e.kind() == io::ErrorKind::NotFound => {
+				return refused(
+					"unknown",
+					e.to_string(),
+					"Check history: it may have been applied already. Otherwise propose the plan again.",
+				);
+			}
+			Err(e) => return Err(e.to_string()),
+		};
 
 		if pending.plan.digest() != pending.digest {
 			self.store.remove(id).ok();
-			return Err("the stored plan was modified after it was proposed; propose it again".into());
-		}
-		if self.store.was_rejected(id) {
-			self.store.remove(id).ok();
-			return Err(format!("plan '{id}' was rejected by the user"));
+			return refused(
+				"modified",
+				"the stored plan was modified after it was proposed".into(),
+				"Propose the plan again.",
+			);
 		}
 		if self.config.approval == Approval::Terminal && !self.store.is_approved(&pending) {
-			return Err(format!(
-				"not approved yet. Ask the user to run `{}` in a terminal{}, then call apply_plan again.",
-				self.approve_command(id),
-				SHELL
-			));
+			return refused(
+				"not_approved",
+				format!(
+					"not approved yet. Ask the user to run `{}` in a terminal{}, then call apply_plan again.",
+					self.approve_command(id),
+					SHELL
+				),
+				"Wait for the user's decision, then call apply_plan again. Do not propose the plan again meanwhile.",
+			);
 		}
 
 		let mut journal = self.journal()?;
@@ -499,7 +525,7 @@ fn tools() -> Value {
 		},
 		{
 			"name": "apply_plan",
-			"description": "Execute a proposed plan after the user approved it. In terminal mode the user approves with `tpfs approve <planId>`; until then this returns 'not approved yet' and you may call it again later. Fails if the plan was modified. A plan can be applied once; if execution fails it is used up and must be proposed again.",
+			"description": "Execute a proposed plan after the user approved it. In terminal mode the user approves with `tpfs approve <planId>`. When it cannot run, the error carries a status and a next step: not_approved (wait and call again later), rejected (the user said no: ask what to change; do not propose the same plan), unknown (applied already or never proposed: see history), modified (propose again). A plan can be applied once; if execution fails it is used up and must be proposed again.",
 			"inputSchema": {
 				"type": "object",
 				"properties": { "planId": { "type": "string", "description": "The planId returned by propose_plan." } },

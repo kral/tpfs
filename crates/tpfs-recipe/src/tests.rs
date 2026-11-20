@@ -382,6 +382,14 @@ fn stop_refuses_and_lists_every_collision() {
 }
 
 #[test]
+fn composed_and_decomposed_names_collide() {
+	let mut v = base("{form.target}/{item.name}");
+	v["action"]["on_conflict"] = json!("number");
+	let plan = run(&recipe(v), &[item("/data/a/Café"), item("/data/b/Cafe\u{301}")], &values("x")).unwrap();
+	assert_eq!(targets(&plan), ["/data/out/Café", "/data/out/Cafe\u{301}_2"], "one name, spelled two ways");
+}
+
+#[test]
 fn another_selected_entry_counts_as_taken() {
 	let mut v = base("{form.label}");
 	v["action"]["op"] = json!("rename");

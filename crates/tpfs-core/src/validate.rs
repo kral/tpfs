@@ -77,7 +77,8 @@ pub fn is_own_name(name: &std::ffi::OsStr) -> bool {
 /// spelling of tpfs's own names: lower case; the letters whose case folding is plain ASCII (`ſ`,
 /// the Kelvin sign, the `ﬀ`…`ﬆ` ligatures) folded; and trailing dots and spaces dropped, which
 /// Windows and the FAT/exFAT drivers ignore; and the invisible characters HFS+ ignores in names
-/// (zero-width and direction marks, soft hyphen) dropped. Not full Unicode folding or normalisation: the
+/// (zero-width and direction marks, soft hyphen) dropped; and accented Latin, Greek and Cyrillic
+/// letters decomposed ([`crate::nfd`]), as macOS compares them. Not full Unicode case folding: the
 /// protected names themselves are ASCII, apart from a user's own folder names.
 fn fold(name: &str) -> String {
 	let mut out = String::with_capacity(name.len());
@@ -100,6 +101,9 @@ fn fold(name: &str) -> String {
 			c => out.push(c),
 		}
 	}
+	// Composed and decomposed accents are one name where a volume treats them so (macOS);
+	// over-matching elsewhere only refuses more.
+	let mut out = crate::path::nfd(&out);
 	let kept = out.trim_end_matches(['.', ' ']).len();
 	// "." and ".." stay what they are.
 	if kept > 0 && !matches!(out.as_str(), "." | "..") {
@@ -785,5 +789,22 @@ mod tests {
 			let issues = v.validate(&crate::Plan::new(vec![op.clone()], ""));
 			assert!(issues.iter().any(|i| i.message.contains("mount point")), "{op}: {issues:?}");
 		}
+	}
+}
+
+#[cfg(test)]
+mod fold_tests {
+	use super::*;
+
+	/// tpfs's state is protected under any spelling a lenient volume treats as the same.
+	#[test]
+	fn protected_paths_match_other_spellings() {
+		let state = Path::new("/home/u/Účetnictví/.tpfs");
+		for other in
+			["/home/u/U\u{301}c\u{30c}etnictvi\u{301}/.tpfs", "/home/u/ÚČETNICTVÍ/.TPFS", "/home/u/Účetnictví./.tpfs"]
+		{
+			assert!(within(Path::new(other), state), "{other}");
+		}
+		assert!(!within(Path::new("/home/u/Ucetnictvi/.tpfs"), state), "accents still count");
 	}
 }

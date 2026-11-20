@@ -577,3 +577,18 @@ fn proposed_recipes_wait_for_the_person_and_report_their_status() {
 	let (v, err) = f.tool("recipe_propose", json!({ "recipe": sixth, "note": "x".repeat(301) }));
 	assert!(err && v["error"].as_str().unwrap().contains("note"), "{v}");
 }
+
+/// apply_plan's refusals carry a status an agent can act on, and a next step.
+#[test]
+fn apply_plan_refusals_have_a_status() {
+	let mut f = Fixture::new(Approval::Terminal);
+	let id = f.propose(json!({ "reason": "make", "ops": [{ "op": "mkdir", "path": f.root.join("n") }] }));
+	let (v, err) = f.tool("apply_plan", json!({ "planId": id }));
+	assert!(err && v["status"] == "not_approved" && v["next"].is_string(), "{v}");
+	f.server.store().reject(&id).unwrap();
+	let (v, err) = f.tool("apply_plan", json!({ "planId": id }));
+	assert!(err && v["status"] == "rejected" && v["error"].as_str().unwrap().contains("rejected by the user"), "{v}");
+	let (v, err) = f.tool("apply_plan", json!({ "planId": "abc123" }));
+	assert!(err && v["status"] == "unknown", "{v}");
+	assert!(!f.root.join("n").exists());
+}

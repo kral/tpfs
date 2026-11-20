@@ -112,7 +112,10 @@ If the agent tries `apply_plan` now, it is told to wait:
 
 ```json
 {
-  "error": "not approved yet. Ask the user to run `tpfs approve 18e97e4e998f5b2f2e6 --home /home/you/.local/state/tpfs` in a terminal, then call apply_plan again."
+  "error": "not approved yet. Ask the user to run `tpfs approve 18e97e4e998f5b2f2e6 --home /home/you/.local/state/tpfs` in a terminal, then call apply_plan again.",
+  "next": "Wait for the user's decision, then call apply_plan again. Do not propose the plan again meanwhile.",
+  "planId": "18e97e4e998f5b2f2e6",
+  "status": "not_approved"
 }
 ```
 
@@ -210,7 +213,10 @@ The agent's next `apply_plan` then fails:
 
 ```json
 {
-  "error": "plan '18e97e4ec04e62e6309' was rejected by the user"
+  "error": "plan '18e97e4ec04e62e6309' was rejected by the user",
+  "next": "Do not propose the same plan again. Ask the user what to change, then propose a new plan.",
+  "planId": "18e97e4ec04e62e6309",
+  "status": "rejected"
 }
 ```
 

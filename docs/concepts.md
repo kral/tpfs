@@ -287,7 +287,9 @@ tpfs keeps its own data in one private folder:
 | `journal.lock` | held by the tpfs process using the journal |
 | `journal-archive.jsonl` | [archived history](#archived-history) |
 | `trash/` | the [trash](#the-trash) |
-| `pending/` | plans proposed by agents (`<id>.json`) and approvals (`<id>.approved`) |
+| `pending/` | plans proposed by agents (`<id>.json`), approvals (`<id>.approved`) and rejections (`<id>.rejected`, kept for a day) |
+| `pending-recipes/` | [recipes](recipes.md) proposed by agents, and the decisions on them |
+| `recipes/` | installed recipes |
 
 tpfs picks the folder in this order:
 
@@ -298,13 +300,17 @@ tpfs picks the folder in this order:
 5. `~/.local/state/tpfs`.
 
 `tpfs log` prints the folder it uses on its first line. On Unix the folder is created with
-permissions `0700`, and tpfs refuses a state folder that others can use:
+permissions `0700`. On Windows it must lie inside your user profile, and tpfs gives it its own
+protected access list: full control for you and for SYSTEM only, inherited by everything inside it,
+whatever the folders above allow. tpfs refuses a state folder that others can use:
 
 ```text
 tpfs log: refusing to use /home/you/shared: it must be a real folder owned by you that only you can use (chmod 700)
 ```
 
-No plan can read, change or contain the state folder:
+No plan can read, change or contain the state folder, under any spelling a lenient volume treats
+as the same name: another letter case, a trailing dot, or accents composed (`é`) or decomposed
+(`e` + U+0301, as macOS stores them). Decomposition covers Latin, Greek and Cyrillic letters:
 
 ```text
 #1: /home/you/.local contains tpfs's state (/home/you/.local/state/tpfs); leave it out of the plan.

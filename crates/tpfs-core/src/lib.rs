@@ -16,6 +16,7 @@ mod op;
 mod path;
 pub mod risk;
 pub mod sync;
+mod unicode;
 mod validate;
 
 pub use display::sanitize;
@@ -23,5 +24,5 @@ pub use executor::{BatchReport, ExecError, Executor, Phase, RecoveryReport, Sour
 pub use fsops::{Listed, list_confined};
 pub use journal::{BatchStatus, BatchView, Entry, Journal, KEEP_COMMITTED, Step};
 pub use op::{Op, Plan};
-pub use path::{canonicalize, check_private_file, normalize, private_dir, share_root, system_roots};
+pub use path::{canonicalize, check_private_file, nfd, normalize, private_dir, share_root, system_roots};
 pub use validate::{Issue, MAX_DEPTH, MAX_OPS, MAX_PATH, MAX_REASON, Validator, is_own_name};

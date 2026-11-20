@@ -117,7 +117,8 @@ uses must be listed in `required`.
   - `number` appends `_2`, `_3` … before the extension;
   - `stop` refuses the run and lists every collision.
 
-  Names are compared with letter case ignored.
+  Names are compared with letter case ignored, and an accented letter typed composed (`é`) or
+  decomposed (`e` + a combining accent) counts as one name.
 - **Determinism.** The same recipe, selection and values give the same plan, byte for byte, so
   the plan also has the same digest.
 

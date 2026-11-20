@@ -24,6 +24,35 @@ pub fn normalize(path: &Path) -> Option<PathBuf> {
 	Some(out)
 }
 
+/// `s` in canonical decomposition (NFD) for Latin, Greek and Cyrillic letters: `é` (U+00E9) and
+/// `e` + U+0301 give the same string, as macOS file systems treat them. Other scripts pass through
+/// unchanged. Combining marks are put in canonical order.
+pub fn nfd(s: &str) -> String {
+	use crate::unicode::{COMBINING, DECOMPOSE};
+	let mut out: Vec<char> = Vec::with_capacity(s.len());
+	for c in s.chars() {
+		match DECOMPOSE.binary_search_by_key(&c, |(k, _)| *k) {
+			Ok(i) => out.extend(DECOMPOSE[i].1.chars()),
+			Err(_) => out.push(c),
+		}
+	}
+	let class = |c: char| COMBINING.binary_search_by_key(&c, |(k, _)| *k).map_or(0, |i| COMBINING[i].1);
+	// Canonical ordering: a stable sort of each run of combining marks by their class.
+	let mut i = 0;
+	while i < out.len() {
+		if class(out[i]) == 0 {
+			i += 1;
+			continue;
+		}
+		let start = i;
+		while i < out.len() && class(out[i]) != 0 {
+			i += 1;
+		}
+		out[start..i].sort_by_key(|c| class(*c));
+	}
+	out.into_iter().collect()
+}
+
 /// `fs::canonicalize` without the Windows verbatim prefix: `\\?\C:\x` becomes `C:\x` and
 /// `\\?\UNC\srv\share` becomes `\\srv\share`, the form users type, see and that other paths
 /// are compared against. Elsewhere this is plain `fs::canonicalize`.
@@ -159,7 +188,182 @@ pub fn private_dir(dir: &Path) -> io::Result<()> {
 				),
 			));
 		}
+		// And its own access list, protected from the profile's: only this user (and the system)
+		// may use it, whatever the folders above allow. Files created inside inherit it.
+		acl::make_private(dir).map_err(|e| {
+			io::Error::new(io::ErrorKind::PermissionDenied, format!("cannot make {} private: {e}", dir.display()))
+		})
+	}
+}
+
+/// The Windows counterpart of mode 0700: a protected access list granting full control to the
+/// current user and to SYSTEM only, inherited by everything inside.
+#[cfg(windows)]
+pub(crate) mod acl {
+	use std::{io, os::windows::ffi::OsStrExt, path::Path, ptr};
+
+	use windows_sys::Win32::{
+		Foundation::{CloseHandle, HANDLE, LocalFree},
+		Security::{
+			ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation, AddAccessAllowedAceEx,
+			Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW},
+			CONTAINER_INHERIT_ACE, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+			GetLengthSid, GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl, OBJECT_INHERIT_ACE,
+			PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+			TokenUser, WinLocalSystemSid,
+		},
+		Storage::FileSystem::FILE_ALL_ACCESS,
+		System::Threading::{GetCurrentProcess, OpenProcessToken},
+	};
+
+	fn wide(p: &Path) -> Vec<u16> {
+		p.as_os_str().encode_wide().chain(Some(0)).collect()
+	}
+
+	/// The current user's SID, in a buffer that keeps it alive.
+	fn user_sid() -> io::Result<Vec<u64>> {
+		// SAFETY: the token handle is closed below; buffers are sized as the system asks.
+		unsafe {
+			let mut token: HANDLE = ptr::null_mut();
+			if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+				return Err(io::Error::last_os_error());
+			}
+			let mut len = 0u32;
+			GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut len);
+			let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+			let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len);
+			CloseHandle(token);
+			if ok == 0 {
+				return Err(io::Error::last_os_error());
+			}
+			Ok(buf)
+		}
+	}
+
+	fn sid_of_user(buf: &[u64]) -> *mut core::ffi::c_void {
+		// SAFETY: `buf` holds a TOKEN_USER filled by GetTokenInformation.
+		unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+	}
+
+	fn system_sid() -> io::Result<Vec<u64>> {
+		let mut size = 68u32; // SECURITY_MAX_SID_SIZE
+		let mut buf = vec![0u64; 9];
+		// SAFETY: `buf` has room for `size` bytes.
+		if unsafe { CreateWellKnownSid(WinLocalSystemSid, ptr::null_mut(), buf.as_mut_ptr().cast(), &mut size) } == 0 {
+			return Err(io::Error::last_os_error());
+		}
+		Ok(buf)
+	}
+
+	/// Whether `dir` already has exactly the private access list (so it is not rewritten, which
+	/// would walk everything inside).
+	pub(crate) fn is_private(dir: &Path) -> io::Result<bool> {
+		let user = user_sid()?;
+		let system = system_sid()?;
+		let name = wide(dir);
+		// SAFETY: the descriptor is freed with LocalFree; the ACL points into it.
+		unsafe {
+			let mut dacl: *mut ACL = ptr::null_mut();
+			let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+			let err = GetNamedSecurityInfoW(
+				name.as_ptr() as _,
+				SE_FILE_OBJECT,
+				DACL_SECURITY_INFORMATION,
+				ptr::null_mut(),
+				ptr::null_mut(),
+				&mut dacl,
+				ptr::null_mut(),
+				&mut sd,
+			);
+			if err != 0 {
+				return Err(io::Error::from_raw_os_error(err as i32));
+			}
+			let mut control = 0u16;
+			let mut revision = 0u32;
+			let mut ok = !dacl.is_null()
+				&& GetSecurityDescriptorControl(sd, &mut control, &mut revision) != 0
+				&& control & SE_DACL_PROTECTED != 0;
+			if ok {
+				let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+				ok = GetAclInformation(
+					dacl,
+					(&raw mut info).cast(),
+					std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+					AclSizeInformation,
+				) != 0 && info.AceCount == 2;
+				for i in 0..2 {
+					let mut ace: *mut core::ffi::c_void = ptr::null_mut();
+					ok = ok && GetAce(dacl, i, &mut ace) != 0 && {
+						let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
+						let sid = (&raw mut (*ace).SidStart).cast::<core::ffi::c_void>();
+						(*ace).Header.AceType == 0 // ACCESS_ALLOWED_ACE_TYPE
+							&& (EqualSid(sid, sid_of_user(&user)) != 0 || EqualSid(sid, system.as_ptr() as _) != 0)
+					};
+				}
+			}
+			LocalFree(sd as _);
+			Ok(ok)
+		}
+	}
+
+	pub(crate) fn make_private(dir: &Path) -> io::Result<()> {
+		if is_private(dir)? {
+			return Ok(());
+		}
+		let user = user_sid()?;
+		let system = system_sid()?;
+		let sids = [sid_of_user(&user), system.as_ptr() as *mut core::ffi::c_void];
+		// SAFETY: the ACL buffer is sized for both entries; the SIDs outlive the calls.
+		unsafe {
+			let entry = std::mem::size_of::<ACCESS_ALLOWED_ACE>() - std::mem::size_of::<u32>();
+			let size =
+				std::mem::size_of::<ACL>() + sids.iter().map(|s| entry + GetLengthSid(*s) as usize).sum::<usize>();
+			let mut buf = vec![0u64; size.div_ceil(8)];
+			let acl = buf.as_mut_ptr().cast::<ACL>();
+			if InitializeAcl(acl, size as u32, ACL_REVISION) == 0 {
+				return Err(io::Error::last_os_error());
+			}
+			for sid in sids {
+				if AddAccessAllowedAceEx(
+					acl,
+					ACL_REVISION,
+					OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+					FILE_ALL_ACCESS,
+					sid,
+				) == 0
+				{
+					return Err(io::Error::last_os_error());
+				}
+			}
+			let name = wide(dir);
+			let err = SetNamedSecurityInfoW(
+				name.as_ptr() as _,
+				SE_FILE_OBJECT,
+				DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+				ptr::null_mut(),
+				ptr::null_mut(),
+				acl,
+				ptr::null(),
+			);
+			if err != 0 {
+				return Err(io::Error::from_raw_os_error(err as i32));
+			}
+		}
 		Ok(())
+	}
+
+	#[cfg(test)]
+	mod tests {
+		#[test]
+		fn the_state_folder_gets_a_private_access_list() {
+			let tmp = tempfile::TempDir::new().unwrap();
+			let dir = tmp.path().join("state");
+			crate::private_dir(&dir).unwrap();
+			assert!(super::is_private(&dir).unwrap());
+			crate::private_dir(&dir).unwrap(); // already private: left as it is
+			std::fs::write(dir.join("f"), "x").unwrap();
+			std::fs::read(dir.join("f")).unwrap();
+		}
 	}
 }
 
@@ -274,5 +478,21 @@ mod tests {
 		// No drive: rooted but not absolute on Windows.
 		assert_eq!(normalize(Path::new(r"\a\b")), None);
 		assert_eq!(normalize(Path::new("relative")), None);
+	}
+}
+
+#[cfg(test)]
+mod nfd_tests {
+	use super::nfd;
+
+	#[test]
+	fn composed_and_decomposed_names_are_one() {
+		assert_eq!(nfd("Účetnictví"), nfd("U\u{301}c\u{30c}etnictvi\u{301}"));
+		assert_eq!(nfd("Café Müller"), "Cafe\u{301} Mu\u{308}ller");
+		assert_eq!(nfd("ǖ"), "u\u{308}\u{304}", "decomposed fully");
+		assert_eq!(nfd("q\u{307}\u{323}"), nfd("q\u{323}\u{307}"), "marks in canonical order");
+		assert_eq!(nfd("Ἀθῆναι Москва́"), nfd("Ἀθῆναι Москва\u{301}"));
+		assert_eq!(nfd("plain.txt"), "plain.txt");
+		assert_ne!(nfd("é"), nfd("e"));
 	}
 }
