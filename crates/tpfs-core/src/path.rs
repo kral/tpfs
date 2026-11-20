@@ -285,12 +285,13 @@ pub(crate) mod acl {
 				&& control & SE_DACL_PROTECTED != 0;
 			if ok {
 				let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
-				ok = GetAclInformation(
+				let got = GetAclInformation(
 					dacl,
 					(&raw mut info).cast(),
 					std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
 					AclSizeInformation,
-				) != 0 && info.AceCount == 2;
+				);
+				ok = got != 0 && info.AceCount == 2;
 				for i in 0..2 {
 					let mut ace: *mut core::ffi::c_void = ptr::null_mut();
 					ok = ok && GetAce(dacl, i, &mut ace) != 0 && {
