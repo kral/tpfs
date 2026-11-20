@@ -7,7 +7,7 @@ use std::{
 use serde_json::{Value, json};
 use tpfs_core::{BatchStatus, Executor, Journal, Plan, Source, Validator, risk, sanitize};
 
-use crate::store::Store;
+use crate::{recipes::RecipeStore, store::Store};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -44,17 +44,25 @@ pub struct Server {
 	config: Config,
 	validator: Validator,
 	store: Store,
+	recipes: RecipeStore,
+	/// The client's name for itself, from `initialize` (not verified).
+	client: String,
 }
 
 impl Server {
 	pub fn new(config: Config) -> io::Result<Self> {
 		let validator = Validator::new(&config.roots)?.with_protected([&config.state]);
 		let store = Store::new(&config.state);
-		Ok(Self { config, validator, store })
+		let recipes = RecipeStore::new(&config.state);
+		Ok(Self { config, validator, store, recipes, client: String::new() })
 	}
 
 	pub fn store(&self) -> &Store {
 		&self.store
+	}
+
+	pub fn recipes(&self) -> &RecipeStore {
+		&self.recipes
 	}
 
 	/// Serve newline-delimited JSON-RPC until the input closes. Nothing but protocol goes to `output`.
@@ -143,7 +151,9 @@ impl Server {
 		format!("tpfs approve {id} --home {home}")
 	}
 
-	fn initialize(&self, params: &Value) -> Value {
+	fn initialize(&mut self, params: &Value) -> Value {
+		let name = params.pointer("/clientInfo/name").and_then(Value::as_str).unwrap_or("unknown");
+		self.client = sanitize(name.chars().take(64).collect::<String>().as_ref());
 		let asked = params.get("protocolVersion").and_then(Value::as_str);
 		let version = asked.filter(|v| SUPPORTED_VERSIONS.contains(v)).unwrap_or(PROTOCOL_VERSION);
 		let roots: Vec<String> = self.validator.roots().iter().map(|r| show(r)).collect();
@@ -164,7 +174,9 @@ impl Server {
 			"instructions": format!(
 				"Safe, undoable file operations. You cannot change files directly: describe the change as a plan \
 				 with propose_plan, show the user the returned preview and risk, and wait for their approval. {approval} \
-				 Nothing is ever overwritten or deleted permanently ('trash' is undoable). Allowed folders: {}.",
+				 Nothing is ever overwritten or deleted permanently ('trash' is undoable). Allowed folders: {}. \
+				 For a task the user repeats, you can propose a recipe (recipe_schema, recipe_validate, recipe_propose): \
+				 the user installs it in their commander and runs it on their own selection, without you.",
 				roots.join(", ")
 			),
 		})
@@ -181,7 +193,10 @@ impl Server {
 			"list_directory" => &["path", "limit"],
 			"propose_plan" => &["plan"],
 			"apply_plan" => &["planId"],
-			"undo_last" | "history" => &[],
+			"undo_last" | "history" | "recipe_schema" => &[],
+			"recipe_validate" => &["recipe", "sample"],
+			"recipe_propose" => &["recipe", "note"],
+			"recipe_status" => &["id"],
 			_ => return Err((-32602, format!("unknown tool: {name}"))),
 		};
 		let Some(obj) = args.as_object() else {
@@ -201,6 +216,10 @@ impl Server {
 			"apply_plan" => self.apply_plan(&args),
 			"undo_last" => self.undo_last(),
 			"history" => self.history(),
+			"recipe_schema" => Ok(recipe_schema()),
+			"recipe_validate" => recipe_validate(&args),
+			"recipe_propose" => self.recipe_propose(&args),
+			"recipe_status" => self.recipe_status(&args),
 			_ => return Err((-32602, format!("unknown tool: {name}"))),
 		};
 		Ok(match outcome {
@@ -395,6 +414,34 @@ impl Server {
 	}
 
 	/// The journal is opened per call, so `tpfs undo` and friends keep working while the server runs.
+	fn recipe_propose(&mut self, args: &Value) -> Result<Value, String> {
+		let note = match args.get("note") {
+			None | Some(Value::Null) => "",
+			Some(Value::String(n)) => n.as_str(),
+			Some(_) => return Err("'note' must be a string".into()),
+		};
+		if note.chars().count() > 300 || note.chars().any(|c| c.is_control() && c != '\n') {
+			return Err("'note' is at most 300 characters of plain text".into());
+		}
+		let recipe = match tpfs_recipe::from_value(args.get("recipe").cloned().unwrap_or(Value::Null)) {
+			Ok(r) => r,
+			Err(errors) => return Ok(json!({ "valid": false, "errors": errors })),
+		};
+		let pending = self.recipes.put(&recipe, &self.client, note).map_err(|e| e.to_string())?;
+		Ok(json!({
+			"id": pending.id,
+			"status": "pending",
+			"next": "Tell the user a recipe is waiting in their commander (Agent recipes). They review and install it, or reject it; recipe_status tells you which. You never run it: the user does, on their own selection.",
+		}))
+	}
+
+	fn recipe_status(&self, args: &Value) -> Result<Value, String> {
+		let Some(id) = args.get("id").and_then(Value::as_str) else {
+			return Err("'id' is required: the id returned by recipe_propose".into());
+		};
+		Ok(json!({ "id": id, "status": self.recipes.status(id).as_str() }))
+	}
+
 	fn journal(&self) -> Result<Journal, String> {
 		Journal::open(self.config.state.join("journal.jsonl")).map_err(|e| e.to_string())
 	}
@@ -468,8 +515,166 @@ fn tools() -> Value {
 			"description": "Your recent batches (agent batches only): id, time (Unix seconds), status (committed, rolled back, undone, interrupted = ask the user to run `tpfs recover`, damaged = its journal records are unreadable; ask the user to check `tpfs log`, abandoned = the user gave up recovering it), number of steps, reason.",
 			"inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
 			"annotations": { "readOnlyHint": true, "openWorldHint": false }
+		},
+		{
+			"name": "recipe_schema",
+			"description": "The recipe format (tpfs-recipe/1): JSON Schema, a short guide and two examples. A recipe is a reusable command the user installs in their commander and runs on their own selection; you never run it.",
+			"inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+			"annotations": { "readOnlyHint": true, "openWorldHint": false }
+		},
+		{
+			"name": "recipe_validate",
+			"description": "Check a recipe without touching any file. With a sample (invented entry names, optional mtimes, and form values) it also returns the steps a run would produce. Errors carry the key they concern.",
+			"inputSchema": {
+				"type": "object",
+				"properties": {
+					"recipe": { "type": "object", "description": "The recipe (see recipe_schema)." },
+					"sample": {
+						"type": "object",
+						"properties": {
+							"items": { "type": "array", "minItems": 1, "maxItems": 20, "items": { "type": "object", "properties": { "name": { "type": "string" }, "mtime": { "type": "string", "description": "YYYY-MM-DD or YYYY-MM-DDTHH:MM" } }, "required": ["name"], "additionalProperties": false } },
+							"values": { "type": "object", "description": "Form field → value." }
+						},
+						"required": ["items"],
+						"additionalProperties": false
+					}
+				},
+				"required": ["recipe"],
+				"additionalProperties": false
+			},
+			"annotations": { "readOnlyHint": true, "openWorldHint": false }
+		},
+		{
+			"name": "recipe_propose",
+			"description": "Offer a recipe to the user. It waits in their commander until they install or reject it (at most 5 wait at once). Nothing runs: the user runs an installed recipe on their own selection.",
+			"inputSchema": {
+				"type": "object",
+				"properties": {
+					"recipe": { "type": "object", "description": "The recipe (see recipe_schema)." },
+					"note": { "type": "string", "maxLength": 300, "description": "Why you propose it, for the user." }
+				},
+				"required": ["recipe"],
+				"additionalProperties": false
+			},
+			"annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
+		},
+		{
+			"name": "recipe_status",
+			"description": "Whether a proposed recipe is pending, installed or rejected (unknown: never proposed, or decided over a month ago).",
+			"inputSchema": {
+				"type": "object",
+				"properties": { "id": { "type": "string", "description": "The id returned by recipe_propose." } },
+				"required": ["id"],
+				"additionalProperties": false
+			},
+			"annotations": { "readOnlyHint": true, "openWorldHint": false }
 		}
 	])
+}
+
+const RECIPE_GUIDE: &str = "A recipe is data only: a form the user fills in and a target template. \
+	The user runs it on entries they select; each run becomes an ordinary plan they review, and can undo. \
+	Template: {source[:format][|filter…]} between literal text, '/' between folders. Sources: item.name, item.stem, \
+	item.ext, item.mtime, today, n (position in the selection), form.<field>; {item.dir} or a folder field \
+	(format x-tpfs-dir) may start a move or copy target, otherwise it is the entry's own folder. Formats: %Y %m %d %H %M \
+	for dates, :0N (as :03) for n and integer fields. Filters: lower, trim, ascii (strips diacritics), slug (spaces and \
+	unsafe characters to _). A value never creates a folder ('/' in it becomes '_'). Missing folders are created; \
+	collisions are numbered (_2, _3 …) with on_conflict number, or stop the run. Every field the template uses must be \
+	required. Check with recipe_validate (with a sample of invented names) before recipe_propose.";
+
+fn recipe_schema() -> Value {
+	let examples: Vec<Value> = [
+		include_str!("../../tpfs-recipe/examples/receipts-to-accounting.json"),
+		include_str!("../../tpfs-recipe/examples/photos-by-date.json"),
+	]
+	.iter()
+	.filter_map(|e| serde_json::from_str(e).ok())
+	.collect();
+	json!({ "format": tpfs_recipe::FORMAT, "schema": tpfs_recipe::Recipe::schema(), "guide": RECIPE_GUIDE, "examples": examples })
+}
+
+/// Check a recipe, and expand it over invented entries: no disk access at all (every path is
+/// free, the scope is taken as written).
+fn recipe_validate(args: &Value) -> Result<Value, String> {
+	let recipe = match tpfs_recipe::from_value(args.get("recipe").cloned().unwrap_or(Value::Null)) {
+		Ok(r) => r,
+		Err(errors) => return Ok(json!({ "valid": false, "errors": errors })),
+	};
+	let summary = json!({ "id": recipe.id, "version": recipe.version, "title": recipe.title, "hash": recipe.hash() });
+	let sample = match args.get("sample") {
+		None | Some(Value::Null) => {
+			return Ok(
+				json!({ "valid": true, "recipe": summary, "next": "Pass a sample (invented names and form values) to see the target names." }),
+			);
+		}
+		Some(s) => s,
+	};
+	let bad = |m: &str| Err(format!("'sample': {m}"));
+	let Some(obj) = sample.as_object() else { return bad("must be an object {items, values}") };
+	if let Some(k) = obj.keys().find(|k| !matches!(k.as_str(), "items" | "values")) {
+		return bad(&format!("unknown key '{}' (it takes: items, values)", sanitize(k.as_ref())));
+	}
+	let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+		.map(PathBuf::from)
+		.unwrap_or_else(|| PathBuf::from(if cfg!(windows) { r"C:\Users\user" } else { "/home/user" }));
+	let roots = recipe.resolve_roots(&home);
+	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+	let today = tpfs_recipe::Stamp::from_unix(i64::try_from(now).unwrap_or(0)).unwrap_or(tpfs_recipe::Stamp {
+		year: 2026,
+		month: 1,
+		day: 1,
+		hour: 0,
+		minute: 0,
+	});
+	let list = match obj.get("items") {
+		Some(Value::Array(a)) if !a.is_empty() && a.len() <= 20 => a,
+		_ => return bad("'items' lists 1–20 invented entries {name, mtime}"),
+	};
+	let mut items = Vec::new();
+	for (i, it) in list.iter().enumerate() {
+		let name = it.get("name").and_then(Value::as_str).filter(|n| !n.is_empty() && !n.contains(['/', '\\']));
+		let Some(name) = name else { return bad(&format!("items[{i}].name must be a plain file name")) };
+		let mtime = match it.get("mtime") {
+			None => today,
+			Some(Value::String(m)) => match tpfs_recipe::Stamp::parse(m) {
+				Some(s) => s,
+				None => return bad(&format!("items[{i}].mtime is YYYY-MM-DD or YYYY-MM-DDTHH:MM")),
+			},
+			Some(_) => return bad(&format!("items[{i}].mtime is a string")),
+		};
+		if let Some(k) = it.as_object().and_then(|o| o.keys().find(|k| !matches!(k.as_str(), "name" | "mtime"))) {
+			return bad(&format!("items[{i}]: unknown key '{}' (it takes: name, mtime)", sanitize(k.as_ref())));
+		}
+		let dir = recipe.input.kind == tpfs_recipe::Kind::Dir;
+		items.push(tpfs_recipe::Item { path: roots[0].join(name), dir, mtime });
+	}
+	let values = match obj.get("values") {
+		None | Some(Value::Null) => tpfs_recipe::Values::default(),
+		Some(Value::Object(o)) => tpfs_recipe::Values(o.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+		Some(_) => return bad("'values' is an object: field name → value"),
+	};
+	match tpfs_recipe::expand(&recipe, &roots, &items, &values, today, &|_| false) {
+		Err(errors) => Ok(json!({ "valid": false, "recipe": summary, "errors": errors })),
+		Ok(plan) => {
+			let steps: Vec<Value> = plan
+				.ops
+				.iter()
+				.map(|op| match op {
+					tpfs_core::Op::Mkdir { path } => json!({ "mkdir": show(path) }),
+					tpfs_core::Op::Move { from, to } | tpfs_core::Op::Copy { from, to } => {
+						json!({ "from": show(from), "to": show(to) })
+					}
+					tpfs_core::Op::Rename { path, new_name } => {
+						json!({ "from": show(path), "newName": sanitize(new_name.as_ref()) })
+					}
+					_ => json!({}),
+				})
+				.collect();
+			Ok(
+				json!({ "valid": true, "recipe": summary, "reason": plan.reason, "steps": steps, "roots": roots.iter().map(|r| show(r)).collect::<Vec<_>>() }),
+			)
+		}
+	}
 }
 
 fn status_word(s: BatchStatus, damaged: bool) -> &'static str {

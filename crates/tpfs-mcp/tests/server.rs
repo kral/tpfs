@@ -56,7 +56,20 @@ fn handshake_and_tool_list() {
 	let tools = f.rpc("tools/list", json!({}));
 	let names: Vec<&str> =
 		tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-	assert_eq!(names, ["list_directory", "propose_plan", "apply_plan", "undo_last", "history"]);
+	assert_eq!(
+		names,
+		[
+			"list_directory",
+			"propose_plan",
+			"apply_plan",
+			"undo_last",
+			"history",
+			"recipe_schema",
+			"recipe_validate",
+			"recipe_propose",
+			"recipe_status"
+		]
+	);
 
 	// The plan schema's definitions are hoisted so that $ref pointers resolve from the root.
 	let propose = &tools["result"]["tools"][1]["inputSchema"];
@@ -474,4 +487,86 @@ fn deep_paths_are_refused_before_they_cost_time() {
 	}
 	let (v, err) = f.tool("propose_plan", json!({ "plan": { "ops": [{ "op": "mkdir", "path": p }] } }));
 	assert!(err && v.to_string().contains("folders deep"), "{v}");
+}
+
+fn photo_recipe(roots: Value) -> Value {
+	let mut r: Value = serde_json::from_str(include_str!("../../tpfs-recipe/examples/photos-by-date.json")).unwrap();
+	r["scope"]["roots"] = roots;
+	r
+}
+
+/// No tool can install or run a recipe, or read anything a run did: the agent's side ends at the inbox.
+#[test]
+fn no_tool_installs_or_runs_a_recipe() {
+	let mut f = Fixture::new(Approval::Terminal);
+	let tools = f.rpc("tools/list", json!({}));
+	for t in tools["result"]["tools"].as_array().unwrap() {
+		let name = t["name"].as_str().unwrap();
+		assert!(
+			!["install", "run", "apply", "approve"].iter().any(|w| name.starts_with("recipe") && name.contains(w)),
+			"{name}"
+		);
+	}
+	for name in ["recipe_install", "recipe_run", "recipe_apply", "recipe_list"] {
+		assert_eq!(f.rpc("tools/call", json!({ "name": name, "arguments": {} }))["error"]["code"], -32602, "{name}");
+	}
+	let (v, err) = f.tool("recipe_schema", json!({}));
+	assert!(!err && v["format"] == "tpfs-recipe/1" && v["examples"].as_array().unwrap().len() == 2, "{v}");
+}
+
+/// recipe_validate touches no file: its roots need not exist, and nothing is created anywhere.
+#[test]
+fn recipe_validate_touches_no_file() {
+	let mut f = Fixture::new(Approval::Terminal);
+	let missing = f.root.join("does-not-exist");
+	let recipe = photo_recipe(json!([missing]));
+	let sample = json!({ "items": [{ "name": "IMG_1.JPG", "mtime": "2026-07-01T09:30" }, { "name": "b.heic", "mtime": "2026-07-01T09:30" }], "values": { "place": "Kyjovice č. 2" } });
+	let (v, err) = f.tool("recipe_validate", json!({ "recipe": recipe, "sample": sample }));
+	assert!(!err, "{v}");
+	let names: Vec<_> = v["steps"].as_array().unwrap().iter().map(|s| s["newName"].as_str().unwrap()).collect();
+	assert_eq!(names, ["2026-07-01_0930_kyjovice_c._2.jpg", "2026-07-01_0930_kyjovice_c._2.heic"]);
+	assert!(!missing.exists());
+	assert!(!f.state.exists(), "validating wrote state");
+	assert_eq!(fs::read_dir(&f.root).unwrap().count(), 0);
+
+	let mut bad = photo_recipe(json!([missing]));
+	bad["action"]["to"] = json!("{item.nope}");
+	let (v, err) = f.tool("recipe_validate", json!({ "recipe": bad }));
+	assert!(err && v["valid"] == false && v["errors"][0]["path"] == "action.to", "{v}");
+	let (v, err) = f.tool("recipe_validate", json!({ "recipe": photo_recipe(json!([missing])), "sample": { "items": [{ "name": "a.txt" }], "values": { "place": "x" } } }));
+	assert!(err && v["errors"][0]["path"] == "items[0]", "the glob refuses a.txt: {v}");
+}
+
+#[test]
+fn proposed_recipes_wait_for_the_person_and_report_their_status() {
+	let mut f = Fixture::new(Approval::Terminal);
+	f.rpc("initialize", json!({ "protocolVersion": "2025-06-18", "clientInfo": { "name": "claude-code\u{1b}[31m" } }));
+	let recipe = photo_recipe(json!([f.root]));
+	let mut ids = Vec::new();
+	for _ in 0..tpfs_mcp::MAX_PENDING_RECIPES {
+		let (v, err) = f.tool("recipe_propose", json!({ "recipe": recipe, "note": "for your holiday photos" }));
+		assert!(!err && v["status"] == "pending", "{v}");
+		ids.push(v["id"].as_str().unwrap().to_owned());
+	}
+	let (v, err) = f.tool("recipe_propose", json!({ "recipe": recipe }));
+	assert!(err && v["error"].as_str().unwrap().contains("too many"), "a sixth recipe: {v}");
+
+	let store = f.server.recipes().clone();
+	let pending = store.get(&ids[0]).unwrap();
+	assert_eq!(pending.note, "for your holiday photos");
+	assert!(!pending.client.contains('\u{1b}'), "{:?}", pending.client);
+	store.reject(&ids[0]).unwrap();
+	store.mark_installed(&ids[1], &pending.hash).unwrap();
+	for (id, want) in [(&ids[0], "rejected"), (&ids[1], "installed"), (&ids[2], "pending")] {
+		let (v, _) = f.tool("recipe_status", json!({ "id": id }));
+		assert_eq!(v["status"], want, "{v}");
+	}
+	assert_eq!(f.tool("recipe_status", json!({ "id": "abc" })).0["status"], "unknown");
+
+	let mut bad = recipe.clone();
+	bad["id"] = json!("NO");
+	let (v, err) = f.tool("recipe_propose", json!({ "recipe": bad }));
+	assert!(err && v["errors"][0]["path"] == "id", "{v}");
+	let (v, err) = f.tool("recipe_propose", json!({ "recipe": recipe, "note": "x".repeat(301) }));
+	assert!(err && v["error"].as_str().unwrap().contains("note"), "{v}");
 }

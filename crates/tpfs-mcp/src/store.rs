@@ -189,7 +189,7 @@ impl Store {
 }
 
 /// Ids come from agents: never let one escape the pending directory.
-fn check_id(id: &str) -> io::Result<&str> {
+pub(crate) fn check_id(id: &str) -> io::Result<&str> {
 	if !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
 		Ok(id)
 	} else {
@@ -200,11 +200,11 @@ fn check_id(id: &str) -> io::Result<&str> {
 	}
 }
 
-fn create_private_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
 	tpfs_core::private_dir(dir)
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 	use std::io::Write;
 	let mut options = fs::OpenOptions::new();
 	options.write(true).create(true).truncate(true);

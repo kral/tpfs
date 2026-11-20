@@ -9,6 +9,7 @@ repository.workspace   = true
 
 [dependencies]
 tpfs-core = { workspace = true }
+tpfs-recipe = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 

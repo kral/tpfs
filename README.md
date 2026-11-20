@@ -72,6 +72,7 @@ tpfs
 - [Agent setup](docs/agent-setup.md): Claude Code and Cursor, the `tpfs guard` hook, `tpfs doctor`
 - [MCP server](docs/mcp.md): let an AI agent propose plans that you approve
 - [Plan format](docs/plan-format.md): the plan JSON
+- [Recipes](docs/recipes.md): reusable commands an agent proposes and you run
 - [Use cases](docs/use-cases/README.md): worked examples
 
 ## License

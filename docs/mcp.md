@@ -156,6 +156,7 @@ The agent then gets this from `apply_plan`:
 | `apply_plan` | `planId` | runs an approved plan; returns `applied` (steps) and `batch` |
 | `undo_last` | none | reverts the newest batch, only if an agent made it |
 | `history` | none | the agent's 20 most recent batches: `batch`, `at` (Unix seconds), `source`, `status`, `steps`, `reason` |
+| `recipe_schema`, `recipe_validate`, `recipe_propose`, `recipe_status` | see [Recipes](recipes.md) | offer a reusable command that you install and run yourself; the agent never runs it |
 
 Rules the agent meets:
 

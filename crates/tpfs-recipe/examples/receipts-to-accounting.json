@@ -1,0 +1,22 @@
+{
+  "format": "tpfs-recipe/1",
+  "id": "receipts-to-accounting",
+  "version": 1,
+  "title": "Doklady do účetnictví",
+  "description": "Moves the selected receipts into the accounting folder, by year and month of the file.",
+  "scope": { "roots": ["~/Downloads", "~/Účetnictví"] },
+  "input": { "kind": "file", "glob": ["*.pdf", "*.jpg", "*.png"], "max": 200 },
+  "form": {
+    "type": "object",
+    "properties": {
+      "target": { "type": "string", "format": "x-tpfs-dir", "title": "Accounting folder", "default": "otherPanel", "x-tpfs": { "remember": true } },
+      "supplier": { "type": "string", "title": "Supplier", "minLength": 1, "maxLength": 40 }
+    },
+    "required": ["target", "supplier"]
+  },
+  "action": {
+    "op": "move",
+    "to": "{form.target}/{item.mtime:%Y}/{item.mtime:%m}/{form.supplier|ascii|slug}_{item.mtime:%Y-%m-%d}_{n:02}.{item.ext|lower}",
+    "on_conflict": "number"
+  }
+}

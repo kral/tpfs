@@ -1,0 +1,16 @@
+{
+  "format": "tpfs-recipe/1",
+  "id": "photos-by-date",
+  "version": 1,
+  "title": "Rename photos by date",
+  "scope": { "roots": ["~/Pictures"] },
+  "input": { "kind": "file", "glob": ["*.jpg", "*.jpeg", "*.heic"] },
+  "form": {
+    "type": "object",
+    "properties": {
+      "place": { "type": "string", "title": "Place", "maxLength": 40 }
+    },
+    "required": ["place"]
+  },
+  "action": { "op": "rename", "to": "{item.mtime:%Y-%m-%d_%H%M}_{form.place|ascii|slug|lower}.{item.ext|lower}", "on_conflict": "number" }
+}

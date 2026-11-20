@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members  = ["crates/tpfs-core", "crates/tpfs-mcp", "crates/tpfs-tui", "crates/tpfs"]
+members  = ["crates/tpfs-core", "crates/tpfs-mcp", "crates/tpfs-recipe", "crates/tpfs-tui", "crates/tpfs"]
 
 [workspace.package]
-version      = "0.5.2"
+version      = "0.6.0"
 edition      = "2024"
 rust-version = "1.89"
 license      = "MIT OR Apache-2.0"
@@ -12,16 +12,19 @@ repository   = "https://github.com/kral/tpfs"
 [workspace.dependencies]
 tpfs-core = { path = "crates/tpfs-core" }
 tpfs-mcp  = { path = "crates/tpfs-mcp" }
+tpfs-recipe = { path = "crates/tpfs-recipe" }
 tpfs-tui  = { path = "crates/tpfs-tui" }
 
 crc32fast  = "1"
 lexopt     = "0.3"
 libc       = "0.2"
+regex      = { version = "1", default-features = false, features = ["std", "unicode"] }
 ratatui    = { version = "0.30", default-features = false, features = ["crossterm"] }
 rustix     = { version = "1", features = ["fs", "process"] }
 schemars   = "1"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_path_to_error = "0.1"
 sha2       = "0.10"
 tempfile   = "3"
 unicode-width = "0.2"

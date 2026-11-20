@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "tpfs recipe (format tpfs-recipe/1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "id", "version", "title", "scope", "input", "form", "action"],
+  "properties": {
+    "format": { "const": "tpfs-recipe/1" },
+    "id": { "type": "string", "pattern": "^[a-z0-9-]{3,48}$", "description": "Stable id; an update keeps it and raises version." },
+    "version": { "type": "integer", "minimum": 1 },
+    "title": { "type": "string", "minLength": 1, "maxLength": 60, "description": "Plain text." },
+    "description": { "type": "string", "maxLength": 300, "description": "Plain text." },
+    "scope": {
+      "type": "object", "additionalProperties": false, "required": ["roots"],
+      "properties": { "roots": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "type": "string", "description": "Absolute folder; '~' or '~/…' is the home folder." } } }
+    },
+    "input": {
+      "type": "object", "additionalProperties": false, "required": ["kind"],
+      "properties": {
+        "kind": { "enum": ["file", "dir"] },
+        "glob": { "type": "array", "maxItems": 20, "items": { "type": "string", "maxLength": 64 }, "description": "Name patterns with * and ?, letter case ignored." },
+        "min": { "type": "integer", "minimum": 1, "default": 1 },
+        "max": { "type": "integer", "minimum": 1, "maximum": 5000, "default": 5000 }
+      }
+    },
+    "form": {
+      "type": "object", "additionalProperties": false, "required": ["type"],
+      "properties": {
+        "type": { "const": "object" },
+        "properties": { "type": "object", "maxProperties": 20, "propertyNames": { "pattern": "^[a-z][a-zA-Z0-9_]{0,31}$" }, "additionalProperties": { "$ref": "#/$defs/field" } },
+        "required": { "type": "array", "items": { "type": "string" }, "description": "Every field the template uses must be listed." }
+      }
+    },
+    "action": {
+      "type": "object", "additionalProperties": false, "required": ["op", "to"],
+      "properties": {
+        "op": { "enum": ["move", "copy", "rename"] },
+        "to": { "type": "string", "maxLength": 500, "description": "Target template. move/copy: path components separated by '/', optionally starting with {item.dir} or a folder field {form.<x>} (default: the entry's own folder). rename: a name only. Substitutions: {source[:format][|filter…]} with sources item.name, item.stem, item.ext, item.mtime, today, n, form.<field>; formats %Y %m %d %H %M for dates, :0N for n and integer fields; filters lower, trim, ascii, slug." },
+        "on_conflict": { "enum": ["number", "stop"], "default": "stop" }
+      }
+    }
+  },
+  "$defs": {
+    "hints": { "type": "object", "additionalProperties": false, "properties": { "remember": { "type": "boolean" } } },
+    "field": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["type"], "properties": {
+          "type": { "const": "string" }, "title": { "type": "string", "maxLength": 60 }, "description": { "type": "string", "maxLength": 300 },
+          "minLength": { "type": "integer", "minimum": 0 }, "maxLength": { "type": "integer", "minimum": 0, "maximum": 1000 },
+          "pattern": { "type": "string", "maxLength": 200 }, "enum": { "type": "array", "minItems": 1, "maxItems": 50, "items": { "type": "string" } },
+          "enumNames": { "type": "array", "items": { "type": "string" } }, "format": { "enum": ["date", "x-tpfs-dir"] },
+          "default": { "description": "A hint for the front end, for example \"otherPanel\"." }, "x-tpfs": { "$ref": "#/$defs/hints" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type"], "properties": {
+          "type": { "enum": ["integer", "number"] }, "title": { "type": "string", "maxLength": 60 }, "description": { "type": "string", "maxLength": 300 },
+          "minimum": { "type": "number" }, "maximum": { "type": "number" }, "default": {}, "x-tpfs": { "$ref": "#/$defs/hints" } } },
+        { "type": "object", "additionalProperties": false, "required": ["type"], "properties": {
+          "type": { "const": "boolean" }, "title": { "type": "string", "maxLength": 60 }, "description": { "type": "string", "maxLength": 300 },
+          "default": {}, "x-tpfs": { "$ref": "#/$defs/hints" } } }
+      ]
+    }
+  }
+}
