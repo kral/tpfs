@@ -95,7 +95,8 @@ A valid proposal returns:
 When `apply_plan` cannot run a plan, its error carries a `status` and a `next` step, so an agent
 does not have to read the sentence: `not_approved` (wait, then call again), `rejected` (ask the
 user what to change; do not propose the same plan again), `unknown` (applied already or never
-proposed) or `modified` (the stored plan was changed; propose it again). Calling `apply_plan`
+proposed), `modified` (the stored plan was changed; propose it again) or `used` (it was started
+once already, maybe interrupted by a crash; an approval is for one run only). Calling `apply_plan`
 before you approved returns:
 
 ```json

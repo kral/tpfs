@@ -3,7 +3,7 @@ resolver = "3"
 members  = ["crates/tpfs-core", "crates/tpfs-mcp", "crates/tpfs-recipe", "crates/tpfs-tui", "crates/tpfs"]
 
 [workspace.package]
-version      = "0.7.2"
+version      = "0.7.3"
 edition      = "2024"
 rust-version = "1.89"
 license      = "MIT OR Apache-2.0"

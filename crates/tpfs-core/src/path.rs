@@ -208,9 +208,9 @@ pub(crate) mod acl {
 			ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation, AddAccessAllowedAceEx,
 			Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW},
 			CONTAINER_INHERIT_ACE, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-			GetLengthSid, GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl, OBJECT_INHERIT_ACE,
-			PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
-			TokenUser, WinLocalSystemSid,
+			GetLengthSid, GetSecurityDescriptorControl, GetTokenInformation, INHERIT_ONLY_ACE, InitializeAcl,
+			OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+			TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid,
 		},
 		Storage::FileSystem::FILE_ALL_ACCESS,
 		System::Threading::{GetCurrentProcess, OpenProcessToken},
@@ -220,8 +220,17 @@ pub(crate) mod acl {
 		p.as_os_str().encode_wide().chain(Some(0)).collect()
 	}
 
-	/// The current user's SID, in a buffer that keeps it alive.
-	fn user_sid() -> io::Result<Vec<u64>> {
+	/// The current user's SID, kept alive in the TOKEN_USER buffer it came in.
+	struct UserSid(Vec<u64>);
+
+	impl UserSid {
+		fn sid(&self) -> *mut core::ffi::c_void {
+			// SAFETY: built only by `user_sid`, which filled the buffer with a TOKEN_USER.
+			unsafe { (*self.0.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+		}
+	}
+
+	fn user_sid() -> io::Result<UserSid> {
 		// SAFETY: the token handle is closed below; buffers are sized as the system asks.
 		unsafe {
 			let mut token: HANDLE = ptr::null_mut();
@@ -233,16 +242,11 @@ pub(crate) mod acl {
 			let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
 			let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len);
 			CloseHandle(token);
-			if ok == 0 {
+			if ok == 0 || (len as usize) < std::mem::size_of::<TOKEN_USER>() {
 				return Err(io::Error::last_os_error());
 			}
-			Ok(buf)
+			Ok(UserSid(buf))
 		}
-	}
-
-	fn sid_of_user(buf: &[u64]) -> *mut core::ffi::c_void {
-		// SAFETY: `buf` holds a TOKEN_USER filled by GetTokenInformation.
-		unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid }
 	}
 
 	fn system_sid() -> io::Result<Vec<u64>> {
@@ -292,15 +296,29 @@ pub(crate) mod acl {
 					AclSizeInformation,
 				);
 				ok = got != 0 && info.AceCount == 2;
+				// Exactly one entry for the user and one for SYSTEM, each allowing everything and
+				// inherited by files and folders inside (and applying to the folder itself).
+				let (mut user_seen, mut system_seen) = (false, false);
 				for i in 0..2 {
 					let mut ace: *mut core::ffi::c_void = ptr::null_mut();
 					ok = ok && GetAce(dacl, i, &mut ace) != 0 && {
 						let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
 						let sid = (&raw mut (*ace).SidStart).cast::<core::ffi::c_void>();
-						(*ace).Header.AceType == 0 // ACCESS_ALLOWED_ACE_TYPE
-							&& (EqualSid(sid, sid_of_user(&user)) != 0 || EqualSid(sid, system.as_ptr() as _) != 0)
+						let flags = u32::from((*ace).Header.AceFlags);
+						let inherited = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+						let shape = (*ace).Header.AceType == 0 // ACCESS_ALLOWED_ACE_TYPE
+							&& (*ace).Mask == FILE_ALL_ACCESS
+							&& flags & inherited == inherited
+							&& flags & INHERIT_ONLY_ACE == 0;
+						let is_user = EqualSid(sid, user.sid()) != 0;
+						let is_system = EqualSid(sid, system.as_ptr() as _) != 0;
+						let new = (is_user && !user_seen) || (is_system && !system_seen && !is_user);
+						user_seen |= is_user;
+						system_seen |= is_system && !is_user;
+						shape && new
 					};
 				}
+				ok = ok && user_seen && system_seen;
 			}
 			LocalFree(sd as _);
 			Ok(ok)
@@ -313,7 +331,7 @@ pub(crate) mod acl {
 		}
 		let user = user_sid()?;
 		let system = system_sid()?;
-		let sids = [sid_of_user(&user), system.as_ptr() as *mut core::ffi::c_void];
+		let sids = [user.sid(), system.as_ptr() as *mut core::ffi::c_void];
 		// SAFETY: the ACL buffer is sized for both entries; the SIDs outlive the calls.
 		unsafe {
 			let entry = std::mem::size_of::<ACCESS_ALLOWED_ACE>() - std::mem::size_of::<u32>();
@@ -359,8 +377,17 @@ pub(crate) mod acl {
 		fn the_state_folder_gets_a_private_access_list() {
 			let tmp = tempfile::TempDir::new().unwrap();
 			let dir = tmp.path().join("state");
+			std::fs::create_dir(&dir).unwrap();
+			// A folder others can use (as one made outside the profile's defaults would be).
+			let status =
+				std::process::Command::new("icacls").arg(&dir).args(["/grant", "*S-1-1-0:(OI)(CI)F"]).status().unwrap();
+			assert!(status.success());
+			assert!(!super::is_private(&dir).unwrap());
 			crate::private_dir(&dir).unwrap();
-			assert!(super::is_private(&dir).unwrap());
+			assert!(super::is_private(&dir).unwrap(), "the broad access list was not replaced");
+			let out = std::process::Command::new("icacls").arg(&dir).output().unwrap();
+			let text = String::from_utf8_lossy(&out.stdout);
+			assert!(!text.contains("Everyone") && !text.contains("S-1-1-0"), "{text}");
 			crate::private_dir(&dir).unwrap(); // already private: left as it is
 			std::fs::write(dir.join("f"), "x").unwrap();
 			std::fs::read(dir.join("f")).unwrap();
@@ -495,5 +522,12 @@ mod nfd_tests {
 		assert_eq!(nfd("Ἀθῆναι Москва́"), nfd("Ἀθῆναι Москва\u{301}"));
 		assert_eq!(nfd("plain.txt"), "plain.txt");
 		assert_ne!(nfd("é"), nfd("e"));
+	}
+
+	#[test]
+	fn the_tables_are_sorted_for_binary_search() {
+		use crate::unicode::{COMBINING, DECOMPOSE};
+		assert!(DECOMPOSE.windows(2).all(|w| w[0].0 < w[1].0));
+		assert!(COMBINING.windows(2).all(|w| w[0].0 < w[1].0));
 	}
 }

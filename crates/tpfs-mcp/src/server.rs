@@ -375,6 +375,13 @@ impl Server {
 				"Propose the plan again.",
 			);
 		}
+		if self.store.is_claimed(id) {
+			return refused(
+				"used",
+				format!("plan '{id}' was already started once (it may have been interrupted); it is used up"),
+				"Check history (and ask the user to run `tpfs recover` if it is interrupted), then propose the plan again if needed.",
+			);
+		}
 		if self.config.approval == Approval::Terminal && !self.store.is_approved(&pending) {
 			return refused(
 				"not_approved",
@@ -388,6 +395,18 @@ impl Server {
 		}
 
 		let mut journal = self.journal()?;
+		// Taken before it starts: a crash during execution never leaves it runnable again.
+		match self.store.claim(id) {
+			Ok(()) => {}
+			Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+				return refused(
+					"used",
+					format!("plan '{id}' is being applied or was started already"),
+					"Check history; propose the plan again if needed.",
+				);
+			}
+			Err(e) => return Err(format!("cannot take the plan for execution: {e}")),
+		}
 		let result = Executor::new(&self.validator, &mut journal, self.config.state.join("trash"))
 			.execute(&pending.plan, Source::Agent);
 		// An approval is for one execution: the plan is used up either way.
@@ -525,7 +544,7 @@ fn tools() -> Value {
 		},
 		{
 			"name": "apply_plan",
-			"description": "Execute a proposed plan after the user approved it. In terminal mode the user approves with `tpfs approve <planId>`. When it cannot run, the error carries a status and a next step: not_approved (wait and call again later), rejected (the user said no: ask what to change; do not propose the same plan), unknown (applied already or never proposed: see history), modified (propose again). A plan can be applied once; if execution fails it is used up and must be proposed again.",
+			"description": "Execute a proposed plan after the user approved it. In terminal mode the user approves with `tpfs approve <planId>`. When it cannot run, the error carries a status and a next step: not_approved (wait and call again later), rejected (the user said no: ask what to change; do not propose the same plan), unknown (applied already or never proposed: see history), modified (propose again), used (already started once: see history). A plan can be applied once; if execution fails it is used up and must be proposed again.",
 			"inputSchema": {
 				"type": "object",
 				"properties": { "planId": { "type": "string", "description": "The planId returned by propose_plan." } },

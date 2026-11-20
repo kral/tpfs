@@ -128,23 +128,55 @@ impl Store {
 
 	/// Approved, and the stored plan has not been modified since: its digest still matches.
 	pub fn is_approved(&self, pending: &Pending) -> bool {
-		// A rejection wins over an approval left behind by an interrupted `reject`.
-		if self.was_rejected(&pending.id) {
+		// A rejection wins over an approval left behind by an interrupted `reject`, and a plan
+		// already taken for execution is used up.
+		if self.was_rejected(&pending.id) || self.is_claimed(&pending.id) {
 			return false;
 		}
 		let Ok(path) = self.approval(&pending.id) else { return false };
 		fs::read_to_string(path).is_ok_and(|d| d == pending.digest && pending.plan.digest() == pending.digest)
 	}
 
-	pub fn remove(&self, id: &str) -> io::Result<()> {
+	/// Take the plan for one execution, before it starts: a `<id>.claimed` marker, created only if
+	/// none exists, then the approval removed and the folder synced. Whatever happens afterwards
+	/// (a crash during execution included), the plan never runs a second time on the same
+	/// approval, and two servers cannot run it at once. `AlreadyExists` if it was taken before.
+	pub fn claim(&self, id: &str) -> io::Result<()> {
+		let marker = self.claim_marker(id)?;
+		let mut options = fs::OpenOptions::new();
+		options.write(true).create_new(true);
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::OpenOptionsExt;
+			options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+		}
+		options.open(&marker)?.sync_all()?;
 		match fs::remove_file(self.approval(id)?) {
 			Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
 			_ => {}
 		}
-		match fs::remove_file(self.file(id)?) {
-			Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-			_ => Ok(()),
+		sync_dir(&self.dir);
+		Ok(())
+	}
+
+	/// The plan was taken for execution once (it is used up, even if that run never finished).
+	pub fn is_claimed(&self, id: &str) -> bool {
+		self.claim_marker(id).is_ok_and(|m| fs::symlink_metadata(m).is_ok())
+	}
+
+	pub fn remove(&self, id: &str) -> io::Result<()> {
+		for path in [self.approval(id)?, self.file(id)?, self.claim_marker(id)?] {
+			match fs::remove_file(path) {
+				Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+				_ => {}
+			}
 		}
+		sync_dir(&self.dir);
+		Ok(())
+	}
+
+	fn claim_marker(&self, id: &str) -> io::Result<PathBuf> {
+		Ok(self.dir.join(format!("{}.claimed", check_id(id)?)))
 	}
 
 	/// Reject a pending plan: remove it and remember for a day that the user rejected it, so
@@ -159,6 +191,7 @@ impl Store {
 			Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
 			_ => {}
 		}
+		sync_dir(&self.dir);
 		write_private(&self.rejection(id)?, b"")?;
 		self.remove(id)?;
 		sync_dir(&self.dir);
@@ -344,5 +377,23 @@ mod tests {
 		assert!(!store.was_rejected(&p.id), "an old rejection still counts");
 		store.put(&plan(), &[]).unwrap();
 		assert!(!marker.exists(), "the old marker was not cleaned up");
+	}
+
+	/// A plan is taken once: a second claim fails, the approval is gone, and it no longer counts as
+	/// approved (a crash after the claim leaves it used up, not runnable again).
+	#[test]
+	fn a_plan_is_claimed_once() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let store = Store::new(tmp.path());
+		let p = store.put(&plan(), &[]).unwrap();
+		store.approve(&p).unwrap();
+		assert!(store.is_approved(&p));
+		store.claim(&p.id).unwrap();
+		assert_eq!(store.claim(&p.id).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+		assert!(!store.is_approved(&p));
+		store.approve(&p).unwrap();
+		assert!(!store.is_approved(&p), "a new approval file does not revive a claimed plan");
+		store.remove(&p.id).unwrap();
+		assert!(!store.is_claimed(&p.id));
 	}
 }

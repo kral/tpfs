@@ -629,7 +629,13 @@ fn run(args: Args) -> Res {
 				println!("{id}  DAMAGED  (unreadable; remove it with `tpfs reject {id}`)");
 			}
 			for p in &pending {
-				let approved = if store.is_approved(p) { "approved" } else { "waiting" };
+				let approved = if store.is_claimed(&p.id) {
+					"used"
+				} else if store.is_approved(p) {
+					"approved"
+				} else {
+					"waiting"
+				};
 				println!(
 					"{}  {:<8} {} op(s)  {}",
 					tpfs_core::sanitize(p.id.as_ref()),
@@ -891,6 +897,12 @@ fn approve(args: &Args) -> Res {
 	let id = plan_id(args)?;
 	let store = tpfs_mcp::Store::new(&state_dir(args)?);
 	let pending = find_pending(&store, &id)?;
+	if store.is_claimed(&id) {
+		return Err(usage(format!(
+			"plan {} was already started once and is used up (see `tpfs log`); reject it",
+			tpfs_core::sanitize(id.as_ref())
+		)));
+	}
 	if !show_pending(args, &pending)? {
 		return Ok(rejected(args));
 	}
@@ -992,7 +1004,7 @@ fn watch(args: &Args) -> Res {
 		}
 		let (plans, _) = store.scan().map_err(|e| e.to_string())?;
 		for pending in plans {
-			if !seen.insert(pending.id.clone()) || store.is_approved(&pending) {
+			if !seen.insert(pending.id.clone()) || store.is_approved(&pending) || store.is_claimed(&pending.id) {
 				continue;
 			}
 			let id = tpfs_core::sanitize(pending.id.as_ref());

@@ -592,3 +592,25 @@ fn apply_plan_refusals_have_a_status() {
 	assert!(err && v["status"] == "unknown", "{v}");
 	assert!(!f.root.join("n").exists());
 }
+
+/// A plan taken for execution and interrupted (crash) is used up: the same approval never runs it
+/// again.
+#[test]
+fn an_interrupted_apply_does_not_run_again() {
+	let mut f = Fixture::new(Approval::Terminal);
+	let id = f.propose(json!({ "reason": "make", "ops": [{ "op": "mkdir", "path": f.root.join("n") }] }));
+	let store = f.server.store().clone();
+	let pending = store.get(&id).unwrap();
+	store.approve(&pending).unwrap();
+	store.claim(&id).unwrap(); // as apply_plan does, then the process "crashes"
+	let (v, err) = f.tool("apply_plan", json!({ "planId": id }));
+	assert!(err && v["status"] == "used", "{v}");
+	assert!(!f.root.join("n").exists());
+	// A stale approval plus a rejection: rejected, nothing changes.
+	let id = f.propose(json!({ "reason": "make", "ops": [{ "op": "mkdir", "path": f.root.join("m") }] }));
+	store.approve(&store.get(&id).unwrap()).unwrap();
+	store.reject(&id).unwrap();
+	let (v, err) = f.tool("apply_plan", json!({ "planId": id }));
+	assert!(err && v["status"] == "rejected", "{v}");
+	assert!(!f.root.join("m").exists());
+}

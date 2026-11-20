@@ -806,5 +806,14 @@ mod fold_tests {
 			assert!(within(Path::new(other), state), "{other}");
 		}
 		assert!(!within(Path::new("/home/u/Ucetnictvi/.tpfs"), state), "accents still count");
+		// The whole validator refuses the decomposed spelling of a protected state folder.
+		let tmp = tempfile::TempDir::new().unwrap();
+		let root = crate::canonicalize(tmp.path()).unwrap();
+		let state = root.join("Účet");
+		std::fs::create_dir(&state).unwrap();
+		let v = Validator::new(std::slice::from_ref(&root)).unwrap().with_protected([&state]);
+		let other = root.join("U\u{301}c\u{30c}et").join("journal.jsonl");
+		let plan = crate::Plan::new(vec![crate::Op::Trash { path: other }], "");
+		assert!(!v.validate(&plan).is_empty(), "the decomposed spelling reached the state folder");
 	}
 }
