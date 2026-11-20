@@ -1,0 +1,95 @@
+name: Release binaries
+
+# Builds tpfs for Linux, macOS and Windows and attaches the archives and SHA256SUMS to the GitHub
+# release. Runs when a release is published, or by hand for an existing tag (to backfill one).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build, e.g. v0.7.2"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest,    run: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, run: true }
+          - { target: aarch64-apple-darwin,       os: macos-latest,     run: true }
+          - { target: x86_64-apple-darwin,        os: macos-latest,     run: false }
+          - { target: x86_64-pc-windows-msvc,     os: windows-latest,   run: true }
+          - { target: aarch64-pc-windows-msvc,    os: windows-latest,   run: false }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: musl tools
+        if: contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: build
+        run: cargo build --release --locked -p tpfs --target ${{ matrix.target }}
+      - name: smoke test
+        if: matrix.run
+        shell: bash
+        run: |
+          out=$(target/${{ matrix.target }}/release/tpfs --version)
+          echo "$out"
+          [ "$out" = "tpfs ${TAG#v}" ]
+      - name: package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          name="tpfs-${TAG}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/tpfs" README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - name: package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "tpfs-$env:TAG-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/tpfs.exe", README.md, LICENSE-MIT, LICENSE-APACHE "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tpfs-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --verify-tag --title "tpfs ${TAG#v}" --generate-notes
+          gh release upload "$TAG" dist/* --clobber

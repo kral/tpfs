@@ -3,9 +3,13 @@
 This page takes you from source code to your first undone change in a few minutes. For the ideas
 behind each step, see [Concepts](concepts.md).
 
-## Build and install
+## Install
 
-You need Rust 1.89 or newer (`rustc --version`).
+The quickest way is a prebuilt binary from the
+[latest release](https://github.com/kral/tpfs/releases/latest): pick the archive for your system,
+unpack it and put `tpfs` (`tpfs.exe` on Windows) on your `PATH`.
+
+To build from source instead, you need Rust 1.89 or newer (`rustc --version`).
 
 ```sh
 git clone https://github.com/kral/tpfs
@@ -20,7 +24,7 @@ Check it runs:
 
 ```console
 $ tpfs --version
-tpfs 0.4.0
+tpfs 0.7.2
 ```
 
 `tpfs --help` lists every command. Each command also has its own short help, for example
