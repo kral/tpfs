@@ -9,6 +9,11 @@
 //! There is deliberately no permanent delete in a plan: `trash` moves into a journaled trash
 //! directory. Only a person empties it ([`trash::empty`]), and the journal records that first.
 
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod crash;
+#[cfg(not(feature = "test-support"))]
+mod crash;
 mod display;
 mod executor;
 mod fsops;

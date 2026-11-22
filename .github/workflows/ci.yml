@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Mondays 03:17 UTC: the long crash and fuzz run below, on fresh seeds.
+    - cron: "17 3 * * 1"
 
 permissions:
   contents: read
@@ -12,8 +15,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Includes the crash-point tests (a crash at every point of a plan, its undo and its recovery)
+  # and the randomized plans of tpfs-core, in their short form, on every system.
   test:
     name: test (${{ matrix.os }})
+    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
@@ -32,6 +38,7 @@ jobs:
 
   msrv:
     name: msrv 1.89 (${{ matrix.os }})
+    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
@@ -42,3 +49,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --locked
+
+  # The same two tests at full length: every pair of a first and a second crash point, and many
+  # more randomized plans from a seed that differs per run. A failure prints the seed and the
+  # line that runs that one case again. Not on pull requests: it takes minutes.
+  fuzz:
+    name: crash points and randomized plans (long)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TPFS_CRASH_NESTED_EVERY: "1"
+      TPFS_FUZZ_CASES: "200000"
+      TPFS_FUZZ_SEED: ${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p tpfs-core --locked --test crash_points --test fuzz_plans -- --nocapture

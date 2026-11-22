@@ -367,6 +367,47 @@ fn a_batch_after_a_torn_tail_is_not_lost() {
 	assert!(!s.root.join("b").exists());
 }
 
+/// A crash in the middle of an append is not damage to the journal: the record never took effect
+/// and none was lost. Found by the crash-point tests: an undo cut short there, and cut short once
+/// more when run again, was refused for good ("damaged; undo it by hand").
+#[test]
+fn a_sealed_torn_tail_does_not_make_a_half_undone_batch_damaged() {
+	let half_undone = |fragment: &[u8]| {
+		let s = Sandbox::new();
+		let v = s.validator();
+		let mut j = s.journal();
+		let batch = Executor::new(&v, &mut j, s.trash())
+			.execute(&Plan::new(vec![Op::Mkdir { path: s.root.join("d") }], ""), Source::Human)
+			.unwrap();
+		drop(j);
+		// The undo removed the folder and crashed while appending its record…
+		fs::remove_dir(s.root.join("d")).unwrap();
+		let path = s.state.join("journal.jsonl");
+		let mut bytes = fs::read(&path).unwrap();
+		bytes.extend_from_slice(fragment);
+		fs::write(&path, bytes).unwrap();
+		// …and the undo run again got as far as that record before it was stopped too.
+		let mut j = s.journal();
+		j.append(&Entry::UndoStep { batch: batch.id, index: 0 }).unwrap();
+		drop(j);
+		s
+	};
+
+	let s = half_undone(b"0badc0de {\"kind\":\"undo_st");
+	let mut j = s.journal();
+	assert!(!j.batches().unwrap()[0].damaged);
+	assert_eq!(j.corrupt_lines(), 1, "the fragment is still reported as an unreadable line");
+	let undone = Executor::new(&s.validator(), &mut j, s.trash()).undo_last().unwrap();
+	assert!(undone.is_some());
+	assert_eq!(j.batches().unwrap()[0].status, BatchStatus::Undone);
+
+	// A whole line that cannot be read is damage: a record may be missing there.
+	let s = half_undone(b"0badc0de {\"kind\":\"undo_st\n");
+	let mut j = s.journal();
+	assert!(j.batches().unwrap()[0].damaged);
+	assert!(Executor::new(&s.validator(), &mut j, s.trash()).undo_last().is_err());
+}
+
 #[test]
 fn journal_skips_oversized_and_non_utf8_lines() {
 	let s = Sandbox::new();

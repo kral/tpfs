@@ -341,6 +341,12 @@ impl Journal {
 	/// A crash in the middle of an append leaves a last line without its newline. Terminate it, so
 	/// the next record starts on a line of its own instead of being glued to the fragment (which
 	/// would make both fail the CRC and silently drop the new record).
+	///
+	/// A fragment that is not a whole record is also marked as what it is ([`TORN`]): a record is
+	/// written and synced *before* the change it announces, so one cut short stands for nothing
+	/// that happened, and no record was lost with it. Unmarked, it would later sit in the middle
+	/// of the journal looking like damage there, and an undo interrupted twice would be refused
+	/// for good as "damaged".
 	fn seal_torn_tail(&mut self) -> io::Result<()> {
 		let len = self.file.metadata()?.len();
 		if len == 0 {
@@ -350,10 +356,23 @@ impl Journal {
 		let mut file = &self.file;
 		file.seek(SeekFrom::Start(len - 1))?;
 		file.read_exact(&mut last)?;
-		if last[0] != b'\n' {
-			self.file.write_all(b"\n")?;
-			self.file.sync_data()?;
+		if last[0] == b'\n' {
+			return Ok(());
 		}
+		// The unterminated line itself, if it is short enough to be a record at all.
+		let start = len.saturating_sub(MAX_LINE as u64 + 1);
+		let mut tail = Vec::new();
+		file.seek(SeekFrom::Start(start))?;
+		file.take(MAX_LINE as u64 + 1).read_to_end(&mut tail)?;
+		let line = match tail.iter().rposition(|b| *b == b'\n') {
+			Some(i) => Some(&tail[i + 1..]),
+			None if start == 0 => Some(&tail[..]),
+			None => None, // longer than any record: left as an unreadable line
+		};
+		let whole = line.is_some_and(|l| std::str::from_utf8(l).ok().and_then(parse_line).is_some());
+		let torn = line.is_some() && !whole;
+		self.file.write_all(if torn { TORN_SEAL.as_bytes() } else { b"\n" })?;
+		self.file.sync_data()?;
 		Ok(())
 	}
 
@@ -377,7 +396,15 @@ impl Journal {
 	pub(crate) fn write(&mut self, entry: &Entry) -> io::Result<()> {
 		let json = serde_json::to_string(entry).map_err(io::Error::other)?;
 		let line = format!("{:08x} {json}\n", crc32fast::hash(json.as_bytes()));
+		crate::crash::point("journal.write");
+		// A power loss in the middle of the append: half the line is there, without its newline.
+		crate::crash::point_with("journal.torn", || {
+			let _ = self.file.write_all(&line.as_bytes()[..line.len() / 2]);
+		});
 		self.file.write_all(line.as_bytes())?;
+		if !crate::crash::durable() {
+			return Ok(());
+		}
 		self.file.sync_data()
 	}
 
@@ -402,7 +429,10 @@ impl Journal {
 
 	/// All batches in journal order.
 	pub fn batches(&mut self) -> io::Result<Vec<BatchView>> {
-		Ok(fold(self.records()?))
+		// A sealed torn tail is an append that never happened, not damage to a record.
+		Ok(fold(
+			self.raw_records()?.into_iter().filter(|(line, e)| e.is_some() || !line.ends_with(TORN)).map(|(_, e)| e),
+		))
 	}
 }
 
@@ -595,7 +625,9 @@ fn read_records(mut reader: impl BufRead, corrupt: &mut usize) -> io::Result<Vec
 		// not a reason to make the whole journal unreadable.
 		let Ok(line) = std::str::from_utf8(&buf) else {
 			*corrupt += 1;
-			out.push((String::new(), None));
+			// A torn tail may end in the middle of a character: it stays known as torn.
+			let torn = buf.strip_suffix(b"\n").unwrap_or(&buf).ends_with(TORN.as_bytes());
+			out.push((if torn { TORN.to_owned() } else { String::new() }, None));
 			continue;
 		};
 		let line = line.trim_end_matches(['\n', '\r']);
@@ -649,6 +681,12 @@ fn step_mut(steps: &mut [Step], index: usize) -> Option<&mut Step> {
 	}
 	steps.iter_mut().find(|s| s.index == index)
 }
+
+/// What ends a line that is the fragment of an append cut short by a crash (see
+/// `Journal::seal_torn_tail`). A record always ends with `}`, so no record ends like this; older
+/// versions read such a line as any other unreadable one.
+const TORN: &str = " #torn";
+const TORN_SEAL: &str = " #torn\n";
 
 /// Journal record format written by this version.
 const FORMAT: u32 = 1;

@@ -164,6 +164,7 @@ impl Fs {
 	pub(crate) fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
 		self.guard(from)?;
 		self.guard(to)?;
+		crate::crash::point("fs.rename");
 		#[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
 		if let Some(result) = confined::rename(&self.anchors, from, to) {
 			return result;
@@ -198,6 +199,7 @@ impl Fs {
 	/// Remove a file or symlink (never a directory), confined like the other operations.
 	pub(crate) fn remove_file(&self, path: &Path) -> io::Result<()> {
 		self.guard(path)?;
+		crate::crash::point("fs.unlink");
 		#[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
 		if let Some(result) = confined::unlink(&self.anchors, path) {
 			return result;
@@ -244,6 +246,7 @@ impl Fs {
 	/// Permissions of a directory just created by a copy, set through a confined descriptor.
 	fn set_dir_mode(&self, dir: &Path, perms: std::fs::Permissions) -> io::Result<()> {
 		self.guard(dir)?;
+		crate::crash::point("fs.chmod");
 		#[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
 		if let Some(result) = confined::set_dir_mode(&self.anchors, dir, perms.clone()) {
 			return result;
@@ -253,6 +256,7 @@ impl Fs {
 
 	fn symlink(&self, target: &Path, path: &Path) -> io::Result<()> {
 		self.guard(path)?;
+		crate::crash::point("fs.symlink");
 		#[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
 		if let Some(result) = confined::symlink(&self.anchors, target, path) {
 			return result;
@@ -376,6 +380,7 @@ impl Fs {
 			// root without an anchor, go through plain path calls unchecked.
 			self.guard(from)?;
 			self.guard(to)?;
+			crate::crash::point("fs.create");
 			#[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
 			if let Some((src, dst)) = confined::open_copy_pair(&self.anchors, from, to, &meta)? {
 				check_regular(&src, from)?;
@@ -423,6 +428,7 @@ impl Fs {
 	/// end up private is never, even for a moment, created wider.
 	pub(crate) fn mkdir_mode(&self, path: &Path, mode: u32) -> io::Result<()> {
 		self.guard(path)?;
+		crate::crash::point("fs.mkdir");
 		#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 		if let Some(result) = confined::mkdir(&self.anchors, path, mode) {
 			return result;
@@ -445,6 +451,7 @@ impl Fs {
 
 	pub(crate) fn rmdir(&self, path: &Path) -> io::Result<()> {
 		self.guard(path)?;
+		crate::crash::point("fs.rmdir");
 		#[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
 		if let Some(result) = confined::rmdir(&self.anchors, path) {
 			return result;
@@ -487,12 +494,17 @@ fn copy_stream(mut src: File, mut dst: File, from: &Path, meta: &fs::Metadata) -
 	if copied != meta.len() {
 		return Err(io::Error::other(format!("short copy of {}: {copied} of {} bytes", from.display(), meta.len())));
 	}
+	// The data is written; the copy has neither its time nor its permissions yet.
+	crate::crash::point("fs.copy-meta");
 	// Keep the modification time, like `cp -p`: a copy is the same content, not a new version,
 	// and folder comparison relies on it.
 	if let Ok(t) = meta.modified() {
 		dst.set_modified(t)?;
 	}
 	dst.set_permissions(safe_permissions(meta))?;
+	if !crate::crash::durable() {
+		return Ok(());
+	}
 	dst.sync_all()
 }
 
@@ -688,7 +700,7 @@ pub(crate) fn remove_part(fs: &Fs, part: &Path) -> io::Result<()> {
 }
 
 /// Give a folder of our own owner write access, so what is in it can be removed or moved.
-fn make_dir_writable(fs: &Fs, dir: &Path) -> io::Result<()> {
+pub(crate) fn make_dir_writable(fs: &Fs, dir: &Path) -> io::Result<()> {
 	let mut p = std::fs::symlink_metadata(dir)?.permissions();
 	#[cfg(unix)]
 	std::os::unix::fs::PermissionsExt::set_mode(&mut p, 0o700);
@@ -746,9 +758,10 @@ pub(crate) fn part_path(to: &Path, tag: &str) -> PathBuf {
 	to.with_file_name(format!(".tpfs-part-{tag}"))
 }
 
-/// Put back into `source` what a cross-device move had already removed from it, taking it from the
-/// published copy at `target`; then move the rest of `target` (duplicates of what is still in
-/// `source`) to `trash_rest`. Used when such a move stopped half way. Every step goes through `fs`
+/// Put back into `source` what a cross-device move had already removed from it, taking it from
+/// the published copy at `target`, folder modes included; then move the rest of `target`
+/// (duplicates of what is still in `source`) to `trash_rest`. Used when such a move stopped half way, and safe to run again after
+/// a crash at any point of it. Every step goes through `fs`
 /// (confined to the roots): a folder swapped for a symlink meanwhile is refused, not followed.
 pub(crate) fn merge_back(
 	fs: &Fs,
@@ -759,32 +772,91 @@ pub(crate) fn merge_back(
 ) -> io::Result<()> {
 	let mut entries = Vec::new();
 	collect(fs, target, Path::new(""), &mut entries)?;
-	for (i, (rel, is_dir)) in entries.iter().enumerate() {
-		let src = if rel.as_os_str().is_empty() { source.to_path_buf() } else { source.join(rel) };
-		if *is_dir {
-			if !crate::path::exists(&src) {
-				fs.mkdir(&src)?;
-			}
-			continue;
-		}
+	let in_source = |rel: &Path| if rel.as_os_str().is_empty() { source.to_path_buf() } else { source.join(rel) };
+	let mut restored = Vec::new();
+	// 1. What is missing in the source is copied back. The copy at `target` stays whole and as it
+	//    is until step 3: its folders are the only record of the modes, and one of them may be
+	//    read-only, so that nothing could be moved out of it without changing that.
+	for (rel, is_dir) in &entries {
+		let src = in_source(rel);
 		if crate::path::exists(&src) {
 			continue;
 		}
-		let part = part_path(&src, &format!("{tag}-restore-{i}"));
+		// The folder it goes back into may be read-only (again): opened like a folder made anew.
+		if let Some(parent) = src.parent().filter(|_| !rel.as_os_str().is_empty()) {
+			reopen(fs, parent)?;
+		}
+		if *is_dir {
+			// Owner-only until it is filled again: it gets its own mode back below.
+			fs.mkdir_mode(&src, REOPENED)?;
+			continue;
+		}
+		// One private name per folder, the same in every run (entries are restored one at a time):
+		// what an interrupted run left under it is found and dropped by the next one. A name
+		// numbered by the entry's position was not — the listing changes between runs — and its
+		// leftover stayed in the user's folder.
+		let part = part_path(&src, &format!("{tag}-restore"));
 		remove_part(fs, &part)?; // a leftover of an earlier, interrupted attempt
-		fs.move_any(&target.join(rel), &src, &part, &mut || Ok(()))?;
+		let from = target.join(rel);
+		let copied = fs.copy_published(&from, &src, &part, &mut || Ok(()))?;
+		restored.push((from, copied));
 	}
-	// Folders now empty were fully restored; whatever is left duplicates the source. It is our own
-	// copy: make its folders writable, or a read-only one could not be moved into the trash.
+	// 2. Folders made or opened for this (now, by an interrupted run, or by the removal that was
+	//    cut short) get the mode their copy has, the deepest first.
+	for (rel, _) in entries.iter().rev().filter(|(_, d)| *d) {
+		restore_reopened_mode(fs, &in_source(rel), &target.join(rel))?;
+	}
+	// 3. The source is whole again. The copy is our own: its folders are made writable (a
+	//    read-only one could neither be emptied nor moved into the trash), what was just copied
+	//    back out of it is removed (unless it changed meanwhile), and so are the folders this
+	//    leaves empty. Whatever is left duplicates the source, or is not known to: to the trash.
+	make_writable(fs, target)?;
+	for (from, copied) in &restored {
+		remove_copied(fs, from, copied)?;
+	}
 	for (rel, _) in entries.iter().rev().filter(|(_, d)| *d) {
 		let _ = fs.rmdir(&target.join(rel));
 	}
-	if crate::path::exists(target) {
-		make_writable(fs, target)?;
-		trash_rest(target)
-	} else {
-		Ok(())
+	if crate::path::exists(target) { trash_rest(target) } else { Ok(()) }
+}
+
+/// The mode of a folder tpfs holds open for its own work on a half-moved tree: one made again by
+/// `merge_back`, or a read-only one opened to remove what was copied out of it.
+const REOPENED: u32 = 0o700;
+
+/// Give `folder` in the source of a half-undone move the mode its copy has, if tpfs left it
+/// [`REOPENED`]: made again by `merge_back` (now or in a run that was interrupted), or opened by
+/// a removal that never got to put the mode back. Only such a folder is touched — one that kept
+/// its own mode never is — and a copy already made writable for the trash (also `REOPENED`)
+/// changes nothing, so running this again after a crash at any point is safe.
+fn restore_reopened_mode(fs: &Fs, folder: &Path, copy: &Path) -> io::Result<()> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		let mode = |p: &Path| std::fs::symlink_metadata(p).ok().filter(|m| m.is_dir()).map(|m| m.permissions());
+		if let (Some(now), Some(wanted)) = (mode(folder), mode(copy))
+			&& now.mode() & 0o7777 == REOPENED
+			&& wanted.mode() & 0o7777 != REOPENED
+		{
+			fs.set_dir_mode(folder, wanted)?;
+		}
 	}
+	let _ = (fs, folder, copy);
+	Ok(())
+}
+
+/// Let the owner put entries into `folder` (a folder of a half-moved tree) if its mode does not:
+/// it becomes [`REOPENED`], and `restore_reopened_mode` closes it again.
+fn reopen(fs: &Fs, folder: &Path) -> io::Result<()> {
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::PermissionsExt;
+		if std::fs::symlink_metadata(folder)?.permissions().mode() & 0o300 != 0o300 {
+			return make_dir_writable(fs, folder);
+		}
+	}
+	let _ = (fs, folder);
+	Ok(())
 }
 
 /// Every entry of the tree at `path` (relative names, and whether each is a folder), each folder
@@ -811,6 +883,9 @@ pub(crate) fn sync_parent(path: &Path) {
 
 /// fsync a directory so entries created in it survive a power loss (Unix; NTFS journals metadata).
 fn sync_dir(dir: &Path) {
+	if !crate::crash::durable() {
+		return;
+	}
 	// Not following a link, and never blocking (a FIFO swapped in for the folder must not hang a
 	// batch that holds the journal lock).
 	#[cfg(unix)]
@@ -2086,6 +2161,52 @@ mod tests {
 		assert_eq!(fs::read_to_string(source.join("sub/b")).unwrap(), "B");
 		assert_eq!(rest, std::slice::from_ref(&target), "the stale duplicate goes to the trash, not away");
 		assert!(target.join("a").exists());
+	}
+
+	/// Folders that a move cut short had already removed from the source come back with their own
+	/// mode (the copy's), and so does one that was opened to empty it; a folder that kept its mode
+	/// is not touched. Run again, nothing changes.
+	#[test]
+	fn merge_back_gives_folders_their_modes_back() {
+		use std::os::unix::fs::PermissionsExt;
+		let mode = |p: &Path| fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
+		let chmod = |p: &Path, m: u32| fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+		let t = tempfile::TempDir::new().unwrap();
+		let (target, source) = (t.path().join("target"), t.path().join("source"));
+		// The copy is whole; in the source `gone` was removed, `opened` emptied and left open.
+		for d in ["gone/inner", "opened", "kept"] {
+			fs::create_dir_all(target.join(d)).unwrap();
+		}
+		for f in ["gone/inner/a", "opened/b", "kept/c"] {
+			fs::write(target.join(f), f).unwrap();
+		}
+		fs::create_dir_all(source.join("opened")).unwrap();
+		fs::create_dir_all(source.join("kept")).unwrap();
+		fs::write(source.join("kept/c"), "kept/c").unwrap();
+		chmod(&target.join("gone/inner"), 0o750);
+		chmod(&target.join("gone"), 0o711);
+		chmod(&target.join("opened"), 0o555);
+		chmod(&source.join("opened"), REOPENED);
+		chmod(&source.join("kept"), 0o2775); // the copy lost the setgid bit; the original keeps it
+
+		let mut rest = Vec::new();
+		let fs_ = Fs::unconfined();
+		for _ in 0..2 {
+			merge_back(&fs_, &target, &source, "t", &mut |p| {
+				rest.push(p.to_path_buf());
+				Ok(())
+			})
+			.unwrap();
+			assert_eq!(fs::read_to_string(source.join("gone/inner/a")).unwrap(), "gone/inner/a");
+			assert_eq!(fs::read_to_string(source.join("opened/b")).unwrap(), "opened/b");
+			assert_eq!(mode(&source.join("gone")), 0o711);
+			assert_eq!(mode(&source.join("gone/inner")), 0o750);
+			assert_eq!(mode(&source.join("opened")), 0o555);
+			assert_eq!(mode(&source.join("kept")), 0o2775);
+		}
+		assert!(!target.join("gone").exists() && !target.join("opened").exists() && target.join("kept/c").exists());
+		assert_eq!(rest, [target.clone(), target]);
+		chmod(&source.join("opened"), 0o755);
 	}
 
 	/// What the recursive copy does below the top level: every nested entry is listed and created
