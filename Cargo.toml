@@ -10,10 +10,10 @@ license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/kral/tpfs"
 
 [workspace.dependencies]
-tpfs-core = { path = "crates/tpfs-core" }
-tpfs-mcp  = { path = "crates/tpfs-mcp" }
-tpfs-recipe = { path = "crates/tpfs-recipe" }
-tpfs-tui  = { path = "crates/tpfs-tui" }
+tpfs-core = { path = "crates/tpfs-core", version = "0.7.4" }
+tpfs-mcp  = { path = "crates/tpfs-mcp", version = "0.7.4" }
+tpfs-recipe = { path = "crates/tpfs-recipe", version = "0.7.4" }
+tpfs-tui  = { path = "crates/tpfs-tui", version = "0.7.4" }
 
 crc32fast  = "1"
 lexopt     = "0.3"

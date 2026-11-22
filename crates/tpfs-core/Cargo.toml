@@ -6,6 +6,9 @@ edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
+readme       = "../../README.md"
+keywords     = ["filesystem","undo","journal","transaction","files"]
+categories   = ["filesystem"]
 
 [features]
 # Hooks for tests of tpfs itself and of its front ends: write journal records by hand, crash a

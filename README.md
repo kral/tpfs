@@ -37,6 +37,12 @@ tar xzf tpfs-v0.7.2-x86_64-unknown-linux-musl.tar.gz
 sudo install tpfs-v0.7.2-x86_64-unknown-linux-musl/tpfs /usr/local/bin/
 ```
 
+**From crates.io** (once published). You need Rust 1.89 or newer.
+
+```sh
+cargo install tpfs
+```
+
 **From source.** You need Rust 1.89 or newer.
 
 ```sh
@@ -47,6 +53,8 @@ cargo install --locked --path crates/tpfs
 
 This puts one binary, `tpfs`, in `~/.cargo/bin`. See [Getting started](docs/getting-started.md) for
 details.
+
+**Code signing.** Windows release binaries are signed when signing is enabled; see [CODE_SIGNING.md](CODE_SIGNING.md).
 
 ## Quick start
 
