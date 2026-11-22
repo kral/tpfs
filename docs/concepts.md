@@ -259,8 +259,32 @@ A walk-through is in [Recover after a crash](use-cases/recover-after-a-crash.md)
 - on Windows, always the trash in the state folder: trashing an item on another drive copies it to
   the state folder's drive.
 
-Undo moves the item back from where the journal says it went. tpfs never empties the trash. If you
-delete something from it by hand, undo of that batch can no longer put it back.
+Undo moves the item back from where the journal says it went. The trash keeps everything until you
+empty it. `tpfs trash` lists it per batch, with the size and whether undo can still use it.
+
+### Emptying the trash
+
+`tpfs trash empty` is the only permanent delete in tpfs, and only a person runs it: there is no MCP
+tool for it, and `tpfs guard` refuses it in an agent's shell. By default it deletes what batches
+older than 30 days left in the trash; `--older-than <N>d` and `--batch <batch>` choose other batches.
+It shows every item and the space it frees, and deletes only after you type `yes`, or with
+`--approve <token>` naming exactly the selection it showed (see [tpfs trash](cli.md#tpfs-trash)).
+
+What that means for undo:
+
+- Before deleting anything, tpfs writes a `purge` record for each batch to the journal. From then on
+  the batch counts as emptied: `tpfs log` shows `committed, trash emptied (cannot be undone)`, and
+  `tpfs undo` refuses it with a clear message instead of failing half way. Undo goes newest first, so
+  the batches before an emptied one cannot be undone either.
+- If tpfs stops while deleting (a crash, a power loss), the batch is still marked emptied, never
+  undoable with half its items gone. `tpfs trash` shows it as `no (emptying was cut short)`,
+  `tpfs recover` mentions it, and the next `tpfs trash empty` finishes it, whatever you select.
+- A batch that was interrupted keeps its trash: `tpfs recover` needs it to roll the batch back.
+- Deletion stays inside tpfs's trash folders. A link in the trash is removed, not what it points to,
+  and read-only folders are made writable first.
+
+If you delete something from the trash by hand instead, tpfs does not know: undo of that batch then
+fails when it reaches the missing item.
 
 ## Roots and confinement
 

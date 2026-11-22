@@ -6,6 +6,9 @@ edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
+readme       = "../../README.md"
+keywords     = ["mcp","agents","filesystem","files","ai"]
+categories   = ["filesystem","command-line-utilities"]
 
 [dependencies]
 tpfs-core = { workspace = true }

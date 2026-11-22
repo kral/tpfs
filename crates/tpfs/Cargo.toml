@@ -6,6 +6,9 @@ edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
 repository.workspace   = true
+readme       = "../../README.md"
+keywords     = ["file-manager","undo","filesystem","cli","tui"]
+categories   = ["command-line-utilities","filesystem"]
 
 [dependencies]
 lexopt      = { workspace = true }

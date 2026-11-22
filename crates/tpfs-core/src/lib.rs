@@ -6,8 +6,14 @@
 //! [journal](Journal), so every committed batch can be undone and a batch interrupted by a crash
 //! can be rolled back on the next start.
 //!
-//! There is deliberately no permanent delete: `trash` moves into a journaled trash directory.
+//! There is deliberately no permanent delete in a plan: `trash` moves into a journaled trash
+//! directory. Only a person empties it ([`trash::empty`]), and the journal records that first.
 
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod crash;
+#[cfg(not(feature = "test-support"))]
+mod crash;
 mod display;
 mod executor;
 mod fsops;
@@ -16,11 +22,12 @@ mod op;
 mod path;
 pub mod risk;
 pub mod sync;
+pub mod trash;
 mod unicode;
 mod validate;
 
 pub use display::sanitize;
-pub use executor::{BatchReport, ExecError, Executor, Phase, RecoveryReport, Source};
+pub use executor::{BatchReport, ExecError, Executor, PURGED, Phase, RecoveryReport, Source};
 pub use fsops::{Listed, list_confined};
 pub use journal::{BatchStatus, BatchView, Entry, Journal, KEEP_COMMITTED, Step};
 pub use op::{Op, Plan};
