@@ -194,13 +194,14 @@ fn old_journals_still_read_and_compaction_keeps_purges() {
 	assert!(j.corrupt_lines() == 0 && b.status == BatchStatus::Committed && !b.purged && !b.damaged);
 
 	// A purge record without `at`, and one for a batch only the archive knows: no damaged ghost.
+	// (The journal is closed first: Windows refuses to write a locked file.)
+	drop(j);
 	fs::write(
 		s.state.join("journal.jsonl"),
 		text + &line(r#"{"kind":"purge","batch":"18e0000000000000-a"}"#)
 			+ &line(r#"{"kind":"purge","batch":"18e0000000000000-b"}"#),
 	)
 	.unwrap();
-	drop(j);
 	let mut j = s.journal();
 	let batches = j.batches().unwrap();
 	assert_eq!(batches.len(), 1);
