@@ -569,3 +569,61 @@ fn a_recipe_run_through_a_link_out_of_its_folders_is_refused() {
 	assert!(a.exists());
 	assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "something reached the folder outside");
 }
+
+/// `tpfs trash` lists; `tpfs trash empty` deletes only the selection whose token was shown, by
+/// age (30 days unless told otherwise) or by batch; an emptied batch can no longer be undone.
+#[test]
+fn the_trash_is_emptied_only_by_its_token() {
+	let tmp = tempfile::TempDir::new().unwrap();
+	let base = tpfs_core::canonicalize(tmp.path()).unwrap();
+	let (root, home) = (base.join("root"), base.join("home"));
+	fs::create_dir(&root).unwrap();
+	let r = root.to_str().unwrap();
+	let mut ids = Vec::new();
+	for name in ["a.txt", "b.txt"] {
+		fs::write(root.join(name), name).unwrap();
+		let plan = base.join("plan.json");
+		fs::write(&plan, format!(r#"{{"ops":[{{"op":"trash","path":{:?}}}]}}"#, root.join(name))).unwrap();
+		let p = plan.to_str().unwrap();
+		let out = String::from_utf8(tpfs(&home, &["check", p, "--root", r]).stdout).unwrap();
+		let digest = out.lines().find_map(|l| l.strip_prefix("Digest: ")).unwrap().to_owned();
+		assert_eq!(code(&tpfs(&home, &["apply", p, "--root", r, "--approve", &digest])), 0);
+		ids.push(newest_batch(&home).unwrap());
+	}
+	let stdout = |o: &Output| String::from_utf8_lossy(&o.stdout).into_owned();
+	let token = |o: &Output| stdout(o).lines().find_map(|l| l.strip_prefix("Token: ")).unwrap().to_owned();
+
+	let list = tpfs(&home, &["trash"]);
+	assert_eq!(code(&list), 0);
+	assert!(stdout(&list).contains(&ids[0]) && stdout(&list).contains("Total: 2 batch(es), 2 item(s), 10 B"));
+	assert_eq!(code(&tpfs(&home, &["trash", "--batch", &ids[0]])), 2, "a filter needs `empty`");
+	assert_eq!(code(&tpfs(&home, &["trash", "purge"])), 2);
+	assert_eq!(code(&tpfs(&home, &["trash", "empty", "--batch", "nope"])), 2);
+	assert_eq!(code(&tpfs(&home, &["trash", "empty", "--older-than", "soon"])), 2);
+
+	// Nothing is 30 days old yet.
+	let o = tpfs(&home, &["trash", "empty"]);
+	assert!(code(&o) == 0 && stdout(&o).contains("Nothing to empty"), "{}", stdout(&o));
+
+	// One batch: not interactive, so the token is needed, and only the right one works.
+	let o = tpfs(&home, &["trash", "empty", "--batch", &ids[1]]);
+	assert_eq!(code(&o), 4);
+	assert!(stdout(&o).contains(root.join("b.txt").to_str().unwrap()), "shows where each item came from");
+	let t = token(&o);
+	assert_eq!(code(&tpfs(&home, &["trash", "empty", "--batch", &ids[1], "--approve", &ids[0]])), 4);
+	assert!(home.join("trash").join(&ids[1]).exists());
+	let o = tpfs(&home, &["trash", "empty", "--batch", &ids[1], "--approve", &t]);
+	assert_eq!(code(&o), 0, "{}", String::from_utf8_lossy(&o.stderr));
+	assert!(!home.join("trash").join(&ids[1]).exists() && home.join("trash").join(&ids[0]).exists());
+
+	// Undo refuses the emptied batch and says why; the log says so too.
+	let o = tpfs(&home, &["undo", "--approve", &ids[1]]);
+	assert_eq!(code(&o), 1);
+	assert!(String::from_utf8_lossy(&o.stderr).contains("trash was emptied"));
+	assert!(stdout(&tpfs(&home, &["log"])).contains("trash emptied (cannot be undone)"));
+
+	// By age: everything older than 0 days.
+	let t = token(&tpfs(&home, &["trash", "empty", "--older-than", "0d"]));
+	assert_eq!(code(&tpfs(&home, &["trash", "empty", "--older-than", "0d", "--approve", &t])), 0);
+	assert!(stdout(&tpfs(&home, &["trash"])).contains("The trash is empty."));
+}

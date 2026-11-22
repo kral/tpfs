@@ -12,6 +12,10 @@ use crate::{
 	validate::{Issue, Validator},
 };
 
+/// Why a batch whose trash was emptied is not undone.
+pub const PURGED: &str = "its trash was emptied (`tpfs trash empty`), so what it moved there is gone for good; \
+	it can no longer be undone, and neither can the batches before it";
+
 /// Who asked for a plan. Agents may only propose; see [`crate::risk`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -390,6 +394,9 @@ impl<'a> Executor<'a> {
 				error: "its journal records are damaged; undo it by hand from `tpfs log`".into(),
 			});
 		}
+		if batch.purged {
+			return Err(ExecError::Undo { batch: batch.id, error: PURGED.into() });
+		}
 		let fs = self.fs(batch.steps.iter().flat_map(|st| [&st.inverse, &st.forward]));
 		let mut reverted = 0;
 		for step in batch.steps.iter().rev().filter(|s| s.done && !s.undone) {
@@ -749,7 +756,7 @@ impl<'a> Executor<'a> {
 }
 
 /// An absolute spelling of `path` without symlinks: its existing part canonicalised.
-fn absolute_real(path: &Path) -> PathBuf {
+pub(crate) fn absolute_real(path: &Path) -> PathBuf {
 	let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
 	let mut rest = Vec::new();
 	let mut base = abs.as_path();
@@ -772,7 +779,7 @@ fn absolute_real(path: &Path) -> PathBuf {
 /// Whether `path` lies in a genuine per-file-system trash of this user: a `.tpfs-trash-<uid>`
 /// folder that is a real directory owned by the user and private. A path that merely contains such
 /// a name (a forged journal entry) does not count.
-fn in_local_trash(path: &Path) -> bool {
+pub(crate) fn in_local_trash(path: &Path) -> bool {
 	#[cfg(any(target_os = "linux", target_vendor = "apple"))]
 	{
 		use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -946,10 +953,10 @@ fn restore_dir(
 #[cfg(test)]
 thread_local! {
 	/// Where the tests stop a folder restore, as a crash would.
-	static CRASH_AT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+	pub(crate) static CRASH_AT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
 }
 
-fn crash_point(_at: &'static str) -> io::Result<()> {
+pub(crate) fn crash_point(_at: &'static str) -> io::Result<()> {
 	#[cfg(test)]
 	if CRASH_AT.with(|c| c.get() == Some(_at)) {
 		return Err(io::Error::other(format!("simulated crash after: {_at}")));
@@ -1266,7 +1273,7 @@ fn trash_slot(trash: &Path, batch: &str, index: usize, path: &Path) -> PathBuf {
 }
 
 #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-fn local_trash(trash: &Path, path: &Path, create: bool) -> Option<PathBuf> {
+pub(crate) fn local_trash(trash: &Path, path: &Path, create: bool) -> Option<PathBuf> {
 	use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
 	let dev = fs::symlink_metadata(path).ok()?.dev();
@@ -1296,11 +1303,11 @@ fn local_trash(trash: &Path, path: &Path, create: bool) -> Option<PathBuf> {
 }
 
 #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-fn local_trash(_: &Path, _: &Path, _: bool) -> Option<PathBuf> {
+pub(crate) fn local_trash(_: &Path, _: &Path, _: bool) -> Option<PathBuf> {
 	None
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 

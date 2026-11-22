@@ -13,6 +13,8 @@ tpfs sync <source> <target> [--both] [--mirror] [--apply] [--approve <digest>] [
 tpfs undo [--approve <batch>]
 tpfs log [--all] [<batch>]
 tpfs recover [--abandon <batch>]
+tpfs trash
+tpfs trash empty [--older-than <N>d] [--batch <batch>] [--approve <token>]
 tpfs mcp --root <dir>... [--approval terminal|client]
 tpfs pending
 tpfs approve <planId>
@@ -242,6 +244,9 @@ Reverts the newest committed batch. See [Undo](concepts.md#undo).
 - If another process committed a newer batch after you were shown one, nothing is undone:
   ``the history changed meanwhile: …; run `tpfs undo` again`` (exit 4).
 - With nothing to undo it prints `Nothing to undo.` (exit 0).
+- If the batch's trash was emptied (`tpfs trash empty`), undo refuses it (exit 1):
+  ``batch …: its trash was emptied (`tpfs trash empty`), so what it moved there is gone for good; it
+  can no longer be undone, and neither can the batches before it``.
 
 On success it lists what it reverted:
 
@@ -268,7 +273,8 @@ State: /home/you/.local/state/tpfs
 18e97ddd3e09330c-6c01  human  committed  6 step(s)  Sort downloads into folders
 ```
 
-The states are explained in [The journal](concepts.md#the-journal). If the journal has unreadable
+The states are explained in [The journal](concepts.md#the-journal). A committed batch whose trash
+was emptied shows as `committed, trash emptied (cannot be undone)`. If the journal has unreadable
 lines, a warning follows: `warning: 1 unreadable journal line(s) skipped`.
 
 With a batch id, lists every step of that batch, its state (`done`, `started`, `failed` or `undone`)
@@ -294,7 +300,58 @@ with damaged journal records. It records the batch as abandoned and changes noth
 terminal it asks `Abandon batch …? Its changes stay on disk as they are. [y/N]`. An unknown batch,
 or one that needs no abandoning, is a usage error (exit 2).
 
+If an emptying of the trash was cut short, `tpfs recover` also says so; `tpfs trash empty`
+finishes it.
+
 A walk-through is in [Recover after a crash](use-cases/recover-after-a-crash.md).
+
+## tpfs trash
+
+```text
+tpfs trash
+tpfs trash empty [--older-than <N>d] [--batch <batch>] [--approve <token>]
+```
+
+`tpfs trash` lists what the trash holds, one line per batch, oldest first: the batch, when it ran
+(UTC), who made it, how many items it left there, their size, and whether `tpfs undo` can still use
+them. It looks in the state folder's trash and in every `.tpfs-trash-<uid>` folder on another disk
+that the journal names and that is mounted now (they are named on stderr). A total ends the list.
+
+```console
+$ tpfs trash
+Trash: /home/you/.local/state/tpfs/trash, /mnt/usb/.tpfs-trash-1000
+BATCH                  DATE (UTC)        SOURCE  ITEMS        SIZE  UNDOABLE
+18e97ddd3e09330c-6c01  2026-09-12 08:41  human       3     1.2 MiB  yes
+18e97ddfa3b51430-6c6a  2026-10-02 17:05  agent       1     640 KiB  no (undone)
+Total: 2 batch(es), 4 item(s), 1.8 MiB
+```
+
+`tpfs trash empty` deletes what batches left in the trash **for good**. It is the only permanent
+delete in tpfs. Agents cannot run it: the MCP server has no such tool, and `tpfs guard` refuses it.
+See [The trash](concepts.md#the-trash) for what it means for undo.
+
+| Flag | Selects |
+|---|---|
+| (none) | every batch older than 30 days |
+| `--older-than <N>d` | every batch older than N days (`0d`: everything) |
+| `--batch <batch>` | only that batch, whatever its age; with `--older-than`, only if it is old enough |
+
+A batch that was interrupted (`INCOMPLETE`) keeps its trash, because `tpfs recover` needs it. An
+emptying that was cut short is always finished, whatever you select.
+
+It lists the batches and every item (where it came from, when the journal knows), the total size,
+how many of the batches can still be undone, and a `Token:`, a digest of exactly that selection.
+
+- On a terminal it asks `Type 'yes' to delete this for good:`.
+- Without a terminal, `--approve <token>` deletes exactly the selection with that token. Without it
+  it stops with exit 4: `not interactive: pass --approve <token> to delete exactly this selection`.
+- A token that does not match, or a trash that changed between the list and the deletion: nothing is
+  deleted (exit 4).
+- With nothing selected it prints `Nothing to empty: …` (exit 0). An unknown `--batch` is a usage
+  error (exit 2).
+
+On success: `Deleted N item(s) of M batch(es), X freed.` A folder that cannot be deleted is listed as
+`error:` (exit 1); the next `tpfs trash empty` tries it again.
 
 ## tpfs mcp
 
@@ -380,6 +437,7 @@ tpfs guard
 
 A PreToolUse hook for AI coding agents: reads the proposed tool call as JSON on stdin and, for a
 shell command that moves, renames or deletes files, prints a refusal that points the agent to tpfs.
+`tpfs trash empty` is refused too: only you empty the trash.
 Prints nothing for other commands. Always exits 0. See [Agent setup](agent-setup.md).
 
 ## tpfs doctor

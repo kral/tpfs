@@ -91,6 +91,14 @@ pub enum Entry {
 	Undo {
 		batch: String,
 	},
+	/// `tpfs trash empty` is about to delete what the batch left in the trash, for good (written
+	/// before anything is deleted). From here on the batch cannot be undone; a run cut short is
+	/// finished by the next one.
+	Purge {
+		batch: String,
+		#[serde(default)]
+		at: u64,
+	},
 }
 
 impl Entry {
@@ -108,6 +116,7 @@ impl Entry {
 			| Entry::Abort { batch }
 			| Entry::Abandon { batch }
 			| Entry::UndoStep { batch, .. }
+			| Entry::Purge { batch, .. }
 			| Entry::Undo { batch } => batch,
 		}
 	}
@@ -138,6 +147,9 @@ pub struct BatchView {
 	/// it was written by a newer format: its steps are not known for sure, so undo and recovery
 	/// refuse it instead of guessing.
 	pub damaged: bool,
+	/// What it left in the trash was (or is being) deleted by `tpfs trash empty`: it can no
+	/// longer be undone (see [`Entry::Purge`]).
+	pub purged: bool,
 	pub steps: Vec<Step>,
 }
 
@@ -466,14 +478,19 @@ fn fold(records: impl IntoIterator<Item = Option<Entry>>) -> Vec<BatchView> {
 				reason: reason.clone(),
 				status: BatchStatus::Incomplete,
 				damaged: *v > FORMAT,
+				purged: false,
 				steps: Vec::new(),
 			});
 			continue;
 		}
 
 		// A record without its `begin` (lost to damage): keep it visible as a damaged batch
-		// instead of dropping it, so undo cannot silently skip over it.
+		// instead of dropping it, so undo cannot silently skip over it. Not for a purge: it may
+		// name a batch whose records are in the archive, and it never makes anything undoable.
 		if !index.contains_key(e.batch()) {
+			if matches!(e, Entry::Purge { .. }) {
+				continue;
+			}
 			index.insert(e.batch().to_owned(), batches.len());
 			batches.push(BatchView {
 				id: e.batch().to_owned(),
@@ -482,6 +499,7 @@ fn fold(records: impl IntoIterator<Item = Option<Entry>>) -> Vec<BatchView> {
 				reason: "(its first journal record is unreadable)".into(),
 				status: BatchStatus::Incomplete,
 				damaged: true,
+				purged: false,
 				steps: Vec::new(),
 			});
 		}
@@ -542,6 +560,7 @@ fn fold(records: impl IntoIterator<Item = Option<Entry>>) -> Vec<BatchView> {
 			Entry::Abort { .. } => b.status = BatchStatus::Aborted,
 			Entry::Abandon { .. } => b.status = BatchStatus::Abandoned,
 			Entry::Undo { .. } => b.status = BatchStatus::Undone,
+			Entry::Purge { .. } => b.purged = true,
 			Entry::Begin { .. } => {}
 		}
 	}
