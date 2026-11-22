@@ -7,6 +7,7 @@ use tpfs_core::{BatchStatus, Executor, Journal, Op, Plan, Source, Validator, tra
 
 struct Sandbox {
 	_tmp: TempDir,
+	#[cfg_attr(not(unix), allow(dead_code, reason = "used by the Unix-only symlink test"))]
 	base: PathBuf,
 	root: PathBuf,
 	state: PathBuf,
