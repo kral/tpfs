@@ -43,6 +43,14 @@ USAGE:
                 [--abandon <batch>]               give up on one recovery cannot handle (damaged, or
                                                   older than newer changes): records it as abandoned
                                                   and changes nothing on disk; see `tpfs log` first
+  tpfs trash                                    list what the trash holds per batch: date, source,
+                                                  items, size, and whether undo can still use it
+  tpfs trash empty                              delete for good what batches left in the trash (the
+                                                  only permanent delete); asks for a typed yes
+                [--older-than <N>d]               batches older than N days (default: 30d)
+                [--batch <batch>]                 only this batch (with --older-than: if old enough)
+                [--approve <token>]               non-interactive: exactly the selection shown
+                                                  with this token; those batches cannot be undone
 
   tpfs mcp --root <dir>... [--approval terminal|client]
                                                   MCP server on stdio for AI agents (agents propose,
@@ -79,8 +87,10 @@ EXIT CODES:
   1  failed                                      4  cancelled or not approved; nothing changed
   2  usage error
 
-Nothing is ever deleted permanently: `trash` moves into <home>/trash (on Linux and macOS, items
-on another disk go to a private .tpfs-trash-<uid> folder at that disk's top) and can be undone.
+No plan ever deletes anything: `trash` moves into <home>/trash (on Linux and macOS, items on
+another disk go to a private .tpfs-trash-<uid> folder at that disk's top) and can be undone. Only
+`tpfs trash empty`, run by a person, deletes from the trash; agents cannot (not over MCP, and
+`tpfs guard` refuses it).
 With --approval client, the MCP client's own confirmation is the only approval: a client set to
 \"always allow\" means no human approval at all.
 ";
@@ -142,6 +152,7 @@ fn allowed(command: &str) -> Option<(&'static [&'static str], usize)> {
 		"log" => (&["home", "all"], 1),
 		"pending" => (&["home"], 0),
 		"recover" => (&["home", "abandon"], 0),
+		"trash" => (&["home", "older-than", "batch", "approve"], 1),
 		"mcp" => (&["root", "approval", "home"], 0),
 		"approve" | "reject" => (&["home"], 1),
 		"guard" => (&[], 0),
@@ -179,6 +190,10 @@ struct Args {
 	positional: usize,
 	help: bool,
 	abandon: Option<String>,
+	/// `tpfs trash empty --older-than <N>d`, in days.
+	older_than: Option<u64>,
+	/// `tpfs trash empty --batch <id>`.
+	batch: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -232,14 +247,29 @@ fn parse_args() -> Result<Args, Fail> {
 		positional: 0,
 		help: false,
 		abandon: None,
+		older_than: None,
+		batch: None,
 	};
 
 	let e = |e: lexopt::Error| usage(e.to_string());
 	while let Some(arg) = parser.next().map_err(e)? {
 		if let Long(name) = &arg {
-			const FLAGS: [&str; 13] = [
-				"root", "approve", "approval", "icons", "both", "mirror", "apply", "json", "max-ops", "home", "source",
-				"all", "set",
+			const FLAGS: [&str; 15] = [
+				"root",
+				"approve",
+				"approval",
+				"icons",
+				"both",
+				"mirror",
+				"apply",
+				"json",
+				"max-ops",
+				"home",
+				"source",
+				"all",
+				"set",
+				"older-than",
+				"batch",
 			];
 			if let Some(f) = FLAGS.iter().find(|f| **f == *name) {
 				args.given.push(f);
@@ -268,6 +298,13 @@ fn parse_args() -> Result<Args, Fail> {
 			Long("abandon") => {
 				args.abandon = Some(parser.value().map_err(e)?.string().map_err(|e| usage(e.to_string()))?)
 			}
+			Long("older-than") => {
+				let v = parser.value().map_err(e)?.string().map_err(|e| usage(e.to_string()))?;
+				let days = v.strip_suffix('d').unwrap_or(&v).parse();
+				args.older_than =
+					Some(days.map_err(|_| usage(format!("--older-than needs days, like 30d; got '{v}'")))?);
+			}
+			Long("batch") => args.batch = Some(parser.value().map_err(e)?.string().map_err(|e| usage(e.to_string()))?),
 			Long("set") => args.sets.push(parser.value().map_err(e)?.string().map_err(|e| usage(e.to_string()))?),
 			Long("icons") => args.icons = true,
 			Long("both") => args.both = true,
@@ -296,9 +333,9 @@ fn parse_args() -> Result<Args, Fail> {
 	}
 
 	// `tpfs <dir> [<dir>]` opens the commander there.
-	const COMMANDS: [&str; 14] = [
+	const COMMANDS: [&str; 15] = [
 		"ui", "schema", "check", "apply", "sync", "undo", "log", "recover", "mcp", "pending", "approve", "reject",
-		"recipes", "recipe",
+		"recipes", "recipe", "trash",
 	];
 	if !args.command.is_empty() && !COMMANDS.contains(&args.command.as_str()) && Path::new(&args.command).is_dir() {
 		args.extra = args.plan.take();
@@ -376,6 +413,7 @@ fn run(args: Args) -> Res {
 		"check" => check(&args, false),
 		"apply" => check(&args, true),
 		"sync" => sync(&args),
+		"trash" => trash(&args),
 		"undo" => {
 			let (mut journal, _) = open_state(&args)?;
 			let validator = any_validator(&args, &mut journal)?;
@@ -402,6 +440,9 @@ fn run(args: Args) -> Res {
 					id = tpfs_core::sanitize(b.id.as_ref())
 				)
 				.into());
+			}
+			if let Some(b) = last.as_ref().filter(|b| b.purged) {
+				return Err(format!("batch {}: {}", tpfs_core::sanitize(b.id.as_ref()), tpfs_core::PURGED).into());
 			}
 			// Not held while the user reads; the batch is checked again when undoing.
 			drop(journal);
@@ -489,10 +530,11 @@ fn run(args: Args) -> Res {
 					.find(|b| b.id == id)
 					.ok_or_else(|| usage(format!("no batch {} in the journal", tpfs_core::sanitize(id.as_ref()))))?;
 				println!(
-					"Batch {} by {}{}: {}",
+					"Batch {} by {}{}{}: {}",
 					tpfs_core::sanitize(b.id.as_ref()),
 					tpfs_core::sanitize(b.source.as_ref()),
 					if b.damaged { " (journal records damaged: the list may be incomplete)" } else { "" },
+					if b.purged { " (its trash was emptied: it cannot be undone)" } else { "" },
 					tpfs_core::sanitize(b.reason.as_ref())
 				);
 				for st in &b.steps {
@@ -525,6 +567,7 @@ fn run(args: Args) -> Res {
 				let status = match b.status {
 					BatchStatus::Abandoned | BatchStatus::Undone | BatchStatus::Aborted => status,
 					_ if b.damaged => "DAMAGED (see `tpfs log <batch>`)",
+					BatchStatus::Committed if b.purged => "committed, trash emptied (cannot be undone)",
 					_ => status,
 				};
 				println!(
@@ -579,7 +622,16 @@ fn run(args: Args) -> Res {
 				println!("Abandoned batch {shown}; its changes were left as they are.");
 				return Ok(ExitCode::SUCCESS);
 			}
-			let report = Executor::new(&validator, &mut journal, trash).recover().map_err(|e| e.to_string())?;
+			let report = Executor::new(&validator, &mut journal, &trash).recover().map_err(|e| e.to_string())?;
+			// An emptying of the trash cut short: already recorded, so nothing claims to be undoable;
+			// the rest is deleted by the next `tpfs trash empty`.
+			let cut_short =
+				tpfs_core::trash::contents(&mut journal, &trash).map_or(0, |c| c.iter().filter(|t| t.purged).count());
+			if cut_short > 0 {
+				eprintln!(
+					"Emptying the trash of {cut_short} batch(es) was cut short; they cannot be undone. `tpfs trash empty` finishes it."
+				);
+			}
 			match (report.rolled_back.len(), report.errors.is_empty()) {
 				(0, true) => println!("Nothing to recover."),
 				(0, false) => println!("Nothing rolled back."),
@@ -670,6 +722,177 @@ fn run(args: Args) -> Res {
 		}
 		other => Err(usage(format!("unknown command '{other}' (see `tpfs --help`)"))),
 	}
+}
+
+/// `tpfs trash`: what the trash holds per batch. `tpfs trash empty`: delete some of it for good,
+/// after a typed `yes` (or `--approve <token>` naming exactly the selection shown).
+fn trash(args: &Args) -> Res {
+	use tpfs_core::trash::{self, Trashed};
+	let sub = args.plan.as_deref().map(|s| s.to_str().unwrap_or("?"));
+	if sub.is_none() && (args.older_than.is_some() || args.batch.is_some() || args.approve.is_some()) {
+		return Err(usage("--older-than, --batch and --approve go with `tpfs trash empty`"));
+	}
+	if let Some(other) = sub.filter(|s| *s != "empty") {
+		return Err(usage(format!(
+			"unknown trash command '{}' (see `tpfs trash --help`)",
+			tpfs_core::sanitize(other.as_ref())
+		)));
+	}
+	let (mut journal, trash_dir) = open_state(args)?;
+	let all = trash::contents(&mut journal, &trash_dir).map_err(|e| e.to_string())?;
+	let line = |t: &Trashed| {
+		format!(
+			"{:<22} {}  {:<6} {:>6}  {:>10}  {}",
+			tpfs_core::sanitize(t.id.as_ref()),
+			date(t.at),
+			if t.source.is_empty() { "?".into() } else { tpfs_core::sanitize(t.source.as_ref()) },
+			t.items,
+			size(t.bytes),
+			t.undo_state()
+		)
+	};
+	let header =
+		format!("{:<22} {:<16}  {:<6} {:>6}  {:>10}  UNDOABLE", "BATCH", "DATE (UTC)", "SOURCE", "ITEMS", "SIZE");
+	let totals = |ts: &[Trashed]| {
+		let (items, bytes) = ts.iter().fold((0, 0), |(i, b), t| (i + t.items, b + t.bytes));
+		format!("{} batch(es), {items} item(s), {}", ts.len(), size(bytes))
+	};
+
+	if sub.is_none() {
+		let mut folders: Vec<String> = Vec::new();
+		for d in all.iter().flat_map(|t| &t.dirs).filter_map(|d| d.parent()) {
+			let d = tpfs_core::sanitize(d.as_os_str());
+			if !folders.contains(&d) {
+				folders.push(d);
+			}
+		}
+		if all.is_empty() {
+			println!("The trash is empty.");
+			return Ok(ExitCode::SUCCESS);
+		}
+		eprintln!("Trash: {}", folders.join(", "));
+		println!("{header}");
+		for t in &all {
+			println!("{}", line(t));
+		}
+		println!("Total: {}", totals(&all));
+		return Ok(ExitCode::SUCCESS);
+	}
+
+	// `tpfs trash empty`: by default everything older than 30 days; `--batch` alone ignores age.
+	let days = args.older_than.or(if args.batch.is_some() { None } else { Some(30) });
+	if let Some(id) = &args.batch {
+		let shown = tpfs_core::sanitize(id.as_ref());
+		match all.iter().find(|t| t.id == *id) {
+			None => return Err(usage(format!("batch {shown} has nothing in the trash (see `tpfs trash`)"))),
+			Some(t) if !t.emptiable() => {
+				return Err(format!(
+					"batch {shown} was interrupted and `tpfs recover` needs its trash; run that first"
+				)
+				.into());
+			}
+			_ => {}
+		}
+	}
+	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+	let wanted = |t: &Trashed| {
+		args.batch.as_ref().is_none_or(|b| *b == t.id) && days.is_none_or(|d| t.at.saturating_add(d * 86_400) <= now)
+	};
+	let kept = all.iter().filter(|t| wanted(t) && !t.emptiable()).count();
+	// An emptying cut short is finished whatever is chosen: it is recorded already.
+	let chosen: Vec<Trashed> = all.into_iter().filter(|t| t.purged || (wanted(t) && t.emptiable())).collect();
+	if kept > 0 {
+		eprintln!("{kept} interrupted batch(es) keep their trash: `tpfs recover` needs it.");
+	}
+	if chosen.is_empty() {
+		match days {
+			Some(d) => println!("Nothing to empty: nothing in the trash is older than {d} day(s) (see `tpfs trash`)."),
+			None => println!("Nothing to empty."),
+		}
+		return Ok(ExitCode::SUCCESS);
+	}
+	let token = trash::token(&chosen);
+	println!("This will be deleted for good:");
+	println!("{header}");
+	for t in &chosen {
+		println!("{}", line(t));
+		for (inside, from) in t.entries.iter().take(20) {
+			match from {
+				Some(from) => println!("    {}", tpfs_core::sanitize(from.as_os_str())),
+				None => println!("    {}", tpfs_core::sanitize(inside.as_os_str())),
+			}
+		}
+		if t.entries.len() > 20 {
+			println!("    … and {} more", t.entries.len() - 20);
+		}
+	}
+	println!("Total: {}", totals(&chosen));
+	let undoable = chosen.iter().filter(|t| t.undoable()).count();
+	if undoable > 0 {
+		println!(
+			"{undoable} of these batch(es) can still be undone; afterwards they (and the batches before them) cannot."
+		);
+	}
+	println!("Token: {token}");
+	if let Some(approved) = &args.approve {
+		if *approved != token {
+			return Err(cancelled("--approve does not match this selection's token; nothing was deleted"));
+		}
+	} else if io::stdin().is_terminal() && io::stderr().is_terminal() {
+		drop(journal); // not held while the user reads
+		if ask("Type 'yes' to delete this for good: ")? != "yes" {
+			return Err(cancelled("cancelled; nothing was deleted"));
+		}
+		journal = open_state(args)?.0;
+	} else {
+		return Err(cancelled(format!("not interactive: pass --approve {token} to delete exactly this selection")));
+	}
+	let ids: Vec<String> = chosen.iter().map(|t| t.id.clone()).collect();
+	let report = match trash::empty(&mut journal, &trash_dir, &ids, &token) {
+		Ok(r) => r,
+		Err(ExecError::Blocked(m)) => return Err(cancelled(m)),
+		Err(e) => return Err(e.to_string().into()),
+	};
+	println!("Deleted {} item(s) of {} batch(es), {} freed.", report.items, report.batches, size(report.bytes));
+	for e in &report.errors {
+		eprintln!("  error: {e}");
+	}
+	if report.errors.is_empty() {
+		Ok(ExitCode::SUCCESS)
+	} else {
+		eprintln!("Fix the cause, then run `tpfs trash empty` again: it finishes what was left.");
+		Ok(ExitCode::from(1))
+	}
+}
+
+/// `1.5 MiB`, `120 B`.
+fn size(bytes: u64) -> String {
+	const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+	let (mut v, mut u) = (bytes as f64, 0);
+	while v >= 1024.0 && u + 1 < UNITS.len() {
+		v /= 1024.0;
+		u += 1;
+	}
+	if u == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", UNITS[u]) }
+}
+
+/// `YYYY-MM-DD HH:MM` in UTC (`????-??-?? ??:??` when unknown).
+fn date(secs: u64) -> String {
+	if secs == 0 {
+		return "????-??-?? ??:??".into();
+	}
+	// Days to a civil date (Howard Hinnant's algorithm).
+	let (days, rest) = ((secs / 86_400) as i64, secs % 86_400);
+	let z = days + 719_468;
+	let era = z.div_euclid(146_097);
+	let doe = z - era * 146_097;
+	let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+	let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+	let mp = (5 * doy + 2) / 153;
+	let d = doy - (153 * mp + 2) / 5 + 1;
+	let m = if mp < 10 { mp + 3 } else { mp - 9 };
+	let y = yoe + era * 400 + i64::from(m <= 2);
+	format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", rest / 3600, rest % 3600 / 60)
 }
 
 fn check(args: &Args, apply: bool) -> Res {

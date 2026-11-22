@@ -2,6 +2,7 @@
 //! project's Claude Code hooks). It reads the proposed tool call as JSON on stdin and refuses shell
 //! commands that move, rename or remove files, pointing the agent to tpfs's MCP tools instead, so
 //! file changes go through a reviewed, journaled, undoable plan.
+//! `tpfs trash empty`, the one permanent delete, is refused too: only the user empties the trash.
 //!
 //! This is a guard rail, not a sandbox: it recognises the usual commands (also behind `sudo`,
 //! `xargs`, `sh -c`, `find -exec` and one-line interpreter scripts), but a determined program can
@@ -128,6 +129,12 @@ fn judge(words: &[String], depth: usize, cwd: Option<&Path>) -> Option<String> {
 			judge(&words[exec + 1..], depth + 1, cwd)
 		}
 		"git" if words.get(1).is_some_and(|w| w == "clean") => refuse("git clean"),
+		// The one permanent delete in tpfs is the user's own decision, never an agent's.
+		"tpfs" if words.iter().skip(1).any(|w| w == "trash") && words.iter().any(|w| w == "empty") => Some(
+			"`tpfs trash empty` deletes files for good. Only the user empties the trash, in their own terminal; \
+			 leave it to them."
+				.into(),
+		),
 		"rsync" if words.iter().any(|w| w.starts_with("--delete") || w == "--remove-source-files") => {
 			refuse("rsync --delete")
 		}

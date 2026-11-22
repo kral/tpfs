@@ -14,7 +14,8 @@ in the terminal, or let an AI agent propose plans over MCP while you keep the fi
 
 - **No overwrite.** A move, copy or rename never replaces an existing file. To replace a file, a
   plan trashes the old one first, so the old version stays restorable.
-- **No permanent delete.** `trash` moves an item into tpfs's trash. There is no delete operation.
+- **No permanent delete.** `trash` moves an item into tpfs's trash. There is no delete operation;
+  only you empty the trash, with `tpfs trash empty`, and the journal records it first.
 - **Undo.** Every committed batch can be reverted with `tpfs undo`, newest first.
 - **Crash recovery.** Each step is journaled before it touches the disk. `tpfs recover` rolls back a
   batch that a crash or power loss interrupted.
