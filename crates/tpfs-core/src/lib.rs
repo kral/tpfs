@@ -8,6 +8,11 @@
 //!
 //! There is deliberately no permanent delete: `trash` moves into a journaled trash directory.
 
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod crash;
+#[cfg(not(feature = "test-support"))]
+mod crash;
 mod display;
 mod executor;
 mod fsops;

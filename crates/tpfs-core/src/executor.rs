@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-	fsops::{Fs, merge_back, part_path, remove_part, same_file, sync_parent},
+	fsops::{Fs, make_dir_writable, merge_back, part_path, remove_part, same_file, sync_parent},
 	journal::{BatchStatus, Entry, Journal},
 	op::{Op, Plan},
 	path::{exists, normalize},
@@ -449,6 +449,7 @@ impl<'a> Executor<'a> {
 			&& let Some(to) = normalize(to)
 			&& exists(&to)
 			&& fingerprint(&to).as_ref() != Some(check)
+			&& fingerprint_as(&to, true).as_ref() != Some(check)
 		{
 			return Err(format!(
 				"{} was changed after it was copied; it is kept. Move it away (or trash it yourself) and try again.",
@@ -815,23 +816,36 @@ fn already_applied(op: &Op) -> bool {
 /// A compact description of what a copy produced (names, kinds, sizes, modification times), so
 /// undo can tell whether someone changed it since.
 fn fingerprint(path: &Path) -> Option<String> {
+	fingerprint_as(path, false)
+}
+
+/// `legacy`: as versions up to 0.7.4 computed it, with a symlink's own time and without its
+/// target (still accepted for the copies they journaled).
+fn fingerprint_as(path: &Path, legacy: bool) -> Option<String> {
 	use sha2::{Digest, Sha256};
-	fn walk(path: &Path, rel: &Path, h: &mut Sha256, budget: &mut usize) -> Option<()> {
+	fn walk(path: &Path, rel: &Path, h: &mut Sha256, budget: &mut usize, legacy: bool) -> Option<()> {
 		*budget = budget.checked_sub(1)?;
 		let m = fs::symlink_metadata(path).ok()?;
 		// Folder times are left out: adding and removing entries (by later steps and their undo)
-		// changes them without changing anything the user made.
-		let mtime = if m.is_dir() {
+		// changes them without changing anything the user made. So is a symlink's own time: a move
+		// to another file system and back (a later step and its undo) makes the link anew. What a
+		// link is, is where it points.
+		let link = m.file_type().is_symlink() && !legacy;
+		let mtime = if m.is_dir() || link {
 			0
 		} else {
 			m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos())
 		};
 		h.update(format!("{}\0{}\0{}\0{mtime}\n", rel.display(), m.is_dir(), if m.is_dir() { 0 } else { m.len() }));
+		if link {
+			h.update(fs::read_link(path).ok()?.as_os_str().as_encoded_bytes());
+			h.update(b"\n");
+		}
 		if m.is_dir() {
 			let mut names: Vec<_> = fs::read_dir(path).ok()?.filter_map(|e| e.ok().map(|e| e.file_name())).collect();
 			names.sort();
 			for name in names {
-				walk(&path.join(&name), &rel.join(&name), h, budget)?;
+				walk(&path.join(&name), &rel.join(&name), h, budget, legacy)?;
 			}
 		}
 		Some(())
@@ -839,7 +853,7 @@ fn fingerprint(path: &Path) -> Option<String> {
 	let mut h = Sha256::new();
 	// Very large trees are not fingerprinted (undo then trashes them, which is still undoable).
 	let mut budget = 100_000;
-	walk(path, Path::new(""), &mut h, &mut budget)?;
+	walk(path, Path::new(""), &mut h, &mut budget, legacy)?;
 	Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
@@ -853,7 +867,8 @@ fn duplicated_in(rest: &Path, copy: &Path) -> bool {
 			(Some(x), Some(y)) => x.abs_diff(y) <= std::time::Duration::from_secs(2),
 			_ => false,
 		};
-		a.file_type() == b.file_type() && (a.is_dir() || (a.len() == b.len() && close))
+		// A symlink is its target (compared below): a copy of one is a new link with a new time.
+		a.file_type() == b.file_type() && (a.is_dir() || a.file_type().is_symlink() || (a.len() == b.len() && close))
 	}
 	let mut budget = 1_000_000usize;
 	let mut stack = vec![(rest.to_path_buf(), copy.to_path_buf())];
@@ -950,6 +965,7 @@ thread_local! {
 }
 
 fn crash_point(_at: &'static str) -> io::Result<()> {
+	crate::crash::point(_at);
 	#[cfg(test)]
 	if CRASH_AT.with(|c| c.get() == Some(_at)) {
 		return Err(io::Error::other(format!("simulated crash after: {_at}")));
@@ -1076,6 +1092,7 @@ fn apply(
 			if let Some(base) = batch_dir.parent() {
 				if base == trash {
 					if !exists(base) {
+						crate::crash::point("trash.create");
 						fs::create_dir_all(base)?; // the private trash in the state folder
 					}
 				} else if !fs.anchors_exactly(base) {
@@ -1097,7 +1114,20 @@ fn apply(
 				sync_parent(batch_dir);
 			}
 			sync_parent(parent);
-			fs.move_any(&path, &slot, &part_path(&slot, &tag), publish)
+			let part = part_path(&slot, &tag);
+			let moved = fs.move_any(&path, &slot, &part, publish);
+			// A clean-up trash (undo, recovery) takes away a copy tpfs made. One of a read-only
+			// folder has that folder's mode, and a folder its owner may not write to cannot be
+			// renamed into another folder: without this, such a copy could never be undone. The
+			// copy is ours, so it is opened and moved; a folder the user asked to trash is not.
+			if planned.is_none()
+				&& moved.as_ref().is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied)
+				&& fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir())
+				&& make_dir_writable(fs, &path).is_ok()
+			{
+				return fs.move_any(&path, &slot, &part, publish);
+			}
+			moved
 		}
 		Op::Mkdir { path } => {
 			// Made at a private name, journaled, then renamed into place without replacing
@@ -1179,7 +1209,17 @@ impl fmt::Display for Fix {
 
 fn apply_fix(fix: &Fix, fs: &Fs, trash: &Path, batch: &str, index: usize) -> io::Result<()> {
 	match fix {
-		Fix::Op(op) => apply(op, fs, trash, batch, index, None, &mut || Ok(())),
+		Fix::Op(op) => {
+			// An earlier recovery that stopped while copying the item back (across file systems)
+			// left its partial copy under this very name: dropped first, as undo does, or the copy
+			// could never be made again and the batch would stay interrupted for good.
+			if let Op::Move { to, .. } = op
+				&& let Some(to) = normalize(to)
+			{
+				remove_part(fs, &part_path(&to, &tag(batch, index)))?;
+			}
+			apply(op, fs, trash, batch, index, None, &mut || Ok(()))
+		}
 		Fix::RemovePart(part) => remove_part(fs, part),
 		Fix::MergeBack { target, source } => merge_back(fs, target, source, &tag(batch, index), &mut |rest| {
 			apply(&Op::Trash { path: rest.to_path_buf() }, fs, trash, batch, index, None, &mut || Ok(()))
@@ -1616,6 +1656,31 @@ mod tests {
 			use std::os::unix::fs::PermissionsExt;
 			assert_eq!(fs::metadata(&d).unwrap().permissions().mode() & 0o777, 0o755);
 		}
+	}
+
+	/// A symlink made anew with the same target (a move to another file system and back) is the
+	/// same link: the copy it is in still counts as unchanged. Its own time is not compared.
+	#[cfg(unix)]
+	#[test]
+	fn a_copy_fingerprint_knows_a_symlink_by_its_target() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let dir = tmp.path().join("copy");
+		fs::create_dir(&dir).unwrap();
+		fs::write(dir.join("file"), "F").unwrap();
+		let link = dir.join("link");
+		std::os::unix::fs::symlink("file", &link).unwrap();
+		let before = fingerprint(&dir).unwrap();
+		let legacy = fingerprint_as(&dir, true).unwrap();
+
+		std::thread::sleep(std::time::Duration::from_millis(20));
+		fs::remove_file(&link).unwrap();
+		std::os::unix::fs::symlink("file", &link).unwrap();
+		assert_eq!(fingerprint(&dir).unwrap(), before);
+		assert_ne!(fingerprint_as(&dir, true).unwrap(), legacy, "the old fingerprint took this for a change");
+
+		fs::remove_file(&link).unwrap();
+		std::os::unix::fs::symlink("elsewhere", &link).unwrap();
+		assert_ne!(fingerprint(&dir).unwrap(), before, "another target is a change");
 	}
 
 	/// A crash at every point of a folder restore, in undo and in recovery: each rerun (twice)
